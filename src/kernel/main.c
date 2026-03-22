@@ -10,6 +10,13 @@
 volatile unsigned long boot_stage;
 volatile unsigned long boot_heartbeat;
 
+/*
+ * Boot order matters here:
+ * - logging/exceptions/page allocator must work before MMU setup
+ * - mmu_init() consumes allocator pages for translation tables
+ * - heap init happens after MMU so dynamic kernel memory already runs under the
+ *   final Stage-1 translation regime
+ */
 void kernel_main(void)
 {
     unsigned long *heap_counter;
@@ -64,6 +71,12 @@ void kernel_main(void)
     log_write_u64(page_allocator_double_free_count());
     log_putc('\n');
 
+    /*
+     * MMU bring-up programs MAIR_EL1, TCR_EL1, TTBR0_EL1, invalidates stale
+     * EL1 translations, then sets SCTLR_EL1.M/C/I to enable translation and
+     * caches. After this point the kernel continues in the same identity-mapped
+     * layout, but under the new permission model.
+     */
     mmu_init();
     log_write("[info] mmu enabled=");
     log_write_u64((unsigned long)mmu_is_enabled());

@@ -5,6 +5,16 @@
 #include <kernel/log.h>
 #include <kernel/page_alloc.h>
 
+/*
+ * Stage 6/7 MMU design summary:
+ * - EL1 Stage-1 translation only
+ * - 48-bit virtual address space with 4 KiB pages
+ * - 4-level walk rooted at TTBR0_EL1
+ * - broad identity map kept on purpose for bring-up and easier debug
+ * - RAM starts at L1 -> L2, then the early kernel window drops to L3 pages so
+ *   .text/.rodata/.data/.bss/boot stack can use different permissions
+ * - the rest of RAM stays mapped by larger L2 blocks to reduce table pressure
+ */
 #define MMU_USE_4LEVEL 1
 #define MMU_DEBUG_WALK_ENABLED 1
 #define MMU_VA_BITS          48UL
@@ -18,6 +28,14 @@
 #define MMU_DESC_BLOCK         MMU_DESC_VALID
 #define MMU_DESC_PAGE          MMU_DESC_TABLE
 
+/*
+ * Descriptor bits used by this kernel's Stage-1 translation tables:
+ * - AttrIndx[2:0] selects a MAIR_EL1 memory type slot
+ * - AP[7:6] controls read/write permission at EL1
+ * - SH[9:8] selects shareability for cacheable memory
+ * - AF[10] must be set so the first access does not fault on access-flag checks
+ * - PXN/UXN forbid instruction fetches from privileged/user execution domains
+ */
 #define MMU_ATTR_INDEX(x)      ((unsigned long)(x) << 2)
 #define MMU_ATTR_INDEX_MASK    MMU_ATTR_INDEX(0x7UL)
 #define MMU_ATTR_DEVICE        MMU_ATTR_INDEX(0)
@@ -35,6 +53,13 @@
 #define MMU_MAIR_NORMAL_WBWA   0xffUL
 #define MMU_TCR_IPS_48BIT      (5UL << 32)
 
+/*
+ * SCTLR_EL1 bits used when turning the MMU on:
+ * - M[0] enables Stage-1 address translation
+ * - C[2] enables data/unified caches for normal memory
+ * - I[12] enables instruction cache
+ * The RES1 bits are architectural mandatory-one fields for EL1.
+ */
 #define SCTLR_EL1_RES1         ((1UL << 29) | (1UL << 28) | (1UL << 23) | (1UL << 22) | (1UL << 20) | (1UL << 11))
 #define SCTLR_EL1_M            (1UL << 0)
 #define SCTLR_EL1_C            (1UL << 2)
@@ -54,11 +79,12 @@
 #define MMU_DEBUG_BLOCK_PAGE   0x40400000UL
 
 /*
- * Current Stage 6 policy:
- * - keep an identity map for easier bring-up and debug
- * - fine-map the first RAM chunks with L3 pages so the kernel image can
- *   carry section-specific permissions
- * - map the remaining RAM with larger L2 blocks to keep table usage small
+ * Current mapping policy:
+ * - L0 holds the single top-level entry used by the current identity map
+ * - L1[0] covers low MMIO as a device block mapping
+ * - L1 entry for RAM points to an L2 table
+ * - early RAM chunks use per-page L3 entries for precise permissions
+ * - later RAM chunks use coarse L2 block entries as RW/NX normal memory
  */
 static unsigned long *l0_table;
 static unsigned long *l1_table;
@@ -533,7 +559,30 @@ static int build_identity_map(void)
     unsigned long chunk_base;
     unsigned long address;
 
-    /* Keep MMIO as device memory with execute-never semantics. */
+    /*
+     * Active table layout for the current kernel map:
+     *
+     *   TTBR0_EL1
+     *      |
+     *      v
+     *     L0 root
+     *      |
+     *      +--> L1[0]          -> 1 GiB device block for low MMIO
+     *      |
+     *      +--> L1[RAM base]   -> L2 RAM table
+     *                              |
+     *                              +--> early entries -> L3 page tables
+     *                              |                     (.text/.rodata/.data/.bss/stack)
+     *                              |
+     *                              +--> later entries -> 2 MiB normal-memory blocks
+     *
+     * The mapping remains identity-based: VA == PA for the current kernel.
+     */
+
+    /*
+     * L1 block for the low physical region on QEMU virt.
+     * This keeps MMIO strongly ordered as Device-nGnRnE and marks it NX.
+     */
     l1_table[l1_index_for(0x00000000UL)] = 0x00000000UL |
                                            MMU_ATTR_DEVICE |
                                            MMU_AP_RW |
@@ -543,9 +592,13 @@ static int build_identity_map(void)
                                            MMU_UXN |
                                            MMU_DESC_BLOCK;
 
+    /* TTBR0_EL1 root -> L0 -> L1 for the active lower VA space. */
     l0_table[l0_index_for(0x00000000UL)] = ((unsigned long)l1_table) | MMU_DESC_TABLE;
 
-    /* The RAM window fans out through L2 so early chunks can optionally drop to L3. */
+    /*
+     * RAM fans out through L2 so the first part can either terminate as an L2
+     * block or continue into L3 page tables for fine-grained permissions.
+     */
     l1_table[l1_index_for(QEMU_VIRT_RAM_BASE)] = ((unsigned long)l2_ram_table) | MMU_DESC_TABLE;
 
     kernel_map_end = align_up((unsigned long)__kernel_end, MMU_L2_BLOCK_SIZE);
@@ -558,8 +611,12 @@ static int build_identity_map(void)
     fine_map_chunks_used = (fine_map_end - QEMU_VIRT_RAM_BASE) / MMU_L2_BLOCK_SIZE;
 
     /*
-     * Allocate one L3 table per 2 MiB chunk that needs page-level permissions.
-     * This covers the kernel image and a small safety margin for nearby pages.
+     * Allocate one L3 table per 2 MiB chunk in the fine-mapped window.
+     * Each 4 KiB page can then carry the permission chosen by
+     * kernel_page_attrs():
+     * - .text   -> normal, RO, executable
+     * - .rodata -> normal, RO, PXN/UXN
+     * - .data/.bss/stack -> normal, RW, PXN/UXN
      */
     for (chunk_base = QEMU_VIRT_RAM_BASE; chunk_base < fine_map_end; chunk_base += MMU_L2_BLOCK_SIZE) {
         unsigned long *l3_table;
@@ -582,7 +639,7 @@ static int build_identity_map(void)
         }
     }
 
-    /* The rest of RAM stays as coarse RW/NX normal-memory blocks for now. */
+    /* The remaining RAM stays mapped as L2 normal-memory blocks, RW and NX. */
     for (address = fine_map_end; address < QEMU_VIRT_RAM_END; address += MMU_L2_BLOCK_SIZE) {
         l2_ram_table[l2_index_for(address)] = (address & ~(MMU_L2_BLOCK_SIZE - 1UL)) |
                                               MMU_ATTR_NORMAL |
@@ -647,13 +704,21 @@ void mmu_init(void)
 
     kernel_debug_log_mmu_boot_targets();
 
+    /*
+     * MAIR_EL1 encodes the memory types referenced by AttrIndx in descriptors:
+     * - slot 0 = Device-nGnRnE for MMIO
+     * - slot 1 = Normal WB/WA cacheable memory for RAM
+     */
     mair = (MMU_MAIR_DEVICE_nGnRnE << 0) | (MMU_MAIR_NORMAL_WBWA << 8);
     /*
-     * TCR_EL1 here selects the Stage 1 TTBR0_EL1 regime used by the kernel:
-     * - 48-bit VA (T0SZ = 16)
-     * - 4 KiB granule
-     * - inner-shareable, write-back cacheable normal memory
-     * - 48-bit physical address size on QEMU virt
+     * TCR_EL1 defines how TTBR0_EL1 addresses are translated:
+     * - T0SZ[5:0]   = 16  -> 48-bit VA space
+     * - IRGN0[9:8]  = 01  -> inner WB/WA cacheability for table walks
+     * - ORGN0[11:10]= 01  -> outer WB/WA cacheability for table walks
+     * - SH0[13:12]  = 11  -> inner-shareable table walks
+     * - TG0[15:14]  = 00  -> 4 KiB granule
+     * - EPD1[23]    = 1   -> disable TTBR1_EL1 walks; this kernel only uses TTBR0_EL1
+     * - IPS[34:32]  = 101 -> 48-bit physical address size
      */
     tcr = MMU_T0SZ |
           (1UL << 8) |
@@ -663,10 +728,14 @@ void mmu_init(void)
           (1UL << 23) |
             MMU_TCR_IPS_48BIT;
 
-        /*
-         * Program the translation regime first, then invalidate stale TLB state
-         * before turning address translation on.
-         */
+    /*
+     * Bring the translation regime live in this order:
+     * 1. MAIR_EL1  <- memory attribute slots used by descriptors
+     * 2. TCR_EL1   <- translation size/shareability/cacheability/granule
+     * 3. TTBR0_EL1 <- base address of the L0 root table
+     * 4. TLBI      <- discard any stale EL1 Stage-1 translations
+     * 5. DSB/ISB   <- complete the register/TLB programming before SCTLR_EL1.M
+     */
     __asm__ volatile(
         "dsb ish\n"
         "msr mair_el1, %0\n"
@@ -687,13 +756,20 @@ void mmu_init(void)
     log_write_hex(sctlr);
     log_putc('\n');
 
+    /* Enable the MMU and both caches with the required architectural RES1 bits. */
     sctlr = SCTLR_EL1_RES1 | SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_I;
 
     log_write("[info] sctlr_el1 after=");
     log_write_hex(sctlr);
     log_putc('\n');
 
-    /* M enables translation, C enables data cache, and I enables instruction cache. */
+    /*
+     * Writing SCTLR_EL1 is the commit point:
+     * - M starts Stage-1 translation
+     * - C allows data cache on normal memory
+     * - I allows instruction cache
+     * The trailing ISB makes later instructions execute under the new regime.
+     */
     __asm__ volatile(
         "msr sctlr_el1, %0\n"
         "isb\n"

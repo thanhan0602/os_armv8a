@@ -3,11 +3,21 @@
 #include <arch/arm/virt.h>
 #include <kernel/log.h>
 
+/*
+ * Page allocator state model:
+ * - UNUSED    = page is outside the managed allocator window
+ * - FREE      = page is currently reachable from the free list
+ * - ALLOCATED = page has been handed out to a subsystem
+ *
+ * The page_state[] array is intentionally redundant with the free list so the
+ * kernel can detect bookkeeping drift during bring-up.
+ */
 #define PAGE_STATE_UNUSED    0U
 #define PAGE_STATE_FREE      1U
 #define PAGE_STATE_ALLOCATED 2U
 #define QEMU_VIRT_MAX_PAGES  (QEMU_VIRT_RAM_SIZE / PAGE_SIZE)
 
+/* Free-list link stored in the physical page itself while the page is free. */
 struct page_node {
     struct page_node *next;
 };
@@ -24,6 +34,7 @@ static unsigned long invalid_free_count;
 static unsigned long double_free_count;
 static unsigned char page_state[QEMU_VIRT_MAX_PAGES];
 
+/* Align the managed region to whole pages so allocator clients never see partial pages. */
 static unsigned long align_up(unsigned long value, unsigned long alignment)
 {
     return (value + alignment - 1UL) & ~(alignment - 1UL);
@@ -99,6 +110,11 @@ void page_allocator_init(void)
     unsigned long ram_end;
     unsigned long page_index;
 
+    /*
+     * The allocator owns RAM from the first page after the kernel image to the
+     * end of the QEMU virt RAM window. Earlier bytes stay reserved for kernel
+     * text/data/bss/boot stack and must never re-enter the free list.
+     */
     ram_end = QEMU_VIRT_RAM_BASE + QEMU_VIRT_RAM_SIZE;
     managed_start = align_up((unsigned long)__kernel_end, PAGE_SIZE);
     managed_end = ram_end;
@@ -114,6 +130,10 @@ void page_allocator_init(void)
         page_state[page_index] = PAGE_STATE_UNUSED;
     }
 
+    /*
+     * Build the initial free list by pushing every managed page. The list order
+     * is not important yet; simplicity matters more than locality in early boot.
+     */
     for (page_addr = managed_start; (page_addr + PAGE_SIZE) <= managed_end; page_addr += PAGE_SIZE) {
         struct page_node *page;
 
@@ -143,6 +163,7 @@ void *page_alloc(void)
 {
     struct page_node *page;
 
+    /* Pop from the head of the free list, mark allocated, then scrub the page. */
     page = page_free_list;
     if (page == (struct page_node *)0) {
         return (void *)0;
@@ -160,6 +181,7 @@ void page_free(void *page)
     struct page_node *node;
     unsigned long page_addr;
 
+    /* Reject anything that is not a managed, page-aligned allocation. */
     if (page == (void *)0) {
         return;
     }
@@ -183,6 +205,7 @@ void page_free(void *page)
         return;
     }
 
+    /* Return the page to the free-list head and restore its metadata to FREE. */
     node = (struct page_node *)page;
     node->next = page_free_list;
     page_free_list = node;
@@ -283,6 +306,7 @@ unsigned long page_allocator_check_consistency(void)
     state_allocated_pages = 0UL;
     mismatches = 0UL;
 
+    /* Cross-check page_state[], counter totals, and the actual free-list length. */
     for (page_addr = managed_start; page_addr < managed_end; page_addr += PAGE_SIZE) {
         unsigned char state;
 

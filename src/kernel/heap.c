@@ -3,9 +3,28 @@
 #include <kernel/log.h>
 #include <kernel/page_alloc.h>
 
+/*
+ * Heap layout inside one physical page:
+ *
+ *   +-------------------------+
+ *   | kernel_heap_page header |
+ *   +-------------------------+
+ *   | alignment padding       |
+ *   +-------------------------+
+ *   | first block header      |
+ *   +-------------------------+
+ *   | block payload ...       |
+ *   +-------------------------+
+ *   | more block headers/data |
+ *   +-------------------------+
+ *
+ * Each page is independent. Blocks split and coalesce only within the same
+ * page, which keeps the implementation simple for early kernel bring-up.
+ */
 #define KERNEL_HEAP_PAGE_MAGIC 0x4b48454150414745UL
 #define KERNEL_HEAP_ALIGNMENT  16UL
 
+/* Per-allocation metadata stored immediately before each user-visible payload. */
 struct kernel_heap_block {
     unsigned long size;
     unsigned long is_free;
@@ -13,6 +32,7 @@ struct kernel_heap_block {
     struct kernel_heap_block *prev;
 };
 
+/* Per-page metadata for a page that currently participates in the heap. */
 struct kernel_heap_page {
     unsigned long magic;
     struct kernel_heap_page *next;
@@ -27,6 +47,7 @@ static unsigned long kernel_heap_used_space;
 static unsigned long kernel_heap_allocations;
 static unsigned long kernel_heap_failed;
 
+/* Keep allocations naturally aligned for 64-bit objects and small structs. */
 static unsigned long kernel_heap_align_up(unsigned long value, unsigned long alignment)
 {
     return (value + alignment - 1UL) & ~(alignment - 1UL);
@@ -58,6 +79,7 @@ static struct kernel_heap_page *kernel_heap_add_page(void)
     unsigned long block_start;
     unsigned long usable_bytes;
 
+    /* Request one physical page and seed it with a single large free block. */
     page = (struct kernel_heap_page *)page_alloc();
     if (page == (struct kernel_heap_page *)0) {
         kernel_heap_failed++;
@@ -90,6 +112,7 @@ static void kernel_heap_split_block(struct kernel_heap_block *block, unsigned lo
     unsigned long remaining_size;
     unsigned long new_block_address;
 
+    /* Only split when the tail can still hold metadata plus a useful payload. */
     if (block->size < (size + kernel_heap_min_split_size())) {
         return;
     }
@@ -115,6 +138,7 @@ static void *kernel_heap_allocate_from_page(struct kernel_heap_page *page, unsig
 {
     struct kernel_heap_block *block;
 
+    /* First-fit scan within a single page. */
     block = page->first_block;
     while (block != (struct kernel_heap_block *)0) {
         if (block->is_free != 0UL && block->size >= size) {
@@ -134,6 +158,7 @@ static void *kernel_heap_allocate_from_page(struct kernel_heap_page *page, unsig
 
 static void kernel_heap_coalesce(struct kernel_heap_block *block)
 {
+    /* Merge adjacent free blocks so repeated small frees rebuild larger gaps. */
     if (block->next != (struct kernel_heap_block *)0 && block->next->is_free != 0UL) {
         block->size += sizeof(struct kernel_heap_block) + block->next->size;
         block->next = block->next->next;
@@ -153,6 +178,7 @@ static void kernel_heap_coalesce(struct kernel_heap_block *block)
 
 void kernel_heap_init(void)
 {
+    /* Start with an empty heap and add the first backing page on demand. */
     kernel_heap_pages = (struct kernel_heap_page *)0;
     kernel_heap_pages_used = 0UL;
     kernel_heap_free_space = 0UL;
@@ -178,6 +204,7 @@ void *kmalloc(unsigned long size)
         return (void *)0;
     }
 
+    /* This heap only supports allocations that fit entirely inside one page. */
     aligned_size = kernel_heap_align_up(size, KERNEL_HEAP_ALIGNMENT);
     if (aligned_size > (PAGE_SIZE - sizeof(struct kernel_heap_page) - sizeof(struct kernel_heap_block) - KERNEL_HEAP_ALIGNMENT)) {
         kernel_heap_failed++;
@@ -194,6 +221,7 @@ void *kmalloc(unsigned long size)
         page = page->next;
     }
 
+    /* No existing page had room, so grow the heap by one more backing page. */
     page = kernel_heap_add_page();
     if (page == (struct kernel_heap_page *)0) {
         return (void *)0;
