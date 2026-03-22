@@ -1,0 +1,10 @@
+build/
+*.o
+*.d
+*.elf
+*.img
+*.map
+*.log
+
+.gdb_history
+.qemu.log

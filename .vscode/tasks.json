@@ -1,0 +1,50 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Kernel",
+            "type": "shell",
+            "command": "make",
+            "args": [
+                "-C",
+                "${workspaceFolder}",
+                "all"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "Start QEMU Debug",
+            "type": "shell",
+            "isBackground": true,
+            "dependsOn": [
+                "Build Kernel"
+            ],
+            "command": "bash",
+            "args": [
+                "${workspaceFolder}/scripts/run_qemu_debug.sh"
+            ],
+            "options": {
+                "env": {
+                    "QEMU_BIN": "/home/a/qemu/build/qemu-system-aarch64"
+                }
+            },
+            "problemMatcher": {
+                "pattern": {
+                    "regexp": "^Starting QEMU"
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "^Starting QEMU",
+                    "endsPattern": "^Starting QEMU"
+                }
+            }
+        }
+    ]
+}
