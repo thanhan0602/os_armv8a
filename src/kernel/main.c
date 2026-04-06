@@ -5,29 +5,65 @@
 #include <kernel/log.h>
 #include <kernel/mmu.h>
 #include <kernel/page_alloc.h>
+#include <kernel/sched.h>
 #include <kernel/timer.h>
+#include <kernel/vm.h>
 
 volatile unsigned long boot_stage;
 volatile unsigned long boot_heartbeat;
+
+static void task_a_func(void)
+{
+    volatile unsigned long count = 0;
+
+    while (1) {
+        count++;
+        if (count <= 4UL) {
+            log_write("[task-a] run #");
+            log_write_u64(count);
+            log_putc('\n');
+        }
+        __asm__ volatile("wfe");
+    }
+}
+
+static void task_b_func(void)
+{
+    volatile unsigned long count = 0;
+
+    while (1) {
+        count++;
+        if (count <= 4UL) {
+            log_write("[task-b] run #");
+            log_write_u64(count);
+            log_putc('\n');
+        }
+        __asm__ volatile("wfe");
+    }
+}
 
 /*
  * Boot order matters here:
  * - logging/exceptions/page allocator must work before MMU setup
  * - mmu_init() consumes allocator pages for translation tables
- * - heap init happens after MMU so dynamic kernel memory already runs under the
- *   final Stage-1 translation regime
+ * - kernel_main_early runs at PA before the VA trampoline
+ * - kernel_main runs at high VA after the trampoline in start.S
  */
-void kernel_main(void)
+
+/*
+ * Called from start.S at physical address before the MMU trampoline.
+ * Initialises logging, exceptions, the page allocator, and the MMU.
+ * Returns to start.S so it can switch execution to the kernel VA.
+ */
+void kernel_main_early(void)
 {
-    unsigned long *heap_counter;
-    char *heap_message;
     void *test_page_a;
     void *test_page_b;
 
     boot_stage = 6;
 
     log_init();
-    log_info("entering kernel_main");
+    log_info("entering kernel_main_early");
     log_info("stage 2 console online");
     log_info("stack and bss initialized");
     exception_init();
@@ -72,10 +108,10 @@ void kernel_main(void)
     log_putc('\n');
 
     /*
-     * MMU bring-up programs MAIR_EL1, TCR_EL1, TTBR0_EL1, invalidates stale
-     * EL1 translations, then sets SCTLR_EL1.M/C/I to enable translation and
-     * caches. After this point the kernel continues in the same identity-mapped
-     * layout, but under the new permission model.
+     * MMU bring-up programs MAIR_EL1, TCR_EL1, TTBR0_EL1, TTBR1_EL1,
+     * invalidates stale EL1 translations, then sets SCTLR_EL1.M/C/I.
+     * After this point both identity map (TTBR0) and kernel VA map
+     * (TTBR1) are live.
      */
     mmu_init();
     log_write("[info] mmu enabled=");
@@ -87,36 +123,78 @@ void kernel_main(void)
     kernel_debug_log_post_mmu_targets((unsigned long)&boot_stage);
     page_allocator_log_consistency();
 
+    log_info("kernel_main_early done, returning for VA trampoline");
+}
+
+/*
+ * Called from start.S at the kernel virtual address after the trampoline.
+ * TTBR1_EL1 is now the active translation path for all kernel code.
+ * heap init happens here so dynamic kernel memory already runs under the
+ * final Stage-1 translation regime at the intended VA.
+ */
+void kernel_main(void)
+{
+    unsigned long *heap_counter;
+    char *heap_large;
+    char *heap_message;
+
+#ifdef CONFIG_KERNEL_VIRTUAL
+    /* Re-install VBAR_EL1 so it holds the kernel VA of the vector table. */
+    exception_init();
+    log_info("kernel running at high VA");
+
+    /* Identity map no longer needed — disable TTBR0 and free its pages. */
+    mmu_disable_ttbr0();
+#endif
+
     kernel_heap_init();
     kernel_heap_log_stats();
 
     heap_counter = (unsigned long *)kmalloc(sizeof(unsigned long));
     heap_message = (char *)kmalloc(48UL);
-    if (heap_counter != (unsigned long *)0 && heap_message != (char *)0) {
+    heap_large = (char *)kmalloc(PAGE_SIZE + 512UL);
+    if (heap_counter != (unsigned long *)0 && heap_message != (char *)0 && heap_large != (char *)0) {
         heap_counter[0] = 7UL;
         heap_message[0] = 'h';
         heap_message[1] = 'e';
         heap_message[2] = 'a';
         heap_message[3] = 'p';
         heap_message[4] = '\0';
+        heap_large[0] = 'L';
+        heap_large[PAGE_SIZE + 511UL] = 'Z';
         log_write("[info] heap self-test counter=");
         log_write_u64(heap_counter[0]);
         log_write(" label=");
         log_write(heap_message);
+        log_write(" large=");
+        log_write_hex((unsigned long)heap_large);
         log_putc('\n');
+#ifdef CONFIG_KERNEL_VIRTUAL
+        page_allocator_log_page_range(va_to_pa(heap_large) & ~(PAGE_SIZE - 1UL), 2UL);
+#else
+        page_allocator_log_page_range((unsigned long)heap_large & ~(PAGE_SIZE - 1UL), 2UL);
+#endif
     } else {
         log_info("heap self-test allocation failed");
     }
     kernel_heap_log_stats();
+    page_allocator_log_consistency();
+    kfree(heap_large);
     kfree(heap_message);
     kfree(heap_counter);
     kernel_heap_log_stats();
+    page_allocator_log_consistency();
 
     timer_init();
     log_write("[info] boot_stage=");
     log_write_u64(boot_stage);
     log_putc('\n');
-    log_info("waiting for timer interrupts");
+
+    sched_init();
+    task_create(task_a_func, "task-a");
+    task_create(task_b_func, "task-b");
+
+    log_info("idle task running");
 
     while (1) {
         boot_heartbeat++;

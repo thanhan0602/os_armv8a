@@ -5,10 +5,10 @@
  * Small kernel heap layered on top of the physical page allocator.
  *
  * Current model:
- * - each heap page comes from page_alloc()
- * - allocations are carved from page-local blocks
- * - frees coalesce with adjacent free blocks inside the same page
- * - single allocations cannot currently span multiple pages
+ * - each heap arena comes from one or more contiguous physical pages
+ * - allocations are carved from arena-local blocks
+ * - frees coalesce with adjacent free blocks inside the same arena
+ * - large allocations can now span multiple contiguous identity-mapped pages
  */
 void kernel_heap_init(void);
 void *kmalloc(unsigned long size);

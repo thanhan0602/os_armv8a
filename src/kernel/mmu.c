@@ -4,6 +4,7 @@
 #include <kernel/debug_targets.h>
 #include <kernel/log.h>
 #include <kernel/page_alloc.h>
+#include <kernel/vm.h>
 
 /*
  * Stage 6/7 MMU design summary:
@@ -52,6 +53,10 @@
 #define MMU_MAIR_DEVICE_nGnRnE 0x00UL
 #define MMU_MAIR_NORMAL_WBWA   0xffUL
 #define MMU_TCR_IPS_48BIT      (5UL << 32)
+#ifdef CONFIG_KERNEL_VIRTUAL
+#define MMU_T1SZ               (16UL << 16)
+#define MMU_TG1_4K             (2UL << 30)
+#endif
 
 /*
  * SCTLR_EL1 bits used when turning the MMU on:
@@ -96,6 +101,13 @@ static unsigned long table_pages_used;
 static int mmu_enabled;
 static unsigned long fine_map_chunks_used;
 
+#ifdef CONFIG_KERNEL_VIRTUAL
+/* TTBR1 page-table root pointers for the kernel virtual address space. */
+static unsigned long *l0_table_ttbr1;
+static unsigned long *l1_table_ttbr1;
+static unsigned long *l2_ram_table_ttbr1;
+#endif
+
 extern char __text_start[];
 extern char __text_end[];
 extern char __rodata_start[];
@@ -106,6 +118,8 @@ extern char __bss_start[];
 extern char __bss_end[];
 extern char __stack_bottom[];
 extern char __stack_top[];
+extern char __stack_guard[];
+extern char __stack_guard_end[];
 extern char __kernel_end[];
 
 struct mmu_debug_target {
@@ -157,9 +171,8 @@ static void mmu_debug_copy_name(char *destination, const char *source)
     destination[index] = '\0';
 }
 
-static void mmu_debug_set_chunk_name(char *destination, unsigned long chunk_index)
+static void mmu_debug_set_chunk_name(char *destination, const char *prefix, unsigned long chunk_index)
 {
-    static const char prefix[] = "l3-chunk-";
     char digits[21];
     unsigned long digit_count;
     unsigned long value;
@@ -174,7 +187,7 @@ static void mmu_debug_set_chunk_name(char *destination, unsigned long chunk_inde
     } while (value != 0UL && digit_count < sizeof(digits));
 
     output_index = 0UL;
-    for (index = 0UL; index < (sizeof(prefix) - 1UL) && output_index < (MMU_DEBUG_MAX_TABLE_NAME_LEN - 1UL); index++) {
+    for (index = 0UL; prefix[index] != '\0' && output_index < (MMU_DEBUG_MAX_TABLE_NAME_LEN - 1UL); index++) {
         destination[output_index++] = prefix[index];
     }
 
@@ -216,6 +229,10 @@ static const char *mmu_region_name(unsigned long address)
         return ".data";
     }
 
+    if (address >= (unsigned long)__stack_guard && address < (unsigned long)__stack_guard_end) {
+        return "stack-guard";
+    }
+
     if (address >= (unsigned long)__stack_bottom && address < (unsigned long)__stack_top) {
         return "boot-stack";
     }
@@ -237,6 +254,11 @@ static const char *mmu_region_name(unsigned long address)
  */
 static unsigned long kernel_page_attrs(unsigned long address)
 {
+    /* Guard page: intentionally unmapped to catch stack overflow. */
+    if (address >= (unsigned long)__stack_guard && address < (unsigned long)__stack_guard_end) {
+        return 0;
+    }
+
     if (address >= (unsigned long)__text_start && address < (unsigned long)__text_end) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RO |
@@ -365,9 +387,19 @@ static void mmu_debug_print_desc_kind(const char *level_name, const char *kind)
 
 /*
  * Software walk helper for bring-up: it follows the page-table pointers we just
- * built in RAM and prints where translation stops. Because Stage 6 still uses an
- * identity map, the table addresses can be dereferenced directly before MMU enable.
+ * built in RAM and prints where translation stops. Descriptor addresses are always
+ * physical. Before the MMU is enabled we dereference them directly; after, we
+ * access them through the TTBR1 kernel VA.
  */
+static unsigned long *desc_pa_to_table(unsigned long pa)
+{
+    if (mmu_enabled) {
+        return (unsigned long *)pa_to_va(pa);
+    }
+
+    return (unsigned long *)pa;
+}
+
 static void mmu_debug_walk(unsigned long address)
 {
     unsigned long l0_index;
@@ -401,7 +433,7 @@ static void mmu_debug_walk(unsigned long address)
     }
     mmu_debug_print_desc_kind("walk l0", "table");
 
-    l1_walk_table = (unsigned long *)(l0_entry & MMU_DESC_ADDR_MASK);
+    l1_walk_table = desc_pa_to_table(l0_entry & MMU_DESC_ADDR_MASK);
     l1_index = l1_index_for(address);
     l1_entry = l1_walk_table[l1_index];
     mmu_debug_print_index("walk l1", l1_index);
@@ -423,7 +455,7 @@ static void mmu_debug_walk(unsigned long address)
     }
     mmu_debug_print_desc_kind("walk l1", "table");
 
-    l2_walk_table = (unsigned long *)(l1_entry & MMU_DESC_ADDR_MASK);
+    l2_walk_table = desc_pa_to_table(l1_entry & MMU_DESC_ADDR_MASK);
     l2_index = l2_index_for(address);
     l2_entry = l2_walk_table[l2_index];
     mmu_debug_print_index("walk l2", l2_index);
@@ -445,7 +477,7 @@ static void mmu_debug_walk(unsigned long address)
     }
     mmu_debug_print_desc_kind("walk l2", "table");
 
-    l3_walk_table = (unsigned long *)(l2_entry & MMU_DESC_ADDR_MASK);
+    l3_walk_table = desc_pa_to_table(l2_entry & MMU_DESC_ADDR_MASK);
     l3_index = l3_index_for(address);
     l3_entry = l3_walk_table[l3_index];
     mmu_debug_print_index("walk l3", l3_index);
@@ -623,7 +655,7 @@ static int build_identity_map(void)
         unsigned long chunk_index;
 
         chunk_index = (chunk_base - QEMU_VIRT_RAM_BASE) / MMU_L2_BLOCK_SIZE;
-        mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], chunk_index);
+        mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], "l3-chunk-", chunk_index);
         l3_table = alloc_named_table_page(mmu_table_page_names[mmu_table_page_count]);
         if (l3_table == (unsigned long *)0) {
             log_info("mmu init failed: no free pages for l3 table");
@@ -633,8 +665,12 @@ static int build_identity_map(void)
         l2_ram_table[l2_index_for(chunk_base)] = ((unsigned long)l3_table) | MMU_DESC_TABLE;
 
         for (address = chunk_base; address < chunk_base + MMU_L2_BLOCK_SIZE; address += PAGE_SIZE) {
+            unsigned long attrs = kernel_page_attrs(address);
+
+            if (attrs == 0)
+                continue; /* guard page: leave entry invalid */
             l3_table[l3_index_for(address)] = (address & ~(PAGE_SIZE - 1UL)) |
-                                              kernel_page_attrs(address) |
+                                              attrs |
                                               MMU_DESC_PAGE;
         }
     }
@@ -653,6 +689,87 @@ static int build_identity_map(void)
 
     return 1;
 }
+
+#ifdef CONFIG_KERNEL_VIRTUAL
+/*
+ * Build a second set of page tables for the kernel virtual address space
+ * reachable through TTBR1_EL1.  The mapping covers the same physical
+ * regions with the same permissions as the identity map.  Once active,
+ * the CPU selects these tables whenever the upper VA bits are all ones
+ * (bits[63:48] == 0xFFFF for T1SZ == 16), making every PA accessible at
+ * VA = PA + 0xFFFF000000000000.
+ *
+ * The TTBR1 tables are independent allocations so the identity map in
+ * TTBR0 can be removed later without touching the kernel tables.
+ */
+static int build_kernel_map(void)
+{
+    unsigned long fine_map_end;
+    unsigned long kernel_map_end;
+    unsigned long minimum_map_end;
+    unsigned long chunk_base;
+    unsigned long address;
+
+    /* L1 device block — same PA as the identity map. */
+    l1_table_ttbr1[l1_index_for(0x00000000UL)] = 0x00000000UL |
+                                                   MMU_ATTR_DEVICE |
+                                                   MMU_AP_RW |
+                                                   MMU_SH_NON_SHAREABLE |
+                                                   MMU_AF |
+                                                   MMU_PXN |
+                                                   MMU_UXN |
+                                                   MMU_DESC_BLOCK;
+
+    l0_table_ttbr1[l0_index_for(0x00000000UL)] = ((unsigned long)l1_table_ttbr1) | MMU_DESC_TABLE;
+
+    l1_table_ttbr1[l1_index_for(QEMU_VIRT_RAM_BASE)] = ((unsigned long)l2_ram_table_ttbr1) | MMU_DESC_TABLE;
+
+    kernel_map_end = align_up((unsigned long)__kernel_end, MMU_L2_BLOCK_SIZE);
+    minimum_map_end = QEMU_VIRT_RAM_BASE + (MMU_KERNEL_FINE_MAP_MIN_CHUNKS * MMU_L2_BLOCK_SIZE);
+    fine_map_end = kernel_map_end;
+    if (fine_map_end < minimum_map_end) {
+        fine_map_end = minimum_map_end;
+    }
+
+    for (chunk_base = QEMU_VIRT_RAM_BASE; chunk_base < fine_map_end; chunk_base += MMU_L2_BLOCK_SIZE) {
+        unsigned long *l3_table;
+        unsigned long chunk_index;
+
+        chunk_index = (chunk_base - QEMU_VIRT_RAM_BASE) / MMU_L2_BLOCK_SIZE;
+        mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], "t1-l3-chunk-", chunk_index);
+        l3_table = alloc_named_table_page(mmu_table_page_names[mmu_table_page_count]);
+        if (l3_table == (unsigned long *)0) {
+            log_info("mmu init failed: no free pages for t1 l3 table");
+            return 0;
+        }
+
+        l2_ram_table_ttbr1[l2_index_for(chunk_base)] = ((unsigned long)l3_table) | MMU_DESC_TABLE;
+
+        for (address = chunk_base; address < chunk_base + MMU_L2_BLOCK_SIZE; address += PAGE_SIZE) {
+            unsigned long attrs = kernel_page_attrs(address);
+
+            if (attrs == 0)
+                continue; /* guard page: leave entry invalid */
+            l3_table[l3_index_for(address)] = (address & ~(PAGE_SIZE - 1UL)) |
+                                              attrs |
+                                              MMU_DESC_PAGE;
+        }
+    }
+
+    for (address = fine_map_end; address < QEMU_VIRT_RAM_END; address += MMU_L2_BLOCK_SIZE) {
+        l2_ram_table_ttbr1[l2_index_for(address)] = (address & ~(MMU_L2_BLOCK_SIZE - 1UL)) |
+                                                     MMU_ATTR_NORMAL |
+                                                     MMU_AP_RW |
+                                                     MMU_SH_INNER_SHAREABLE |
+                                                     MMU_AF |
+                                                     MMU_PXN |
+                                                     MMU_UXN |
+                                                     MMU_DESC_BLOCK;
+    }
+
+    return 1;
+}
+#endif /* CONFIG_KERNEL_VIRTUAL */
 
 void mmu_init(void)
 {
@@ -680,11 +797,33 @@ void mmu_init(void)
 
     log_info("mmu tables allocated");
 
+#ifdef CONFIG_KERNEL_VIRTUAL
+    l0_table_ttbr1 = alloc_named_table_page("t1-l0-root");
+    l1_table_ttbr1 = alloc_named_table_page("t1-l1-root");
+    l2_ram_table_ttbr1 = alloc_named_table_page("t1-l2-ram");
+    if (l0_table_ttbr1 == (unsigned long *)0 ||
+        l1_table_ttbr1 == (unsigned long *)0 ||
+        l2_ram_table_ttbr1 == (unsigned long *)0) {
+        log_info("mmu init failed: no free pages for ttbr1 tables");
+        return;
+    }
+
+    log_info("mmu ttbr1 tables allocated");
+#endif
+
     if (!build_identity_map()) {
         return;
     }
 
-    log_info("mmu maps built");
+#ifdef CONFIG_KERNEL_VIRTUAL
+    if (!build_kernel_map()) {
+        return;
+    }
+
+    log_info("mmu maps built (identity + kernel)");
+#else
+    log_info("mmu identity map built");
+#endif
 
     log_write("[info] l0 root entry=");
     log_write_hex(l0_table[l0_index_for(QEMU_VIRT_RAM_BASE)]);
@@ -711,13 +850,21 @@ void mmu_init(void)
      */
     mair = (MMU_MAIR_DEVICE_nGnRnE << 0) | (MMU_MAIR_NORMAL_WBWA << 8);
     /*
-     * TCR_EL1 defines how TTBR0_EL1 addresses are translated:
-     * - T0SZ[5:0]   = 16  -> 48-bit VA space
-     * - IRGN0[9:8]  = 01  -> inner WB/WA cacheability for table walks
-     * - ORGN0[11:10]= 01  -> outer WB/WA cacheability for table walks
-     * - SH0[13:12]  = 11  -> inner-shareable table walks
-     * - TG0[15:14]  = 00  -> 4 KiB granule
-     * - EPD1[23]    = 1   -> disable TTBR1_EL1 walks; this kernel only uses TTBR0_EL1
+     * TCR_EL1 defines how TTBR0_EL1 (and TTBR1_EL1) addresses are translated:
+     * - T0SZ[5:0]   = 16  -> 48-bit VA space for TTBR0
+     * - IRGN0[9:8]  = 01  -> inner WB/WA cacheability for TTBR0 walks
+     * - ORGN0[11:10]= 01  -> outer WB/WA cacheability for TTBR0 walks
+     * - SH0[13:12]  = 11  -> inner-shareable TTBR0 walks
+     * - TG0[15:14]  = 00  -> 4 KiB granule for TTBR0
+     * When CONFIG_KERNEL_VIRTUAL:
+     * - T1SZ[21:16] = 16  -> 48-bit VA space for TTBR1
+     * - IRGN1[25:24]= 01  -> inner WB/WA cacheability for TTBR1 walks
+     * - ORGN1[27:26]= 01  -> outer WB/WA cacheability for TTBR1 walks
+     * - SH1[29:28]  = 11  -> inner-shareable TTBR1 walks
+     * - TG1[31:30]  = 10  -> 4 KiB granule for TTBR1
+     * Otherwise:
+     * - EPD1[23]    = 1   -> disable TTBR1 translations
+     * Common:
      * - IPS[34:32]  = 101 -> 48-bit physical address size
      */
     tcr = MMU_T0SZ |
@@ -725,27 +872,43 @@ void mmu_init(void)
           (1UL << 10) |
           (3UL << 12) |
           (0UL << 14) |
-          (1UL << 23) |
-            MMU_TCR_IPS_48BIT;
+#ifdef CONFIG_KERNEL_VIRTUAL
+          MMU_T1SZ |
+          (1UL << 24) |
+          (1UL << 26) |
+          (3UL << 28) |
+          MMU_TG1_4K |
+#else
+          (1UL << 23) |  /* EPD1 = 1: disable TTBR1 translations */
+#endif
+          MMU_TCR_IPS_48BIT;
 
     /*
      * Bring the translation regime live in this order:
      * 1. MAIR_EL1  <- memory attribute slots used by descriptors
      * 2. TCR_EL1   <- translation size/shareability/cacheability/granule
-     * 3. TTBR0_EL1 <- base address of the L0 root table
-     * 4. TLBI      <- discard any stale EL1 Stage-1 translations
-     * 5. DSB/ISB   <- complete the register/TLB programming before SCTLR_EL1.M
+     * 3. TTBR0_EL1 <- base address of the identity map L0 root table
+     * 4. TTBR1_EL1 <- base address of the kernel VA L0 root table
+     * 5. TLBI      <- discard any stale EL1 Stage-1 translations
+     * 6. DSB/ISB   <- complete the register/TLB programming before SCTLR_EL1.M
      */
     __asm__ volatile(
         "dsb ish\n"
         "msr mair_el1, %0\n"
         "msr tcr_el1, %1\n"
         "msr ttbr0_el1, %2\n"
+#ifdef CONFIG_KERNEL_VIRTUAL
+        "msr ttbr1_el1, %3\n"
+#endif
         "tlbi vmalle1\n"
         "dsb ish\n"
         "isb\n"
         :
+#ifdef CONFIG_KERNEL_VIRTUAL
+        : "r"(mair), "r"(tcr), "r"(l0_table), "r"(l0_table_ttbr1)
+#else
         : "r"(mair), "r"(tcr), "r"(l0_table)
+#endif
         : "memory");
 
     log_info("mmu control registers programmed");
@@ -783,6 +946,11 @@ void mmu_init(void)
     log_write("[info] ttbr0_el1=");
     log_write_hex((unsigned long)l0_table);
     log_putc('\n');
+#ifdef CONFIG_KERNEL_VIRTUAL
+    log_write("[info] ttbr1_el1=");
+    log_write_hex((unsigned long)l0_table_ttbr1);
+    log_putc('\n');
+#endif
     log_write("[info] mmu table pages=");
     log_write_u64(table_pages_used);
     log_putc('\n');
@@ -797,3 +965,50 @@ unsigned long mmu_table_pages_used(void)
 {
     return table_pages_used;
 }
+
+#ifdef CONFIG_KERNEL_VIRTUAL
+void mmu_disable_ttbr0(void)
+{
+    unsigned long tcr;
+    unsigned long i;
+
+    if (!mmu_enabled) {
+        return;
+    }
+
+    /* Set EPD0 (bit 7) to disable TTBR0 translations. */
+    __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr));
+    tcr |= (1UL << 7);
+    __asm__ volatile(
+        "msr tcr_el1, %0\n"
+        "isb\n"
+        "tlbi vmalle1\n"
+        "dsb ish\n"
+        "isb\n"
+        :
+        : "r"(tcr)
+        : "memory");
+
+    log_info("ttbr0 disabled (EPD0=1)");
+
+    /* Return the TTBR0 table pages to the page allocator. */
+    for (i = 0; i < mmu_table_page_count; i++) {
+        const char *name = mmu_table_page_names[i];
+
+        /* TTBR1 pages are prefixed with "t1-"; skip them. */
+        if (name[0] == 't' && name[1] == '1' && name[2] == '-')
+            continue;
+
+        page_free((void *)mmu_table_page_addresses[i]);
+        table_pages_used--;
+    }
+
+    l0_table = (unsigned long *)0;
+    l1_table = (unsigned long *)0;
+    l2_ram_table = (unsigned long *)0;
+
+    log_write("[info] mmu table pages after ttbr0 free=");
+    log_write_u64(table_pages_used);
+    log_putc('\n');
+}
+#endif

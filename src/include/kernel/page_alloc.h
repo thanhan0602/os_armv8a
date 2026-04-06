@@ -14,7 +14,9 @@
  */
 void page_allocator_init(void);
 void *page_alloc(void);
+void *page_alloc_contiguous(unsigned long page_count);
 void page_free(void *page);
+void page_free_contiguous(void *page, unsigned long page_count);
 
 /* High-level allocator counters used by boot logs and self-checks. */
 unsigned long page_allocator_total_pages(void);

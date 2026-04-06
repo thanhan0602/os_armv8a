@@ -14,6 +14,15 @@
 void mmu_init(void);
 int mmu_is_enabled(void);
 
+#ifdef CONFIG_KERNEL_VIRTUAL
+/*
+ * Disable TTBR0 translations (set EPD0=1 in TCR_EL1) and return the
+ * TTBR0 table pages to the page allocator.  Only meaningful when the
+ * kernel is running at high VA through TTBR1.
+ */
+void mmu_disable_ttbr0(void);
+#endif
+
 /* Number of physical pages currently consumed by translation tables. */
 unsigned long mmu_table_pages_used(void);
 

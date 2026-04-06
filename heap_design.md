@@ -8,7 +8,7 @@ Tài liệu này mô tả baseline Stage 7 hiện tại: một kernel heap nhỏ
 
 Kernel heap hiện được khởi tạo sau `mmu_init()`.
 
-Heap dùng page allocator làm backend, nhưng không yêu cầu các page phải liên tiếp vật lý. Mỗi heap page là một arena độc lập, bên trong có danh sách block riêng để phục vụ `kmalloc` và `kfree`.
+Heap dùng page allocator làm backend. Với allocation nhỏ, heap vẫn dùng arena một page như trước. Với allocation lớn hơn sức chứa của một page, heap xin một span page vật lý liên tiếp rồi dùng toàn bộ span đó làm một arena lớn hơn.
 
 Thiết kế hiện tại ưu tiên:
 
@@ -18,11 +18,13 @@ Thiết kế hiện tại ưu tiên:
 
 ## Cấu trúc nội bộ
 
-Mỗi page heap có:
+Mỗi heap arena có:
 
 - `struct kernel_heap_page` ở đầu page
 - một `struct kernel_heap_block` đầu tiên mô tả phần free còn lại trong page
 - các block tiếp theo được split dần khi có allocation
+
+Arena có thể rộng `1` page hoặc nhiều page liên tiếp, nhưng logic block bên trong vẫn giống nhau.
 
 Mỗi `kernel_heap_block` có:
 
@@ -41,7 +43,8 @@ Các allocation được căn chỉnh theo `16` byte.
 2. duyệt các heap page hiện có để tìm free block đủ lớn
 3. nếu block lớn hơn cần thiết, split block
 4. đánh dấu block là allocated và trả về địa chỉ ngay sau header block
-5. nếu không page nào đủ chỗ, xin thêm một page mới từ `page_alloc()` rồi thử lại
+5. nếu không arena nào đủ chỗ, tính số page tối thiểu cần thiết cho request đó
+6. xin một span page liên tiếp từ `page_alloc_contiguous()` rồi seed thành một arena mới
 
 ## Luồng giải phóng
 
@@ -54,12 +57,12 @@ Các allocation được căn chỉnh theo `16` byte.
 
 ## Giới hạn hiện tại
 
-Baseline này cố ý giữ phạm vi hẹp:
+Baseline này vẫn giữ phạm vi hẹp:
 
-- mỗi allocation phải vừa trong một heap page đơn lẻ
-- chưa có allocation nhiều page liên tiếp
-- chưa có heap virtual range riêng
-- chưa trả page rỗng hoàn toàn về lại page allocator
+- allocation lớn cần span page vật lý liên tiếp
+- heap chưa có virtual range riêng
+- arena rỗng chưa được trả về lại page allocator
+- chưa có guard pages hoặc red-zone giữa các allocation
 
 Điều này vẫn đủ cho các object kernel nhỏ như node, queue, descriptor, metadata cấu hình, hoặc buffer ngắn.
 
@@ -78,6 +81,7 @@ Boot-time self-test trong `kernel_main()` hiện:
 
 - khởi tạo heap
 - cấp phát hai object nhỏ
+- cấp phát một object lớn hơn một page
 - ghi dữ liệu vào object đã cấp phát
 - log thống kê trước và sau `kfree`
 
@@ -85,7 +89,7 @@ Boot-time self-test trong `kernel_main()` hiện:
 
 Các bước tiếp theo có giá trị thực tế:
 
-1. thêm chiến lược allocation nhiều page cho object lớn
-2. tách heap sang một virtual range riêng thay vì chỉ dựa vào identity map hiện tại
-3. trả các heap page hoàn toàn rỗng về lại page allocator
+1. trả các heap arena hoàn toàn rỗng về lại page allocator
+2. thêm heap-specific debug targets để soi allocation lớn và span liên tiếp
+3. cân nhắc virtual heap range riêng nếu không còn muốn phụ thuộc vào contiguous physical spans
 4. thêm guard pattern hoặc sanity check để bắt ghi tràn block sớm hơn

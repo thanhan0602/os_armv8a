@@ -147,6 +147,7 @@ exception_sync_entry:
     mrs x2, elr_el1
     mrs x3, spsr_el1
     mrs x4, far_el1
+    mov x5, sp
     bl exception_handle_sync
 
 1:
@@ -158,6 +159,7 @@ exception_irq_entry:
     mrs x2, elr_el1
     mrs x3, spsr_el1
     mrs x4, far_el1
+    mov x5, sp
     bl exception_handle_irq
     restore_context
     eret

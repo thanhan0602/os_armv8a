@@ -17,6 +17,11 @@
                     "description": "Enable pretty-printing for gdb",
                     "text": "-enable-pretty-printing",
                     "ignoreFailures": true
+                },
+                {
+                    "description": "Load kernel symbols at TTBR1 high VA",
+                    "text": "add-symbol-file ${workspaceFolder}/build/kernel8.elf -o 0xFFFF000000000000",
+                    "ignoreFailures": false
                 }
             ],
             "preLaunchTask": "Start QEMU Debug"

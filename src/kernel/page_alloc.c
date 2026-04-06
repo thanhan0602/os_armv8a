@@ -2,6 +2,8 @@
 
 #include <arch/arm/virt.h>
 #include <kernel/log.h>
+#include <kernel/mmu.h>
+#include <kernel/vm.h>
 
 /*
  * Page allocator state model:
@@ -40,12 +42,44 @@ static unsigned long align_up(unsigned long value, unsigned long alignment)
     return (value + alignment - 1UL) & ~(alignment - 1UL);
 }
 
-static void zero_page(void *page)
+/*
+ * Convert a physical page address to a pointer that can be safely
+ * dereferenced at the current execution context:
+ *
+ * - Before the MMU is enabled, PA == usable pointer (identity mapping or
+ *   no translation at all).
+ * - After the MMU is enabled, the page must be reached through the
+ *   TTBR1 kernel VA (PA + KERNEL_VA_OFFSET).
+ */
+static void *page_pa_to_ptr(unsigned long pa)
+{
+    if (mmu_is_enabled()) {
+        return pa_to_va(pa);
+    }
+
+    return (void *)pa;
+}
+
+/*
+ * Convert a pointer back to a physical address.  The inverse of
+ * page_pa_to_ptr(): strips KERNEL_VA_OFFSET when the MMU is active,
+ * or is a plain cast when it is not.
+ */
+static unsigned long page_ptr_to_pa(const void *ptr)
+{
+    if (mmu_is_enabled()) {
+        return va_to_pa(ptr);
+    }
+
+    return (unsigned long)ptr;
+}
+
+static void zero_page(unsigned long page_pa)
 {
     unsigned long *words;
     unsigned long index;
 
-    words = (unsigned long *)page;
+    words = (unsigned long *)page_pa_to_ptr(page_pa);
     for (index = 0; index < (PAGE_SIZE / sizeof(unsigned long)); index++) {
         words[index] = 0UL;
     }
@@ -104,6 +138,26 @@ static unsigned long count_free_list_nodes(void)
     return count;
 }
 
+static void page_allocator_rebuild_free_list(void)
+{
+    unsigned long page_addr;
+
+    page_free_list = (struct page_node *)0;
+    for (page_addr = managed_end - PAGE_SIZE; page_addr >= managed_start; page_addr -= PAGE_SIZE) {
+        if (page_state[page_index_from_address(page_addr)] == PAGE_STATE_FREE) {
+            struct page_node *page;
+
+            page = (struct page_node *)page_pa_to_ptr(page_addr);
+            page->next = page_free_list;
+            page_free_list = page;
+        }
+
+        if (page_addr == managed_start) {
+            break;
+        }
+    }
+}
+
 void page_allocator_init(void)
 {
     unsigned long page_addr;
@@ -137,7 +191,7 @@ void page_allocator_init(void)
     for (page_addr = managed_start; (page_addr + PAGE_SIZE) <= managed_end; page_addr += PAGE_SIZE) {
         struct page_node *page;
 
-        page = (struct page_node *)page_addr;
+        page = (struct page_node *)page_pa_to_ptr(page_addr);
         page->next = page_free_list;
         page_free_list = page;
         page_state[page_index_from_address(page_addr)] = PAGE_STATE_FREE;
@@ -170,10 +224,52 @@ void *page_alloc(void)
     }
 
     page_free_list = page->next;
-    page_state[page_index_from_address((unsigned long)page)] = PAGE_STATE_ALLOCATED;
+    page_state[page_index_from_address(page_ptr_to_pa(page))] = PAGE_STATE_ALLOCATED;
     free_pages--;
-    zero_page((void *)page);
-    return (void *)page;
+    zero_page(page_ptr_to_pa(page));
+    return (void *)page_ptr_to_pa(page);
+}
+
+void *page_alloc_contiguous(unsigned long page_count)
+{
+    unsigned long run_start;
+    unsigned long run_length;
+    unsigned long page_addr;
+    unsigned long offset;
+
+    if (page_count == 0UL || page_count > free_pages) {
+        return (void *)0;
+    }
+
+    run_start = 0UL;
+    run_length = 0UL;
+
+    for (page_addr = managed_start; page_addr < managed_end; page_addr += PAGE_SIZE) {
+        if (page_state[page_index_from_address(page_addr)] == PAGE_STATE_FREE) {
+            if (run_length == 0UL) {
+                run_start = page_addr;
+            }
+
+            run_length++;
+            if (run_length == page_count) {
+                for (offset = 0UL; offset < page_count; offset++) {
+                    unsigned long alloc_addr;
+
+                    alloc_addr = run_start + (offset * PAGE_SIZE);
+                    page_state[page_index_from_address(alloc_addr)] = PAGE_STATE_ALLOCATED;
+                    zero_page(alloc_addr);
+                }
+
+                free_pages -= page_count;
+                page_allocator_rebuild_free_list();
+                return (void *)run_start;
+            }
+        } else {
+            run_length = 0UL;
+        }
+    }
+
+    return (void *)0;
 }
 
 void page_free(void *page)
@@ -206,11 +302,55 @@ void page_free(void *page)
     }
 
     /* Return the page to the free-list head and restore its metadata to FREE. */
-    node = (struct page_node *)page;
+    node = (struct page_node *)page_pa_to_ptr(page_addr);
     node->next = page_free_list;
     page_free_list = node;
     page_state[page_index_from_address(page_addr)] = PAGE_STATE_FREE;
     free_pages++;
+}
+
+void page_free_contiguous(void *page, unsigned long page_count)
+{
+    unsigned long page_addr;
+    unsigned long offset;
+
+    if (page == (void *)0 || page_count == 0UL) {
+        return;
+    }
+
+    page_addr = (unsigned long)page;
+    if ((page_addr & (PAGE_SIZE - 1UL)) != 0UL) {
+        invalid_free_count++;
+        page_allocator_warn("ignoring unaligned contiguous page free", page_addr);
+        return;
+    }
+
+    if (page_addr < managed_start || (page_addr + (page_count * PAGE_SIZE)) > managed_end) {
+        invalid_free_count++;
+        page_allocator_warn("ignoring out-of-range contiguous page free", page_addr);
+        return;
+    }
+
+    for (offset = 0UL; offset < page_count; offset++) {
+        unsigned long free_addr;
+
+        free_addr = page_addr + (offset * PAGE_SIZE);
+        if (page_state[page_index_from_address(free_addr)] != PAGE_STATE_ALLOCATED) {
+            double_free_count++;
+            page_allocator_warn("ignoring duplicate or invalid contiguous page free", free_addr);
+            return;
+        }
+    }
+
+    for (offset = 0UL; offset < page_count; offset++) {
+        unsigned long free_addr;
+
+        free_addr = page_addr + (offset * PAGE_SIZE);
+        page_state[page_index_from_address(free_addr)] = PAGE_STATE_FREE;
+    }
+
+    free_pages += page_count;
+    page_allocator_rebuild_free_list();
 }
 
 unsigned long page_allocator_total_pages(void)

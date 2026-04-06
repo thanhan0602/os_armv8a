@@ -12,6 +12,11 @@ _start:
     b 1b
 
 0:
+    /*
+     * Running at physical address with MMU off.
+     * Linker symbols are at PA (VMA == LMA) so they can be used
+     * directly for stack setup and BSS clearing.
+     */
     ldr x0, =__stack_top
     mov sp, x0
 
@@ -32,7 +37,33 @@ _start:
     msr cpacr_el1, x0
     isb
 
+    bl kernel_main_early
+
+#ifdef CONFIG_KERNEL_VIRTUAL
+    /*
+     * kernel_main_early has returned.  The MMU is now on with:
+     *   TTBR0_EL1 -> identity map  (VA == PA)
+     *   TTBR1_EL1 -> kernel VA map (VA == PA + KERNEL_VA_OFFSET)
+     *
+     * Switch execution to the kernel virtual address space:
+     * 1. Load KERNEL_VA_OFFSET
+     * 2. Move SP from PA to its corresponding VA
+     * 3. Compute kernel_main VA via adrp+add (gives PA) + offset
+     * 4. Branch to the high VA — TTBR1 takes over
+     */
+    ldr x9, =__kernel_va_offset
+
+    mov x0, sp
+    add x0, x0, x9
+    mov sp, x0
+
+    adrp x0, kernel_main
+    add  x0, x0, :lo12:kernel_main
+    add  x0, x0, x9
+    br   x0
+#else
     bl kernel_main
+#endif
 
 4:
     wfe

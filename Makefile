@@ -16,10 +16,16 @@ LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -static -no-pie -Wl,--build-id
 DEBUG_PRE_MMU ?= 1
 DEBUG_MMU_BOOT ?= 1
 DEBUG_POST_MMU ?= 1
+KERNEL_VIRTUAL ?= 1
 
 CFLAGS += -DKERNEL_DEBUG_ENABLE_PRE_MMU=$(DEBUG_PRE_MMU)
 CFLAGS += -DKERNEL_DEBUG_ENABLE_MMU_BOOT=$(DEBUG_MMU_BOOT)
 CFLAGS += -DKERNEL_DEBUG_ENABLE_POST_MMU=$(DEBUG_POST_MMU)
+
+ifeq ($(KERNEL_VIRTUAL),1)
+CFLAGS += -DCONFIG_KERNEL_VIRTUAL=1
+ASFLAGS += -DCONFIG_KERNEL_VIRTUAL=1
+endif
 
 C_SOURCES := $(shell find $(SRC_DIR) -type f -name '*.c')
 S_SOURCES := $(shell find $(SRC_DIR) -type f -name '*.S')

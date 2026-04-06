@@ -52,11 +52,12 @@ Implemented:
 - 16-slot vector table in `src/arch/arm/exception_vectors.S`
 - Exception installation and dump logic in `src/kernel/exception.c`
 - Synchronous exception self-test helper for validating fault handling
+- General-purpose register dump for synchronous faults, including `x0..x30`, entry SP, `FPCR`, and `FPSR`
 
 Current behavior:
 - Kernel boots
 - Logging works over UART
-- Kernel installs vectors and can report synchronous faults with ESR/ELR/SPSR dumps
+- Kernel installs vectors and can report synchronous faults with ESR/ELR/SPSR/FAR plus full general-purpose register dumps
 
 ### Stage 4: Timer And Interrupts
 
@@ -130,10 +131,20 @@ Current behavior:
 - The remaining QEMU RAM range continues to use larger `L2` block mappings for simplicity and lower table overhead
 - MMU boot-time debug targets now flow through the same framework as page-allocator debug targets, so software walk and hardware probe logs can be correlated from one target system
 
-Design note for later consideration:
-- The current Stage 6 baseline still relies on broad identity mapping for simplicity and debugability.
-- A later architectural step can introduce a separate kernel virtual layout so kernel text, rodata, data, heap, stacks, MMIO, and optional physical direct-map regions live at intentionally chosen virtual addresses instead of broadly using `VA = PA`.
-- This is intentionally deferred until after the current MMU, cache, timer, and exception paths remain stable under the simpler identity-mapped baseline.
+Kernel virtual layout (completed):
+- Added `vm.h` with `KERNEL_VA_OFFSET`, `pa_to_va()` and `va_to_pa()` macros. Offset is `0xFFFF000000000000` when `CONFIG_KERNEL_VIRTUAL=1`, `0` when identity-only.
+- Linker script exports `__kernel_va_offset` symbol and defines `KERNEL_LMA_BASE`, `KERNEL_VA_OFFSET`, `KERNEL_VMA_BASE`
+- `mmu_init()` now builds a second set of page tables for `TTBR1_EL1` (kernel VA) alongside the existing `TTBR0_EL1` identity map (when `CONFIG_KERNEL_VIRTUAL=1`)
+- `TCR_EL1` enables both TTBR0 and TTBR1 walks when virtual, or sets `EPD1=1` to disable TTBR1 when identity-only
+- `start.S` calls `kernel_main_early()` at PA (pre-MMU through post-MMU-enable), then uses a trampoline (`adrp+add+KERNEL_VA_OFFSET`) to jump to `kernel_main()` at the kernel VA (when virtual), or calls `kernel_main()` directly (when identity)
+- PA→VA migration complete: page_alloc, heap, mmu walks, MMIO drivers all use conditional PA/VA conversion via `mmu_is_enabled()`
+- Runtime verified: both `KERNEL_VIRTUAL=1` (high VA, 10 table pages, heap at `0xFFFF...`) and `KERNEL_VIRTUAL=0` (PA, 5 table pages, heap at `0x4...`) boot clean with timer ticks and zero mismatches
+- TTBR0 identity map still present; will be repurposed for user-space (TTBR0 for EL0) or removed
+
+Bug encountered during this work:
+- First attempt set VMA=VA in linker.ld (`0xFFFF000040080000`). This caused `const char *` fields inside `static const struct` arrays in `.rodata` to contain high VA values. Pre-MMU C code dereferenced these VA pointers before TTBR1 was active, causing an infinite fault loop.
+- Resolution: keep VMA=PA in linker so all pointer-in-data values remain physical addresses. The trampoline computes kernel VA at runtime via `adrp+add+offset`. This avoids the pre-MMU pointer problem entirely.
+- Lesson: a VMA=VA linker split requires the MMU (with TTBR1 mapping) to be active before any C code touches initialised pointer data. That demands moving page-table construction into assembly, which is significantly more complex.
 
 ### Stage 7: Kernel Heap
 
@@ -145,22 +156,39 @@ Goals:
 
 Implemented:
 - Added a page-backed kernel heap allocator with `kmalloc` and `kfree`
-- Used a page-local free-list layout so heap allocations do not require physically contiguous pages
-- Added boot-time heap statistics and a simple self-test allocation path in `kernel_main`
+- Added contiguous physical page allocation helpers to the page allocator for larger heap arenas
+- Used a page-local free-list layout for small allocations and multi-page contiguous arenas for larger allocations
+- Added boot-time heap statistics plus both small and larger-than-one-page self-test allocations in `kernel_main`
 
 Current behavior:
 - Kernel initializes a heap after MMU bring-up
-- Small dynamic allocations can be served and freed during boot
+- Small and larger-than-one-page dynamic allocations can be served and freed during boot while the kernel still relies on the current identity map
 - Heap usage and failure counters are logged so allocator growth is visible during bring-up
 
 ### Stage 8: Scheduler And Kernel Threads
 
-Status: planned
+Status: completed
 
 Goals:
 - Create kernel thread contexts
 - Switch execution between threads
 - Drive preemption from timer interrupts
+
+Implemented:
+- Callee-saved context struct (`x19-x30`, `SP`) for cooperative/preemptive switching
+- `switch_context()` assembly routine that saves/restores callee-saved registers
+- `task_entry_trampoline` that unmasks IRQs and calls the task entry function on first run
+- Round-robin `schedule()` called from the timer IRQ handler after EOI
+- `task_create()` allocates guard page + usable stack page contiguously from the page allocator
+- `task_exit()` marks task dead; dead tasks are reaped by `sched_reap_dead()` at the next schedule, freeing stack pages back to the allocator
+- Idle task (task 0) runs on the boot stack, integrated into the circular ready list
+- Two demo tasks (`task-a`, `task-b`) created at boot to verify round-robin scheduling
+
+Current behavior:
+- Scheduler cycles idle → task-b → task-a → idle every 500ms timer tick
+- Context switches logged for the first 8 switches
+- Dead tasks are unlinked from the ready list and their guard+stack pages are freed
+- Both `KERNEL_VIRTUAL=1` and `KERNEL_VIRTUAL=0` variants verified at runtime
 
 ### Stage 9: EL0 And Syscalls
 
@@ -199,6 +227,5 @@ Goals:
 
 ## Immediate Next Steps
 
-1. Add register dump helpers for general-purpose registers during faults.
-2. Extend the heap beyond the current single-page-allocation limit by introducing a dedicated virtual heap range or multi-page allocation strategy.
-3. Extend the fine-grained `L2/L3` mapping beyond the initial kernel region as preparation for more advanced VM work.
+1. Add heap-specific debug targets so large heap arenas can be inspected through the same target framework.
+2. Design the first incremental step toward per-process address spaces (Stage 10).

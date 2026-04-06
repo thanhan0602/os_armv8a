@@ -32,6 +32,8 @@ Page allocator hiện đã có các helper sau:
 - `page_allocator_log_managed_head(count)`
 - `page_allocator_check_consistency()`
 - `page_allocator_log_consistency()`
+- `page_alloc_contiguous(count)`
+- `page_free_contiguous(base, count)`
 
 ## Ý nghĩa từng helper
 
@@ -95,6 +97,18 @@ Ví dụ:
 ```
 
 Đây là dòng nên nhìn đầu tiên khi nghi ngờ allocator bị hỏng trạng thái nội bộ.
+
+### `page_alloc_contiguous` và `page_free_contiguous`
+
+Hai API này mở rộng allocator để cấp phát hoặc trả về một span nhiều page vật lý liên tiếp.
+
+Thiết kế hiện tại vẫn dùng `page_state[]` làm nguồn sự thật để tìm contiguous run, sau đó rebuild free list cho đơn giản và đúng đắn trong giai đoạn bring-up.
+
+Điều này chậm hơn allocator production-grade, nhưng phù hợp với mục tiêu hiện tại:
+
+- dễ kiểm chứng
+- dễ debug
+- đủ tốt cho số lượng allocation boot-time còn nhỏ
 
 ## Tích hợp với debug target framework
 

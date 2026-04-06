@@ -2,6 +2,7 @@
 
 #include <kernel/log.h>
 #include <kernel/page_alloc.h>
+#include <kernel/vm.h>
 
 /*
  * Heap layout inside one physical page:
@@ -18,8 +19,10 @@
  *   | more block headers/data |
  *   +-------------------------+
  *
- * Each page is independent. Blocks split and coalesce only within the same
- * page, which keeps the implementation simple for early kernel bring-up.
+ * Each arena is made of one or more contiguous physical pages, accessed
+ * through the kernel VA (pa_to_va).  Blocks split and coalesce only within
+ * the same arena, which keeps the implementation simple for early kernel
+ * bring-up.
  */
 #define KERNEL_HEAP_PAGE_MAGIC 0x4b48454150414745UL
 #define KERNEL_HEAP_ALIGNMENT  16UL
@@ -35,6 +38,7 @@ struct kernel_heap_block {
 /* Per-page metadata for a page that currently participates in the heap. */
 struct kernel_heap_page {
     unsigned long magic;
+    unsigned long page_count;
     struct kernel_heap_page *next;
     unsigned long usable_bytes;
     struct kernel_heap_block *first_block;
@@ -58,44 +62,76 @@ static unsigned long kernel_heap_min_split_size(void)
     return sizeof(struct kernel_heap_block) + KERNEL_HEAP_ALIGNMENT;
 }
 
-static struct kernel_heap_page *kernel_heap_page_from_pointer(void *ptr)
+static unsigned long kernel_heap_pages_for_size(unsigned long size)
 {
-    unsigned long page_base;
-    struct kernel_heap_page *page;
+    unsigned long aligned_size;
+    unsigned long block_start;
+    unsigned long required_bytes;
 
-    page_base = ((unsigned long)ptr) & ~(PAGE_SIZE - 1UL);
-    page = (struct kernel_heap_page *)page_base;
-    if (page->magic != KERNEL_HEAP_PAGE_MAGIC) {
-        return (struct kernel_heap_page *)0;
-    }
-
-    return page;
+    aligned_size = kernel_heap_align_up(size, KERNEL_HEAP_ALIGNMENT);
+    block_start = kernel_heap_align_up(sizeof(struct kernel_heap_page), KERNEL_HEAP_ALIGNMENT);
+    required_bytes = block_start + sizeof(struct kernel_heap_block) + aligned_size;
+    return kernel_heap_align_up(required_bytes, PAGE_SIZE) / PAGE_SIZE;
 }
 
-static struct kernel_heap_page *kernel_heap_add_page(void)
+static struct kernel_heap_page *kernel_heap_page_from_pointer(void *ptr)
+{
+    struct kernel_heap_page *page;
+
+    page = kernel_heap_pages;
+    while (page != (struct kernel_heap_page *)0) {
+        unsigned long arena_start;
+        unsigned long arena_end;
+
+        arena_start = (unsigned long)page;
+        arena_end = arena_start + (page->page_count * PAGE_SIZE);
+        if ((unsigned long)ptr >= arena_start && (unsigned long)ptr < arena_end) {
+            if (page->magic == KERNEL_HEAP_PAGE_MAGIC) {
+                return page;
+            }
+
+            return (struct kernel_heap_page *)0;
+        }
+
+        page = page->next;
+    }
+
+    return (struct kernel_heap_page *)0;
+}
+
+static struct kernel_heap_page *kernel_heap_add_arena(unsigned long page_count)
 {
     struct kernel_heap_page *page;
     struct kernel_heap_block *block;
     unsigned long block_start;
+    unsigned long total_bytes;
     unsigned long usable_bytes;
 
-    /* Request one physical page and seed it with a single large free block. */
-    page = (struct kernel_heap_page *)page_alloc();
-    if (page == (struct kernel_heap_page *)0) {
-        kernel_heap_failed++;
-        return (struct kernel_heap_page *)0;
+    /* Request one or more contiguous physical pages and seed a single free block. */
+    {
+        void *raw_pa;
+
+        raw_pa = page_alloc_contiguous(page_count);
+        if (raw_pa == (void *)0) {
+            kernel_heap_failed++;
+            return (struct kernel_heap_page *)0;
+        }
+
+        page = (struct kernel_heap_page *)pa_to_va(raw_pa);
     }
 
     block_start = kernel_heap_align_up((unsigned long)page + sizeof(struct kernel_heap_page), KERNEL_HEAP_ALIGNMENT);
-    usable_bytes = PAGE_SIZE - (block_start - (unsigned long)page) - sizeof(struct kernel_heap_block);
+    total_bytes = page_count * PAGE_SIZE;
+    usable_bytes = total_bytes - (block_start - (unsigned long)page) - sizeof(struct kernel_heap_block);
     block = (struct kernel_heap_block *)block_start;
 
     page->magic = KERNEL_HEAP_PAGE_MAGIC;
+    page->page_count = page_count;
     page->next = kernel_heap_pages;
     page->usable_bytes = usable_bytes;
     page->first_block = block;
     kernel_heap_pages = page;
-    kernel_heap_pages_used++;
+    kernel_heap_pages_used += page_count;
     kernel_heap_free_space += usable_bytes;
 
     block->size = usable_bytes;
@@ -134,11 +170,11 @@ static void kernel_heap_split_block(struct kernel_heap_block *block, unsigned lo
     block->next = new_block;
 }
 
-static void *kernel_heap_allocate_from_page(struct kernel_heap_page *page, unsigned long size)
+static void *kernel_heap_allocate_from_arena(struct kernel_heap_page *page, unsigned long size)
 {
     struct kernel_heap_block *block;
 
-    /* First-fit scan within a single page. */
+    /* First-fit scan within a single heap arena. */
     block = page->first_block;
     while (block != (struct kernel_heap_block *)0) {
         if (block->is_free != 0UL && block->size >= size) {
@@ -178,7 +214,7 @@ static void kernel_heap_coalesce(struct kernel_heap_block *block)
 
 void kernel_heap_init(void)
 {
-    /* Start with an empty heap and add the first backing page on demand. */
+    /* Start with an empty heap and seed it with one single-page arena. */
     kernel_heap_pages = (struct kernel_heap_page *)0;
     kernel_heap_pages_used = 0UL;
     kernel_heap_free_space = 0UL;
@@ -186,7 +222,7 @@ void kernel_heap_init(void)
     kernel_heap_allocations = 0UL;
     kernel_heap_failed = 0UL;
 
-    if (kernel_heap_add_page() == (struct kernel_heap_page *)0) {
+    if (kernel_heap_add_arena(1UL) == (struct kernel_heap_page *)0) {
         log_info("kernel heap init failed");
         return;
     }
@@ -199,21 +235,18 @@ void *kmalloc(unsigned long size)
     struct kernel_heap_page *page;
     void *allocation;
     unsigned long aligned_size;
+    unsigned long required_pages;
 
     if (size == 0UL) {
         return (void *)0;
     }
 
-    /* This heap only supports allocations that fit entirely inside one page. */
     aligned_size = kernel_heap_align_up(size, KERNEL_HEAP_ALIGNMENT);
-    if (aligned_size > (PAGE_SIZE - sizeof(struct kernel_heap_page) - sizeof(struct kernel_heap_block) - KERNEL_HEAP_ALIGNMENT)) {
-        kernel_heap_failed++;
-        return (void *)0;
-    }
+    required_pages = kernel_heap_pages_for_size(aligned_size);
 
     page = kernel_heap_pages;
     while (page != (struct kernel_heap_page *)0) {
-        allocation = kernel_heap_allocate_from_page(page, aligned_size);
+        allocation = kernel_heap_allocate_from_arena(page, aligned_size);
         if (allocation != (void *)0) {
             return allocation;
         }
@@ -221,13 +254,13 @@ void *kmalloc(unsigned long size)
         page = page->next;
     }
 
-    /* No existing page had room, so grow the heap by one more backing page. */
-    page = kernel_heap_add_page();
+    /* No existing arena had room, so grow the heap by the number of pages this size needs. */
+    page = kernel_heap_add_arena(required_pages);
     if (page == (struct kernel_heap_page *)0) {
         return (void *)0;
     }
 
-    return kernel_heap_allocate_from_page(page, aligned_size);
+    return kernel_heap_allocate_from_arena(page, aligned_size);
 }
 
 void kfree(void *ptr)

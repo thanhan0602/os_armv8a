@@ -9,13 +9,17 @@ Tài liệu này mô tả thiết kế MMU hiện tại của kernel ARMv8-A tro
 Hệ thống hiện tại sử dụng:
 
 - AArch64 EL1
-- `TTBR0_EL1` cho kernel identity map
 - `48-bit VA`
 - `4 KiB` granule
 - root table tại `L0`
 - hybrid mapping:
   - `L0 -> L1 -> L2 -> L3` cho tối thiểu `2` chunk đầu, mỗi chunk `2 MiB`
   - `L2` block mappings cho phần RAM còn lại
+
+Hệ thống hỗ trợ hai build variant thông qua flag `CONFIG_KERNEL_VIRTUAL`:
+
+- **`KERNEL_VIRTUAL=1` (mặc định)**: dùng cả `TTBR0_EL1` (identity map) và `TTBR1_EL1` (kernel VA map). Kernel chạy tại high VA `0xFFFF...` sau trampoline.
+- **`KERNEL_VIRTUAL=0`**: chỉ dùng `TTBR0_EL1` identity map, `TTBR1` bị tắt bằng `EPD1=1`. Kernel chạy tại PA. Phù hợp cho debugging và bring-up đơn giản.
 
 ## Vì sao chọn 4-level thay vì 1, 2, hoặc 3 level
 
@@ -77,22 +81,43 @@ Tóm lại:
 
 ```mermaid
 flowchart TD
-    VA[VA 48-bit]
-    L0[L0 root table]
-    L1D[L1 device block]
-    L1R[L1 RAM table entry]
-    L2[L2 RAM table]
-    L3[L3 page table cho vùng kernel đầu]
-    KP[Kernel pages: text rodata data bss stack]
-    RB[L2 block mappings cho RAM còn lại]
+    subgraph TTBR0["TTBR0 - Identity Map"]
+        VA0[VA 48-bit lower half]
+        L0_0[L0 root table]
+        L1D_0[L1 device block]
+        L1R_0[L1 RAM table entry]
+        L2_0[L2 RAM table]
+        L3_0[L3 page table cho vùng kernel đầu]
+        KP_0[Kernel pages: text rodata data bss stack]
+        RB_0[L2 block mappings cho RAM còn lại]
 
-    VA --> L0
-    L0 --> L1D
-    L0 --> L1R
-    L1R --> L2
-    L2 --> L3
-    L3 --> KP
-    L2 --> RB
+        VA0 --> L0_0
+        L0_0 --> L1D_0
+        L0_0 --> L1R_0
+        L1R_0 --> L2_0
+        L2_0 --> L3_0
+        L3_0 --> KP_0
+        L2_0 --> RB_0
+    end
+
+    subgraph TTBR1["TTBR1 - Kernel VA Map (CONFIG_KERNEL_VIRTUAL=1)"]
+        VA1[VA 48-bit upper half 0xFFFF...]
+        L0_1[t1-L0 root table]
+        L1D_1[t1-L1 device block]
+        L1R_1[t1-L1 RAM table entry]
+        L2_1[t1-L2 RAM table]
+        L3_1[t1-L3 page table cho vùng kernel đầu]
+        KP_1[Cùng PA: text rodata data bss stack]
+        RB_1[t1-L2 block mappings cho RAM còn lại]
+
+        VA1 --> L0_1
+        L0_1 --> L1D_1
+        L0_1 --> L1R_1
+        L1R_1 --> L2_1
+        L2_1 --> L3_1
+        L3_1 --> KP_1
+        L2_1 --> RB_1
+    end
 ```
 
 ## Mục đích của hybrid mapping
@@ -188,11 +213,24 @@ Hệ thống đặt:
 - `ORGN0/IRGN0 = WBWA`
 - `IPS = 48-bit`
 
+Khi `CONFIG_KERNEL_VIRTUAL=1`:
+
+- `T1SZ = 16`, tương ứng `48-bit VA` cho TTBR1
+- `TG1 = 4 KiB`
+- `SH1 = Inner Shareable`
+- `ORGN1/IRGN1 = WBWA`
+
+Khi `CONFIG_KERNEL_VIRTUAL=0`:
+
+- `EPD1 = 1`: tắt hoàn toàn translation qua TTBR1
+
 ### `SCTLR_EL1`
 
 Kernel hiện tại bật `SCTLR_EL1.M/C/I` bằng một giá trị explicit có các bit `RES1` cần thiết. Điều này giúp tránh phụ thuộc vào reset-state của emulator.
 
 ## Cấu trúc bảng trang
+
+### TTBR0 (identity map — cả hai variant)
 
 ### `L0`
 
@@ -215,6 +253,17 @@ Kernel hiện tại bật `SCTLR_EL1.M/C/I` bằng một giá trị explicit có
 - được cấp phát theo từng chunk `2 MiB` cần fine mapping
 - mỗi entry là page `4 KiB`
 - hiện tại áp dụng cho tối thiểu `4 MiB` đầu của vùng RAM chứa kernel image
+
+### TTBR1 (kernel VA map — chỉ khi `CONFIG_KERNEL_VIRTUAL=1`)
+
+TTBR1 là một bộ bảng trang hoàn toàn độc lập, phản chiếu cùng PA range nhưng được truy cập qua kernel VA (`VA = PA + 0xFFFF000000000000`).
+
+- `L0`, `L1`, `L2` được cấp riêng (tên: `t1-l0-root`, `t1-l1-root`, `t1-l2-ram`)
+- `L3` chunks cũng được cấp riêng (tên: `t1-l3-chunk-0`, `t1-l3-chunk-1`, ...)
+- Cùng permission model như TTBR0: `.text` RO+X, `.rodata` RO+NX, `.data/.bss` RW+NX
+- L1 device block cho MMIO (0x00000000–0x3FFFFFFF) với `nGnRnE + RW + NX`
+- Tổng table pages khi TTBR1 active: `10` (5 TTBR0 + 5 TTBR1)
+- Tổng table pages khi chỉ identity map: `5`
 
 ## Layout hiện tại của kernel image
 
@@ -278,20 +327,45 @@ Trong runtime hiện tại:
 - 1 page cho `L2`
 - thêm các page `L3` cho các chunk `2 MiB` được fine-map
 
-Log runtime hiện tại cho thấy `mmu table pages=5` với cấu hình tối thiểu `2` chunk fine-map đã verify.
+Log runtime hiện tại cho thấy:
+
+- `mmu table pages=10` khi `CONFIG_KERNEL_VIRTUAL=1` (5 TTBR0 + 5 TTBR1)
+- `mmu table pages=5` khi `KERNEL_VIRTUAL=0` (chỉ TTBR0)
 
 ## Flow khởi tạo
 
 Trình tự `mmu_init()` hiện tại:
 
-1. Cấp phát `L0`, `L1`, `L2`.
-2. Xây dựng mapping identity cho device và RAM.
-3. Cấp phát thêm `L3` cho tối thiểu `2` chunk đầu của RAM, bao gồm vùng chứa kernel.
-4. In descriptor và translation probe để debug.
-5. Nạp `MAIR_EL1`, `TCR_EL1`, `TTBR0_EL1`.
-6. `TLBI` + `DSB` + `ISB`.
-7. Bật `SCTLR_EL1.M/C/I`.
-8. Xác nhận runtime vẫn tiếp tục, sau đó timer IRQ tiếp tục chạy.
+1. Cấp phát `L0`, `L1`, `L2` cho TTBR0.
+2. (Nếu `CONFIG_KERNEL_VIRTUAL`) Cấp phát `L0`, `L1`, `L2` cho TTBR1.
+3. Xây dựng identity map cho device và RAM (TTBR0).
+4. (Nếu `CONFIG_KERNEL_VIRTUAL`) Xây dựng kernel VA map (TTBR1) — mirror cùng PA range.
+5. Cấp phát thêm `L3` cho tối thiểu `2` chunk đầu (cho mỗi bộ bảng trang).
+6. In descriptor và translation probe để debug.
+7. Nạp `MAIR_EL1`, `TCR_EL1`, `TTBR0_EL1` (và `TTBR1_EL1` nếu virtual).
+8. `TLBI` + `DSB` + `ISB`.
+9. Bật `SCTLR_EL1.M/C/I`.
+10. Xác nhận runtime vẫn tiếp tục, sau đó timer IRQ tiếp tục chạy.
+
+### Boot flow sau mmu_init
+
+Khi `CONFIG_KERNEL_VIRTUAL=1`:
+
+```text
+_start (PA) → kernel_main_early (PA) → mmu_init → trampoline (adrp+add+offset) → kernel_main (high VA qua TTBR1)
+```
+
+- Trampoline trong `start.S` chuyển SP và PC sang kernel VA
+- `kernel_main()` gọi lại `exception_init()` để VBAR_EL1 chứa VA của vector table
+
+Khi `KERNEL_VIRTUAL=0`:
+
+```text
+_start (PA) → kernel_main_early (PA) → mmu_init → kernel_main (PA qua TTBR0)
+```
+
+- Không có trampoline, `start.S` gọi thẳng `kernel_main`
+- VBAR_EL1 giữ nguyên PA vì VA == PA
 
 ## Cách quan sát translation walk qua từng level
 
@@ -496,6 +570,24 @@ Ngoài ra log giờ còn in thêm `walk region=...` để chỉ vùng logic mà 
 - `walk region=ram-other`
 - `walk region=mmio-or-unmapped`
 
+## PA→VA conversion
+
+Sau khi MMU bật, kernel code cần phân biệt giữa physical address (PA) và virtual address (VA). Hệ thống hiện tại dùng:
+
+- `pa_to_va(pa)` — `(void *)((unsigned long)(pa) + KERNEL_VA_OFFSET)`
+- `va_to_pa(va)` — `(unsigned long)(va) - KERNEL_VA_OFFSET`
+
+Khi `CONFIG_KERNEL_VIRTUAL=1`: `KERNEL_VA_OFFSET = 0xFFFF000000000000`
+Khi `KERNEL_VIRTUAL=0`: `KERNEL_VA_OFFSET = 0` (pa_to_va trở thành no-op)
+
+Các module đã được chuyển đổi PA→VA:
+
+- `page_alloc.c`: dùng `page_pa_to_ptr()` / `page_ptr_to_pa()` với `mmu_is_enabled()` guard
+- `heap.c`: dùng `pa_to_va()` trên kết quả `page_alloc_contiguous()`
+- `mmu.c`: dùng `desc_pa_to_table()` cho debug walk
+- `pl011.c`, `gicv2.c`: dùng `mmio_va()` helper cho MMIO register access
+- `main.c`: dùng `va_to_pa()` khi log backing PA của heap allocation
+
 ## Vì sao vẫn là identity map
 
 Thiết kế hiện tại ưu tiên ổn định boot và khả năng debug. Identity map có các ưu điểm:
@@ -557,7 +649,14 @@ Kernel virtual layout:
 
 ### Vì sao chưa làm ngay ở Stage 6 hiện tại
 
-Stage 6 hiện tại ưu tiên:
+Stage 6 ưu tiên bật MMU ổn định trước, sau đó mới thêm virtual layout. Điều này đã được thực hiện thành công:
+
+1. Bật MMU với identity map ổn định (TTBR0)
+2. Thêm kernel virtual layout qua TTBR1
+3. PA→VA migration cho toàn bộ kernel code
+4. Build flag `CONFIG_KERNEL_VIRTUAL` cho phép chọn giữa hai variant
+
+Bước chuyển đổi thực tế đã diễn ra:
 
 - bật MMU ổn định
 - giữ UART, timer, IRQ, exception path hoạt động
@@ -590,16 +689,17 @@ Một lộ trình thực dụng thường là:
 
 ## Ràng buộc hiện tại
 
-1. Chỉ dùng `TTBR0_EL1`; chưa tách vùng kernel/user theo `TTBR1_EL1`.
-2. Vẫn còn identity map cho toàn bộ RAM đã quản lý.
+1. Identity map (TTBR0) vẫn còn active trong cả hai variant. Khi `CONFIG_KERNEL_VIRTUAL=1`, nó được dùng cho boot path trước trampoline.
+2. VMA vẫn là PA trong linker.ld để tránh pointer-in-data bug.
 3. Chưa có allocator riêng cho page tables ngoài physical page allocator.
 4. Fine-grained `L3` mới áp dụng cho một phần đầu của RAM, chưa mở rộng ra toàn bộ các vùng cần chính sách riêng.
-5. Kernel vẫn chưa có virtual layout tách biệt khỏi physical identity map.
+5. TTBR0 identity map chưa bị xóa; có thể repurpose cho user-space sau này.
 
 ## Hướng mở rộng tiếp theo
 
-1. Mở rộng `L3` fine mapping cho thêm các chunk RAM cần phân quyền chi tiết.
-2. Giới thiệu higher-half hoặc một kernel virtual layout tách biệt khỏi identity map.
-3. Tách page-table allocator và metadata riêng cho memory management sau này.
-4. Thêm guard pages và các vùng ảo chuyên biệt cho stack, heap, và MMIO.
+1. Xóa TTBR0 identity map khi `CONFIG_KERNEL_VIRTUAL=1` hoặc repurpose cho user-space (TTBR0 cho EL0).
+2. Mở rộng `L3` fine mapping cho thêm các chunk RAM cần phân quyền chi tiết.
+3. Thêm guard pages cho stack và các vùng nhạy cảm.
+4. Tách page-table allocator và metadata riêng cho memory management sau này.
 5. Tiến tới address spaces riêng cho process ở các stage sau.
+6. Xem xét KASLR khi virtual layout đã ổn định.
