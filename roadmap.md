@@ -159,11 +159,13 @@ Implemented:
 - Added contiguous physical page allocation helpers to the page allocator for larger heap arenas
 - Used a page-local free-list layout for small allocations and multi-page contiguous arenas for larger allocations
 - Added boot-time heap statistics plus both small and larger-than-one-page self-test allocations in `kernel_main`
+- Added shared heap debug targets `heap-arenas` and `heap-large-arenas` backed by heap arena inspection helpers
 
 Current behavior:
 - Kernel initializes a heap after MMU bring-up
-- Small and larger-than-one-page dynamic allocations can be served and freed during boot while the kernel still relies on the current identity map
+- Small and larger-than-one-page dynamic allocations can be served and freed during boot in both the high-VA and identity-only runtime variants
 - Heap usage and failure counters are logged so allocator growth is visible during bring-up
+- Heap self-test inspection now flows through the shared debug-target framework, including dedicated targets for all arenas and multi-page arenas
 
 ### Stage 8: Scheduler And Kernel Threads
 
@@ -227,5 +229,4 @@ Goals:
 
 ## Immediate Next Steps
 
-1. Add heap-specific debug targets so large heap arenas can be inspected through the same target framework.
-2. Design the first incremental step toward per-process address spaces (Stage 10).
+1. Design the first incremental step toward per-process address spaces (Stage 10).

@@ -20,6 +20,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - GICv2 và generic timer IRQ hoạt động.
 - Physical page allocator hoạt động.
 - Kernel heap page-backed hiện hỗ trợ allocation nhỏ và allocation lớn hơn một page thông qua contiguous physical spans.
+- Shared debug target framework hiện cũng bao phủ heap arena inspection qua `heap-arenas` và `heap-large-arenas`; heap self-test đã đi qua cùng framework này.
 - MMU đã bật ổn định với cả TTBR0 (identity) và TTBR1 (kernel VA) khi virtual, hoặc chỉ TTBR0 khi identity.
 - Cache `SCTLR_EL1.M/C/I` đã được bật và verify.
 - Boot flow khi `CONFIG_KERNEL_VIRTUAL=1`: `_start` (PA) → `kernel_main_early` (PA) → trampoline → `kernel_main` (VA qua TTBR1).
@@ -59,6 +60,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - FP/SIMD đã được enable sớm trong boot, nên không còn phụ thuộc vào `-mgeneral-regs-only`.
 - Deliberate `brk` đã được verify lại sau khi thêm register dump; fault log hiện có cả `ESR/ELR/SPSR/FAR` lẫn `x0..x30`.
 - **VMA=VA pointer-in-data bug**: khi đặt VMA=0xFFFF... trong linker.ld, các `const char *` bên trong `static const struct` arrays (.rodata) chứa VA tuyệt đối. Pre-MMU C code dereference chúng trước khi TTBR1 active → infinite fault loop. Giải pháp: giữ VMA=PA, trampoline dùng `adrp+add+offset` để nhảy sang VA tại runtime.
+- **Post-TTBR0 static-table pointer lesson**: vì linker VMA vẫn là PA, các con trỏ string lưu trong `static const` tables tiếp tục là PA. Code chạy sau khi TTBR1 active và TTBR0 bị tắt phải translate các con trỏ đã lưu này (ví dụ `pa_to_va`) trước khi dereference.
 
 ## Tài liệu nên đọc trước khi tiếp tục
 
@@ -86,6 +88,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 ## Trạng thái AI tooling hiện tại
 
 - `.github/copilot-instructions.md` đã define workflow đọc context theo lớp: bắt đầu từ `handoff.md`, rồi chỉ đọc đúng doc/subsystem cần thiết.
+- Workspace hiện có custom agent set trong `.github/agents`: `Orchestrator` để điều phối, `Code` để implement, `Scheduler`, `MMU`, `ARM Architecture` cho phân tích subsystem, `Test` để validate/reproduce, `Document` để cập nhật note, và `Code Review` để review không sửa code.
 - Local RAG API hiện nằm ở `tools/rag`, dùng shared SQLite + FAISS/Numpy retrieval tại `.rag-store/index.sqlite3`.
 - MCP prototype hiện nằm ở `tools/mcp` với topology `1 + 3`:
   - `gateway`: route query và merge kết quả
@@ -111,6 +114,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 Repo hiện đã có một framework `debug target` thống nhất cho log boot-time, nằm chủ yếu ở:
 
 - `src/kernel/debug_targets.c`
+- `src/kernel/heap.c`
 - `src/kernel/mmu.c`
 - `src/kernel/page_alloc.c`
 
@@ -123,6 +127,8 @@ Các target hiện có gồm:
 - `mmu-tables`
 - `mmu-walk`
 - `mmu-probe`
+- `heap-arenas`
+- `heap-large-arenas`
 
 Các phase này hiện có thể bật hoặc tắt qua build flags:
 
@@ -137,6 +143,10 @@ Các phase này hiện có thể bật hoặc tắt qua build flags:
 - `mmu-tables`: liệt kê các page allocator đang bị MMU giữ làm bảng trang, với tên semantic như `l0-root`, `l1-root`, `l2-ram`, `l3-chunk-0`
 - `mmu-walk`: software walk qua `L0/L1/L2/L3`
 - `mmu-probe`: hardware probe bằng `AT S1E1R` + `PAR_EL1`
+- `heap-arenas`: dump mọi heap arena qua shared target framework
+- `heap-large-arenas`: chỉ dump các arena có ít nhất `2` page, hữu ích để soi allocation lớn
+
+Heap self-test trong `kernel_main()` hiện gọi `kernel_debug_log_heap_targets()` thay cho ad hoc page-range dump, nên log heap arena và log page allocator dùng cùng naming và flow debug target.
 
 Page allocator hiện cũng có `page_alloc_contiguous/page_free_contiguous` để heap có thể tạo arena lớn hơn một page mà chưa cần heap VA riêng.
 
@@ -160,6 +170,12 @@ Nếu log page allocator cần đọc nhanh, nên nhìn theo thứ tự:
 1. `debug target=managed-head`
 2. `debug target=page-a/page-b/alloc-window`
 3. `page allocator consistency mismatches=...`
+
+Nếu log heap cần đọc nhanh, nên nhìn theo thứ tự:
+
+1. `debug target=heap-arenas`
+2. `debug target=heap-large-arenas`
+3. `heap pages=... used_bytes=... free_bytes=...`
 
 ## Lệnh thường dùng
 
@@ -224,3 +240,4 @@ Khi quay lại repo này, nên làm theo thứ tự:
 - MCP now includes an `ops` specialist plus gateway proxy tools for `build_kernel`, `start_qemu`, `qemu_status`, `read_qemu_log`, and `stop_qemu`; QEMU state/logs live under `.mcp-runtime/`.
 - MCP ops now also supports `build_and_run`, `restart_qemu`, and `gdb_attach_info`; an ops demo client is available via `tools/mcp/run_ops_demo.sh`.
 - MCP ops now understands the existing VS Code debug setup via `.vscode/launch.json` and `.vscode/tasks.json`, and exposes `vscode_debug_info` plus `prepare_vscode_debug` for the QEMU attach flow.
+- MCP ops now exposes `git_push` through both the ops specialist and the gateway; it defaults to `origin`, uses the current branch when possible, rejects missing-upstream and no-op pushes, and never enables force push behavior.

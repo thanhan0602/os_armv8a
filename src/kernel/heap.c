@@ -62,6 +62,15 @@ static unsigned long kernel_heap_min_split_size(void)
     return sizeof(struct kernel_heap_block) + KERNEL_HEAP_ALIGNMENT;
 }
 
+static unsigned long kernel_heap_debug_min_page_count(unsigned long min_page_count)
+{
+    if (min_page_count == 0UL) {
+        return 1UL;
+    }
+
+    return min_page_count;
+}
+
 static unsigned long kernel_heap_pages_for_size(unsigned long size)
 {
     unsigned long aligned_size;
@@ -97,6 +106,52 @@ static struct kernel_heap_page *kernel_heap_page_from_pointer(void *ptr)
     }
 
     return (struct kernel_heap_page *)0;
+}
+
+static struct kernel_heap_page *kernel_heap_debug_find_arena(unsigned long arena_index, unsigned long min_page_count)
+{
+    struct kernel_heap_page *page;
+    unsigned long current_index;
+
+    page = kernel_heap_pages;
+    current_index = 0UL;
+    min_page_count = kernel_heap_debug_min_page_count(min_page_count);
+
+    while (page != (struct kernel_heap_page *)0) {
+        if (page->page_count >= min_page_count) {
+            if (current_index == arena_index) {
+                return page;
+            }
+
+            current_index++;
+        }
+
+        page = page->next;
+    }
+
+    return (struct kernel_heap_page *)0;
+}
+
+static void kernel_heap_debug_arena_usage(struct kernel_heap_page *page,
+                                          unsigned long *free_bytes,
+                                          unsigned long *largest_free_block)
+{
+    struct kernel_heap_block *block;
+
+    *free_bytes = 0UL;
+    *largest_free_block = 0UL;
+
+    block = page->first_block;
+    while (block != (struct kernel_heap_block *)0) {
+        if (block->is_free != 0UL) {
+            *free_bytes += block->size;
+            if (block->size > *largest_free_block) {
+                *largest_free_block = block->size;
+            }
+        }
+
+        block = block->next;
+    }
 }
 
 static struct kernel_heap_page *kernel_heap_add_arena(unsigned long page_count)
@@ -317,6 +372,64 @@ unsigned long kernel_heap_allocation_count(void)
 unsigned long kernel_heap_failed_allocations(void)
 {
     return kernel_heap_failed;
+}
+
+unsigned long kernel_heap_debug_arena_count(unsigned long min_page_count)
+{
+    struct kernel_heap_page *page;
+    unsigned long count;
+
+    page = kernel_heap_pages;
+    count = 0UL;
+    min_page_count = kernel_heap_debug_min_page_count(min_page_count);
+
+    while (page != (struct kernel_heap_page *)0) {
+        if (page->page_count >= min_page_count) {
+            count++;
+        }
+
+        page = page->next;
+    }
+
+    return count;
+}
+
+void kernel_heap_debug_log_arena(unsigned long arena_index, unsigned long min_page_count)
+{
+    struct kernel_heap_page *page;
+    unsigned long free_bytes;
+    unsigned long largest_free_block;
+    unsigned long used_bytes;
+    unsigned long physical_base;
+
+    page = kernel_heap_debug_find_arena(arena_index, min_page_count);
+    if (page == (struct kernel_heap_page *)0) {
+        return;
+    }
+
+    kernel_heap_debug_arena_usage(page, &free_bytes, &largest_free_block);
+    used_bytes = page->usable_bytes - free_bytes;
+    physical_base = va_to_pa((unsigned long)page);
+
+    log_write("[info] heap arena index=");
+    log_write_u64(arena_index);
+    log_write(" base=");
+    log_write_hex((unsigned long)page);
+    log_write(" physical=");
+    log_write_hex(physical_base);
+    log_write(" pages=");
+    log_write_u64(page->page_count);
+    log_write(" usable_bytes=");
+    log_write_u64(page->usable_bytes);
+    log_write(" used_bytes=");
+    log_write_u64(used_bytes);
+    log_write(" free_bytes=");
+    log_write_u64(free_bytes);
+    log_write(" largest_free=");
+    log_write_u64(largest_free_block);
+    log_putc('\n');
+
+    page_allocator_log_page_range(physical_base, page->page_count);
 }
 
 void kernel_heap_log_stats(void)

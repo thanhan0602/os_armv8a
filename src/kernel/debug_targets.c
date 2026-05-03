@@ -1,8 +1,10 @@
 #include <kernel/debug_targets.h>
 
+#include <kernel/heap.h>
 #include <kernel/log.h>
 #include <kernel/mmu.h>
 #include <kernel/page_alloc.h>
+#include <kernel/vm.h>
 
 #ifndef KERNEL_DEBUG_ENABLE_PRE_MMU
 #define KERNEL_DEBUG_ENABLE_PRE_MMU 1
@@ -27,6 +29,7 @@ struct kernel_debug_target {
 #define KERNEL_DEBUG_PHASE_PRE_MMU       1UL
 #define KERNEL_DEBUG_PHASE_MMU_BOOT      2UL
 #define KERNEL_DEBUG_PHASE_POST_MMU      3UL
+#define KERNEL_DEBUG_PHASE_HEAP          4UL
 
 #define KERNEL_DEBUG_TARGET_PAGE_RANGE    1UL
 #define KERNEL_DEBUG_TARGET_MANAGED_HEAD  2UL
@@ -35,6 +38,7 @@ struct kernel_debug_target {
 #define KERNEL_DEBUG_TARGET_MMU_PROBE     5UL
 #define KERNEL_DEBUG_TARGET_MMU_BOOT_WALKS 6UL
 #define KERNEL_DEBUG_TARGET_MMU_BOOT_PROBES 7UL
+#define KERNEL_DEBUG_TARGET_HEAP_ARENAS   8UL
 
 #define KERNEL_DEBUG_ADDRESS_NONE         0UL
 #define KERNEL_DEBUG_ADDRESS_PAGE_A       1UL
@@ -52,6 +56,8 @@ static const struct kernel_debug_target kernel_debug_targets[] = {
     { KERNEL_DEBUG_PHASE_POST_MMU, KERNEL_DEBUG_TARGET_MMU_TABLES, KERNEL_DEBUG_ADDRESS_NONE, "mmu-tables", 0UL },
     { KERNEL_DEBUG_PHASE_POST_MMU, KERNEL_DEBUG_TARGET_MMU_WALK, KERNEL_DEBUG_ADDRESS_WALK, "mmu-walk", 1UL },
     { KERNEL_DEBUG_PHASE_POST_MMU, KERNEL_DEBUG_TARGET_MMU_PROBE, KERNEL_DEBUG_ADDRESS_WALK, "mmu-probe", 1UL },
+    { KERNEL_DEBUG_PHASE_HEAP, KERNEL_DEBUG_TARGET_HEAP_ARENAS, KERNEL_DEBUG_ADDRESS_NONE, "heap-arenas", 1UL },
+    { KERNEL_DEBUG_PHASE_HEAP, KERNEL_DEBUG_TARGET_HEAP_ARENAS, KERNEL_DEBUG_ADDRESS_NONE, "heap-large-arenas", 2UL },
 };
 
 static unsigned long kernel_debug_resolve_address(unsigned long source, unsigned long page_a, unsigned long page_b, unsigned long walk_address)
@@ -71,6 +77,15 @@ static unsigned long kernel_debug_resolve_address(unsigned long source, unsigned
     return 0UL;
 }
 
+static const char *kernel_debug_target_name(const char *name)
+{
+    if (mmu_is_enabled()) {
+        return (const char *)pa_to_va(name);
+    }
+
+    return name;
+}
+
 static int kernel_debug_phase_enabled(unsigned long phase)
 {
     if (phase == KERNEL_DEBUG_PHASE_PRE_MMU) {
@@ -82,6 +97,10 @@ static int kernel_debug_phase_enabled(unsigned long phase)
     }
 
     if (phase == KERNEL_DEBUG_PHASE_POST_MMU) {
+        return KERNEL_DEBUG_ENABLE_POST_MMU != 0;
+    }
+
+    if (phase == KERNEL_DEBUG_PHASE_HEAP) {
         return KERNEL_DEBUG_ENABLE_POST_MMU != 0;
     }
 
@@ -113,7 +132,7 @@ static void kernel_debug_log_targets(unsigned long phase, unsigned long page_a, 
         }
 
         log_write("[info] debug target=");
-        log_write(kernel_debug_targets[index].name);
+        log_write(kernel_debug_target_name(kernel_debug_targets[index].name));
 
         if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_PAGE_RANGE) {
             log_write(" count=");
@@ -141,7 +160,7 @@ static void kernel_debug_log_targets(unsigned long phase, unsigned long page_a, 
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MMU_PROBE) {
             log_write(" count=1\n");
             log_write("[info] probe ");
-            log_write(kernel_debug_targets[index].name);
+            log_write(kernel_debug_target_name(kernel_debug_targets[index].name));
             log_write(" par=");
             log_write_hex(mmu_debug_probe_address(address));
             log_putc('\n');
@@ -166,6 +185,18 @@ static void kernel_debug_log_targets(unsigned long phase, unsigned long page_a, 
                 log_write_hex(mmu_debug_probe_address(mmu_debug_boot_target_address(table_index)));
                 log_putc('\n');
             }
+        } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_HEAP_ARENAS) {
+            log_write(" count=");
+            log_write_u64(kernel_heap_debug_arena_count(kernel_debug_targets[index].page_count));
+            log_putc('\n');
+            for (table_index = 0UL; table_index < kernel_heap_debug_arena_count(kernel_debug_targets[index].page_count); table_index++) {
+                log_write("[info] debug target=");
+                log_write(kernel_debug_target_name(kernel_debug_targets[index].name));
+                log_write(" arena_index=");
+                log_write_u64(table_index);
+                log_putc('\n');
+                kernel_heap_debug_log_arena(table_index, kernel_debug_targets[index].page_count);
+            }
         }
     }
 }
@@ -183,4 +214,9 @@ void kernel_debug_log_mmu_boot_targets(void)
 void kernel_debug_log_post_mmu_targets(unsigned long walk_address)
 {
     kernel_debug_log_targets(KERNEL_DEBUG_PHASE_POST_MMU, 0UL, 0UL, walk_address);
+}
+
+void kernel_debug_log_heap_targets(void)
+{
+    kernel_debug_log_targets(KERNEL_DEBUG_PHASE_HEAP, 0UL, 0UL, 0UL);
 }

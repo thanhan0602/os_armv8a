@@ -169,14 +169,10 @@ void kernel_main(void)
         log_write(" large=");
         log_write_hex((unsigned long)heap_large);
         log_putc('\n');
-#ifdef CONFIG_KERNEL_VIRTUAL
-        page_allocator_log_page_range(va_to_pa(heap_large) & ~(PAGE_SIZE - 1UL), 2UL);
-#else
-        page_allocator_log_page_range((unsigned long)heap_large & ~(PAGE_SIZE - 1UL), 2UL);
-#endif
     } else {
         log_info("heap self-test allocation failed");
     }
+    kernel_debug_log_heap_targets();
     kernel_heap_log_stats();
     page_allocator_log_consistency();
     kfree(heap_large);

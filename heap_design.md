@@ -77,12 +77,23 @@ Heap hiện có các helper thống kê:
 - `kernel_heap_failed_allocations()`
 - `kernel_heap_log_stats()`
 
+Heap arena observability hiện cũng có:
+
+- `kernel_heap_debug_arena_count(min_page_count)`
+- `kernel_heap_debug_log_arena(arena_index, min_page_count)`
+
+Hai helper này được nối vào shared debug target framework qua hai target:
+
+- `heap-arenas`: soi tất cả arena
+- `heap-large-arenas`: chỉ soi arena có ít nhất `2` page
+
 Boot-time self-test trong `kernel_main()` hiện:
 
 - khởi tạo heap
 - cấp phát hai object nhỏ
 - cấp phát một object lớn hơn một page
 - ghi dữ liệu vào object đã cấp phát
+- gọi shared heap debug targets để inspect arena hiện có thay vì dump ad hoc một page range
 - log thống kê trước và sau `kfree`
 
 ## Hướng mở rộng hợp lý
@@ -90,6 +101,5 @@ Boot-time self-test trong `kernel_main()` hiện:
 Các bước tiếp theo có giá trị thực tế:
 
 1. trả các heap arena hoàn toàn rỗng về lại page allocator
-2. thêm heap-specific debug targets để soi allocation lớn và span liên tiếp
-3. cân nhắc virtual heap range riêng nếu không còn muốn phụ thuộc vào contiguous physical spans
-4. thêm guard pattern hoặc sanity check để bắt ghi tràn block sớm hơn
+2. cân nhắc virtual heap range riêng nếu không còn muốn phụ thuộc vào contiguous physical spans
+3. thêm guard pattern hoặc sanity check để bắt ghi tràn block sớm hơn

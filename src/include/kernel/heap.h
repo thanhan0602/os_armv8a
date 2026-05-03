@@ -22,4 +22,8 @@ unsigned long kernel_heap_allocation_count(void);
 unsigned long kernel_heap_failed_allocations(void);
 void kernel_heap_log_stats(void);
 
+/* Debug-target helpers for inspecting active heap arenas. */
+unsigned long kernel_heap_debug_arena_count(unsigned long min_page_count);
+void kernel_heap_debug_log_arena(unsigned long arena_index, unsigned long min_page_count);
+
 #endif
