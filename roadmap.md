@@ -134,12 +134,13 @@ Current behavior:
 Kernel virtual layout (completed):
 - Added `vm.h` with `KERNEL_VA_OFFSET`, `pa_to_va()` and `va_to_pa()` macros. Offset is `0xFFFF000000000000` when `CONFIG_KERNEL_VIRTUAL=1`, `0` when identity-only.
 - Linker script exports `__kernel_va_offset` symbol and defines `KERNEL_LMA_BASE`, `KERNEL_VA_OFFSET`, `KERNEL_VMA_BASE`
-- `mmu_init()` now builds a second set of page tables for `TTBR1_EL1` (kernel VA) alongside the existing `TTBR0_EL1` identity map (when `CONFIG_KERNEL_VIRTUAL=1`)
+- `mmu_init()` now builds a second set of page tables for `TTBR1_EL1` (kernel VA) alongside a boot-time `TTBR0_EL1` identity map (when `CONFIG_KERNEL_VIRTUAL=1`)
 - `TCR_EL1` enables both TTBR0 and TTBR1 walks when virtual, or sets `EPD1=1` to disable TTBR1 when identity-only
 - `start.S` calls `kernel_main_early()` at PA (pre-MMU through post-MMU-enable), then uses a trampoline (`adrp+add+KERNEL_VA_OFFSET`) to jump to `kernel_main()` at the kernel VA (when virtual), or calls `kernel_main()` directly (when identity)
 - PA→VA migration complete: page_alloc, heap, mmu walks, MMIO drivers all use conditional PA/VA conversion via `mmu_is_enabled()`
-- Runtime verified: both `KERNEL_VIRTUAL=1` (high VA, 10 table pages, heap at `0xFFFF...`) and `KERNEL_VIRTUAL=0` (PA, 5 table pages, heap at `0x4...`) boot clean with timer ticks and zero mismatches
-- TTBR0 identity map still present; will be repurposed for user-space (TTBR0 for EL0) or removed
+- After trampoline in the virtual build, runtime installs an owned empty lower-half root into `TTBR0_EL1` and frees the old boot identity tables, so `TTBR1_EL1` remains the only kernel execution map
+- Runtime verified: both `KERNEL_VIRTUAL=1` (high VA, 6 table pages at runtime, heap at `0xFFFF...`) and `KERNEL_VIRTUAL=0` (PA, 5 table pages, heap at `0x4...`) boot clean with timer ticks and zero mismatches
+- Runtime proof for the virtual build now shows the low kernel alias faults while the `TTBR1` high alias still translates
 
 Bug encountered during this work:
 - First attempt set VMA=VA in linker.ld (`0xFFFF000040080000`). This caused `const char *` fields inside `static const struct` arrays in `.rodata` to contain high VA values. Pre-MMU C code dereferenced these VA pointers before TTBR1 was active, causing an infinite fault loop.
@@ -203,12 +204,21 @@ Goals:
 
 ### Stage 10: Processes And Address Spaces
 
-Status: planned
+Status: in progress
 
 Goals:
 - Give each process its own page tables
 - Load user stacks and images
 - Handle translation faults cleanly
+
+Implemented (first increment):
+- Virtual runtime now keeps `TTBR1` as the only kernel execution map after trampoline
+- `TTBR0` is replaced with an owned empty lower-half root instead of being disabled, so the lower half is ready to be populated later
+- The old boot identity tables are freed after the handoff, reducing virtual runtime MMU table usage from `10` to `6` pages
+
+Current behavior:
+- In `KERNEL_VIRTUAL=1`, the low kernel alias now faults at runtime while the high `TTBR1` alias still translates
+- This establishes the first incremental Stage 10 base for future per-process lower-half mappings
 
 ### Stage 11: IPC And Synchronization
 
@@ -229,4 +239,4 @@ Goals:
 
 ## Immediate Next Steps
 
-1. Design the first incremental step toward per-process address spaces (Stage 10).
+1. Build the next Stage 10 increment on top of the owned empty `TTBR0` runtime root: per-process lower-half mappings and fault handling.

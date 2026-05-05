@@ -106,6 +106,7 @@ static unsigned long fine_map_chunks_used;
 static unsigned long *l0_table_ttbr1;
 static unsigned long *l1_table_ttbr1;
 static unsigned long *l2_ram_table_ttbr1;
+static unsigned long *ttbr0_runtime_empty_root;
 #endif
 
 extern char __text_start[];
@@ -171,6 +172,30 @@ static void mmu_debug_copy_name(char *destination, const char *source)
     destination[index] = '\0';
 }
 
+static int mmu_debug_name_has_prefix(const char *name, const char *prefix)
+{
+    unsigned long index;
+
+    for (index = 0UL; prefix[index] != '\0'; index++) {
+        if (name[index] != prefix[index]) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void mmu_debug_record_table_page(unsigned long address, const char *name)
+{
+    if (mmu_table_page_count >= MMU_DEBUG_MAX_TABLE_PAGES) {
+        return;
+    }
+
+    mmu_table_page_addresses[mmu_table_page_count] = address;
+    mmu_debug_copy_name(mmu_table_page_names[mmu_table_page_count], name);
+    mmu_table_page_count++;
+}
+
 static void mmu_debug_set_chunk_name(char *destination, const char *prefix, unsigned long chunk_index)
 {
     char digits[21];
@@ -204,11 +229,7 @@ static unsigned long *alloc_named_table_page(const char *name)
 
     table = (unsigned long *)page_alloc();
     if (table != (unsigned long *)0) {
-        if (mmu_table_page_count < MMU_DEBUG_MAX_TABLE_PAGES) {
-            mmu_table_page_addresses[mmu_table_page_count] = (unsigned long)table;
-            mmu_debug_copy_name(mmu_table_page_names[mmu_table_page_count], name);
-            mmu_table_page_count++;
-        }
+        mmu_debug_record_table_page((unsigned long)table, name);
         table_pages_used++;
     }
 
@@ -400,6 +421,15 @@ static unsigned long *desc_pa_to_table(unsigned long pa)
     return (unsigned long *)pa;
 }
 
+static unsigned long *mmu_root_table_for_walk(void)
+{
+    if (l0_table == (unsigned long *)0) {
+        return (unsigned long *)0;
+    }
+
+    return desc_pa_to_table((unsigned long)l0_table);
+}
+
 static void mmu_debug_walk(unsigned long address)
 {
     unsigned long l0_index;
@@ -410,6 +440,7 @@ static void mmu_debug_walk(unsigned long address)
     unsigned long l1_entry;
     unsigned long l2_entry;
     unsigned long l3_entry;
+    unsigned long *l0_walk_table;
     unsigned long *l1_walk_table;
     unsigned long *l2_walk_table;
     unsigned long *l3_walk_table;
@@ -422,8 +453,14 @@ static void mmu_debug_walk(unsigned long address)
     log_write(mmu_region_name(address));
     log_putc('\n');
 
+    l0_walk_table = mmu_root_table_for_walk();
+    if (l0_walk_table == (unsigned long *)0) {
+        log_info("walk unavailable: no active ttbr0 root");
+        return;
+    }
+
     l0_index = l0_index_for(address);
-    l0_entry = l0_table[l0_index];
+    l0_entry = l0_walk_table[l0_index];
     mmu_debug_print_index("walk l0", l0_index);
     mmu_debug_print_entry("walk l0", l0_entry);
     if ((l0_entry & MMU_DESC_VALID) == 0) {
@@ -967,45 +1004,64 @@ unsigned long mmu_table_pages_used(void)
 }
 
 #ifdef CONFIG_KERNEL_VIRTUAL
-void mmu_disable_ttbr0(void)
+void mmu_install_empty_ttbr0_root(void)
 {
-    unsigned long tcr;
-    unsigned long i;
+    unsigned long *new_root;
+    unsigned long read_index;
+    unsigned long write_index;
 
     if (!mmu_enabled) {
         return;
     }
 
-    /* Set EPD0 (bit 7) to disable TTBR0 translations. */
-    __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr));
-    tcr |= (1UL << 7);
+    if (ttbr0_runtime_empty_root != (unsigned long *)0 && l0_table == ttbr0_runtime_empty_root) {
+        return;
+    }
+
+    new_root = (unsigned long *)page_alloc();
+    if (new_root == (unsigned long *)0) {
+        log_info("ttbr0 empty-root install failed: no free pages");
+        return;
+    }
+
     __asm__ volatile(
-        "msr tcr_el1, %0\n"
+        "msr ttbr0_el1, %0\n"
         "isb\n"
         "tlbi vmalle1\n"
         "dsb ish\n"
         "isb\n"
         :
-        : "r"(tcr)
+        : "r"(new_root)
         : "memory");
 
-    log_info("ttbr0 disabled (EPD0=1)");
+    ttbr0_runtime_empty_root = new_root;
+    l0_table = new_root;
+    l1_table = (unsigned long *)0;
+    l2_ram_table = (unsigned long *)0;
 
-    /* Return the TTBR0 table pages to the page allocator. */
-    for (i = 0; i < mmu_table_page_count; i++) {
-        const char *name = mmu_table_page_names[i];
+    write_index = 0UL;
+    for (read_index = 0UL; read_index < mmu_table_page_count; read_index++) {
+        const char *name;
 
-        /* TTBR1 pages are prefixed with "t1-"; skip them. */
-        if (name[0] == 't' && name[1] == '1' && name[2] == '-')
+        name = mmu_table_page_names[read_index];
+        if (mmu_debug_name_has_prefix(name, "t1-")) {
+            if (write_index != read_index) {
+                mmu_table_page_addresses[write_index] = mmu_table_page_addresses[read_index];
+                mmu_debug_copy_name(mmu_table_page_names[write_index], name);
+            }
+            write_index++;
             continue;
+        }
 
-        page_free((void *)mmu_table_page_addresses[i]);
+        page_free((void *)mmu_table_page_addresses[read_index]);
         table_pages_used--;
     }
 
-    l0_table = (unsigned long *)0;
-    l1_table = (unsigned long *)0;
-    l2_ram_table = (unsigned long *)0;
+    mmu_table_page_count = write_index;
+    mmu_debug_record_table_page((unsigned long)new_root, "t0-empty-root");
+    table_pages_used++;
+
+    log_info("ttbr0 runtime root installed (empty lower half)");
 
     log_write("[info] mmu table pages after ttbr0 free=");
     log_write_u64(table_pages_used);

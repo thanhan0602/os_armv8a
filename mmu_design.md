@@ -18,8 +18,10 @@ Hệ thống hiện tại sử dụng:
 
 Hệ thống hỗ trợ hai build variant thông qua flag `CONFIG_KERNEL_VIRTUAL`:
 
-- **`KERNEL_VIRTUAL=1` (mặc định)**: dùng cả `TTBR0_EL1` (identity map) và `TTBR1_EL1` (kernel VA map). Kernel chạy tại high VA `0xFFFF...` sau trampoline.
+- **`KERNEL_VIRTUAL=1` (mặc định)**: boot dùng `TTBR0_EL1` identity map và `TTBR1_EL1` kernel VA map. Sau trampoline, kernel chạy tại high VA `0xFFFF...` qua `TTBR1`, còn `TTBR0` được thay bằng một empty lower-half root do kernel sở hữu.
 - **`KERNEL_VIRTUAL=0`**: chỉ dùng `TTBR0_EL1` identity map, `TTBR1` bị tắt bằng `EPD1=1`. Kernel chạy tại PA. Phù hợp cho debugging và bring-up đơn giản.
+
+Khi đọc sơ đồ TTBR0 bên dưới, cần nhớ rằng trong `KERNEL_VIRTUAL=1` cây identity đó chỉ tồn tại cho boot path; runtime giữ lại một root lower-half rỗng thay vì tiếp tục giữ kernel low alias.
 
 ## Vì sao chọn 4-level thay vì 1, 2, hoặc 3 level
 
@@ -230,7 +232,11 @@ Kernel hiện tại bật `SCTLR_EL1.M/C/I` bằng một giá trị explicit có
 
 ## Cấu trúc bảng trang
 
-### TTBR0 (identity map — cả hai variant)
+### TTBR0 (boot identity map; runtime empty lower-half root khi `CONFIG_KERNEL_VIRTUAL=1`)
+
+Trong `KERNEL_VIRTUAL=1`, các bảng dưới đây mô tả boot identity map dùng để bật MMU và đi tới trampoline. Sau khi kernel đã chạy ổn định ở high VA qua `TTBR1`, runtime thay `TTBR0_EL1` bằng một root lower-half rỗng do kernel sở hữu và giải phóng các bảng identity cũ.
+
+Trong `KERNEL_VIRTUAL=0`, `TTBR0` vẫn giữ identity map này suốt runtime.
 
 ### `L0`
 
@@ -262,7 +268,7 @@ TTBR1 là một bộ bảng trang hoàn toàn độc lập, phản chiếu cùng
 - `L3` chunks cũng được cấp riêng (tên: `t1-l3-chunk-0`, `t1-l3-chunk-1`, ...)
 - Cùng permission model như TTBR0: `.text` RO+X, `.rodata` RO+NX, `.data/.bss` RW+NX
 - L1 device block cho MMIO (0x00000000–0x3FFFFFFF) với `nGnRnE + RW + NX`
-- Tổng table pages khi TTBR1 active: `10` (5 TTBR0 + 5 TTBR1)
+- Tổng table pages ở runtime khi `CONFIG_KERNEL_VIRTUAL=1`: `6` (1 empty TTBR0 root + 5 TTBR1 pages)
 - Tổng table pages khi chỉ identity map: `5`
 
 ## Layout hiện tại của kernel image
@@ -329,7 +335,7 @@ Trong runtime hiện tại:
 
 Log runtime hiện tại cho thấy:
 
-- `mmu table pages=10` khi `CONFIG_KERNEL_VIRTUAL=1` (5 TTBR0 + 5 TTBR1)
+- `mmu table pages=6` khi `CONFIG_KERNEL_VIRTUAL=1` (1 empty TTBR0 root + 5 TTBR1 pages)
 - `mmu table pages=5` khi `KERNEL_VIRTUAL=0` (chỉ TTBR0)
 
 ## Flow khởi tạo
@@ -357,6 +363,8 @@ _start (PA) → kernel_main_early (PA) → mmu_init → trampoline (adrp+add+off
 
 - Trampoline trong `start.S` chuyển SP và PC sang kernel VA
 - `kernel_main()` gọi lại `exception_init()` để VBAR_EL1 chứa VA của vector table
+- Sau handoff, runtime cài `TTBR0_EL1` sang empty lower-half root riêng và giải phóng boot TTBR0 identity tables
+- Runtime proof hiện tại cho thấy low VA kernel alias fault, trong khi high VA alias qua `TTBR1` vẫn translate bình thường
 
 Khi `KERNEL_VIRTUAL=0`:
 
@@ -588,26 +596,27 @@ Các module đã được chuyển đổi PA→VA:
 - `pl011.c`, `gicv2.c`: dùng `mmio_va()` helper cho MMIO register access
 - `main.c`: dùng `va_to_pa()` khi log backing PA của heap allocation
 
-## Vì sao vẫn là identity map
+## Vì sao vẫn giữ boot identity map
 
-Thiết kế hiện tại ưu tiên ổn định boot và khả năng debug. Identity map có các ưu điểm:
+Thiết kế MMU đã đi theo hướng thực dụng: trước hết giữ identity map đủ ổn định để bật MMU và vượt qua trampoline, sau đó mới cắt dần phụ thuộc runtime vào lower-half alias.
 
-- dễ đối chiếu VA và PA khi debug
-- dễ phân tích fault trong QEMU trace và GDB
-- giảm số lượng biến động khi Stage 6 mới được khởi tạo
+Boot identity map vẫn có ích vì:
 
-Đây chưa phải layout virtual memory cuối cùng của kernel.
+- dễ đối chiếu VA và PA khi debug bring-up ban đầu
+- giúp bật MMU với ít biến số hơn trong giai đoạn đầu
+- cho phép giữ code pre-MMU và trampoline đơn giản hơn
+
+Nhưng ở trạng thái hiện tại, identity map đó không còn là kernel runtime map trong build virtual nữa.
 
 ## Kernel virtual layout là gì
 
-`Kernel virtual layout` là cách tổ chức không gian địa chỉ ảo của kernel theo chủ đích thiết kế, thay vì để gần như toàn bộ vùng kernel dùng `VA = PA` như hiện tại.
+`Kernel virtual layout` là cách tổ chức không gian địa chỉ ảo của kernel theo chủ đích thiết kế, thay vì giữ kernel runtime phụ thuộc vào `VA = PA`.
 
-Trong identity map hiện tại, ví dụ:
+Trong runtime hiện tại khi `CONFIG_KERNEL_VIRTUAL=1`:
 
-- kernel text nằm tại VA `0x40080000`
-- và cũng được truy cập từ PA `0x40080000`
-
-Điều này rất tiện cho bring-up vì khi nhìn log, GDB, hoặc QEMU trace, ta không phải dịch qua lại giữa địa chỉ ảo và vật lý.
+- kernel thực thi qua high VA trên `TTBR1`
+- low VA kernel alias không còn hợp lệ sau handoff
+- lower half được giữ rỗng để chuẩn bị cho address spaces riêng về sau
 
 Tuy nhiên về dài hạn, kernel thường không muốn toàn bộ layout bị ràng buộc bởi địa chỉ vật lý thật. Thay vào đó, kernel virtual layout sẽ đặt các vùng theo vai trò logic.
 
@@ -647,20 +656,15 @@ Kernel virtual layout:
 - thuận lợi cho guard pages, KASLR về sau, userspace separation, direct map, và memory debugging
 - phù hợp hơn với một hệ điều hành thực thụ thay vì chỉ là kernel bring-up
 
-### Vì sao chưa làm ngay ở Stage 6 hiện tại
+### Vì sao chưa làm ngay toàn bộ ở Stage 6
 
-Stage 6 ưu tiên bật MMU ổn định trước, sau đó mới thêm virtual layout. Điều này đã được thực hiện thành công:
+Stage 6 ưu tiên bật MMU ổn định trước, sau đó mới thêm virtual layout và cuối cùng mới cắt low alias runtime. Chuỗi chuyển đổi thực tế đã diễn ra là:
 
-1. Bật MMU với identity map ổn định (TTBR0)
+1. Bật MMU với TTBR0 identity map ổn định
 2. Thêm kernel virtual layout qua TTBR1
-3. PA→VA migration cho toàn bộ kernel code
-4. Build flag `CONFIG_KERNEL_VIRTUAL` cho phép chọn giữa hai variant
-
-Bước chuyển đổi thực tế đã diễn ra:
-
-- bật MMU ổn định
-- giữ UART, timer, IRQ, exception path hoạt động
-- giảm số lượng biến động cùng lúc
+3. Hoàn tất PA→VA migration cho code kernel
+4. Giữ `CONFIG_KERNEL_VIRTUAL` để so sánh và debug hai variant
+5. Sau trampoline, thay TTBR0 runtime root bằng empty lower-half root và giải phóng boot identity tables
 
 Nếu vừa bật MMU vừa chuyển ngay sang một virtual layout hoàn toàn khác, số nguồn lỗi sẽ tăng mạnh:
 
@@ -673,7 +677,7 @@ Vì vậy cách đi hợp lý là:
 
 1. trước hết bật MMU ổn định với identity map
 2. sau đó từng bước giới thiệu kernel virtual layout
-3. cuối cùng giảm dần sự phụ thuộc vào `VA = PA`
+3. rồi mới cắt dần sự phụ thuộc vào `VA = PA` trong runtime
 
 ### Bước chuyển đổi thực tế sẽ như thế nào
 
@@ -682,22 +686,23 @@ Một lộ trình thực dụng thường là:
 1. giữ một identity map tối thiểu cho boot path
 2. thêm một vùng VA riêng cho kernel text/rodata/data
 3. chuyển code kernel sang chạy ổn định trong vùng VA mới
-4. thêm heap/stacks/MMIO windows riêng
-5. cuối cùng thu hẹp hoặc loại bỏ các identity mappings không còn cần thiết
+4. cắt kernel low alias ở runtime bằng empty TTBR0 root
+5. dùng root lower-half đó làm base cho mappings riêng theo process/user
+6. thêm heap/stacks/MMIO windows riêng hơn nữa khi address-space manager trưởng thành
 
 Đó là ý nghĩa của câu “tách Stage 6 thành kernel virtual layout thay vì identity map toàn bộ”.
 
 ## Ràng buộc hiện tại
 
-1. Identity map (TTBR0) vẫn còn active trong cả hai variant. Khi `CONFIG_KERNEL_VIRTUAL=1`, nó được dùng cho boot path trước trampoline.
+1. Khi `CONFIG_KERNEL_VIRTUAL=1`, TTBR0 identity map chỉ còn là boot path; runtime giữ một empty lower-half root chung chứ chưa có mappings riêng theo process/user.
 2. VMA vẫn là PA trong linker.ld để tránh pointer-in-data bug.
 3. Chưa có allocator riêng cho page tables ngoài physical page allocator.
 4. Fine-grained `L3` mới áp dụng cho một phần đầu của RAM, chưa mở rộng ra toàn bộ các vùng cần chính sách riêng.
-5. TTBR0 identity map chưa bị xóa; có thể repurpose cho user-space sau này.
+5. Lower half hiện vẫn trống; bước tiếp theo mới là populate nó bằng mappings riêng theo address space.
 
 ## Hướng mở rộng tiếp theo
 
-1. Xóa TTBR0 identity map khi `CONFIG_KERNEL_VIRTUAL=1` hoặc repurpose cho user-space (TTBR0 cho EL0).
+1. Dùng empty `TTBR0` lower-half root hiện có làm base cho page tables riêng theo process/user.
 2. Mở rộng `L3` fine mapping cho thêm các chunk RAM cần phân quyền chi tiết.
 3. Thêm guard pages cho stack và các vùng nhạy cảm.
 4. Tách page-table allocator và metadata riêng cho memory management sau này.

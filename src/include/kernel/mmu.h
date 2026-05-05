@@ -16,11 +16,11 @@ int mmu_is_enabled(void);
 
 #ifdef CONFIG_KERNEL_VIRTUAL
 /*
- * Disable TTBR0 translations (set EPD0=1 in TCR_EL1) and return the
- * TTBR0 table pages to the page allocator.  Only meaningful when the
- * kernel is running at high VA through TTBR1.
+ * Replace the boot-time TTBR0 identity map with an owned empty lower-half
+ * root after the kernel has switched to TTBR1. The old TTBR0 table pages are
+ * returned to the page allocator while TTBR0 walks remain enabled.
  */
-void mmu_disable_ttbr0(void);
+void mmu_install_empty_ttbr0_root(void);
 #endif
 
 /* Number of physical pages currently consumed by translation tables. */

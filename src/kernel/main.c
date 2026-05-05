@@ -12,6 +12,10 @@
 volatile unsigned long boot_stage;
 volatile unsigned long boot_heartbeat;
 
+extern char __text_start[];
+
+#define MMU_PAR_FAULT  (1UL << 0)
+
 static void task_a_func(void)
 {
     volatile unsigned long count = 0;
@@ -140,11 +144,39 @@ void kernel_main(void)
 
 #ifdef CONFIG_KERNEL_VIRTUAL
     /* Re-install VBAR_EL1 so it holds the kernel VA of the vector table. */
+    unsigned long kernel_low_alias;
+    unsigned long kernel_high_alias;
+    unsigned long low_probe_par;
+    unsigned long high_probe_par;
+
     exception_init();
     log_info("kernel running at high VA");
 
-    /* Identity map no longer needed — disable TTBR0 and free its pages. */
-    mmu_disable_ttbr0();
+    /* Replace boot-time TTBR0 identity tables with an owned empty runtime root. */
+    mmu_install_empty_ttbr0_root();
+
+    kernel_high_alias = (unsigned long)__text_start;
+    kernel_low_alias = va_to_pa((void *)kernel_high_alias);
+
+    mmu_debug_walk_address(kernel_low_alias);
+    low_probe_par = mmu_debug_probe_address(kernel_low_alias);
+    high_probe_par = mmu_debug_probe_address(kernel_high_alias);
+
+    log_write("[info] ttbr0 empty low probe va=");
+    log_write_hex(kernel_low_alias);
+    log_write(" par=");
+    log_write_hex(low_probe_par);
+    log_write(" fault=");
+    log_write_u64((low_probe_par & MMU_PAR_FAULT) != 0UL);
+    log_putc('\n');
+
+    log_write("[info] ttbr1 high probe va=");
+    log_write_hex(kernel_high_alias);
+    log_write(" par=");
+    log_write_hex(high_probe_par);
+    log_write(" fault=");
+    log_write_u64((high_probe_par & MMU_PAR_FAULT) != 0UL);
+    log_putc('\n');
 #endif
 
     kernel_heap_init();

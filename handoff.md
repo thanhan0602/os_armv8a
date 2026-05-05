@@ -21,7 +21,9 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - Physical page allocator hoạt động.
 - Kernel heap page-backed hiện hỗ trợ allocation nhỏ và allocation lớn hơn một page thông qua contiguous physical spans.
 - Shared debug target framework hiện cũng bao phủ heap arena inspection qua `heap-arenas` và `heap-large-arenas`; heap self-test đã đi qua cùng framework này.
-- MMU đã bật ổn định với cả TTBR0 (identity) và TTBR1 (kernel VA) khi virtual, hoặc chỉ TTBR0 khi identity.
+- MMU đã bật ổn định: boot path dùng TTBR0 identity + TTBR1 kernel VA khi virtual, hoặc chỉ TTBR0 khi identity.
+- Khi `CONFIG_KERNEL_VIRTUAL=1`, sau trampoline kernel hiện giữ TTBR1 cho kernel runtime và thay TTBR0 identity root bằng một empty lower-half root được kernel sở hữu; TTBR0 walks vẫn bật nhưng low VA kernel aliases giờ fault như mong đợi.
+- Đây là increment Stage 10 đầu tiên: runtime đã cắt phụ thuộc vào boot identity map và giữ sẵn lower-half root để đi tiếp tới address spaces riêng.
 - Cache `SCTLR_EL1.M/C/I` đã được bật và verify.
 - Boot flow khi `CONFIG_KERNEL_VIRTUAL=1`: `_start` (PA) → `kernel_main_early` (PA) → trampoline → `kernel_main` (VA qua TTBR1).
 - Boot flow khi `KERNEL_VIRTUAL=0`: `_start` (PA) → `kernel_main_early` (PA) → `kernel_main` (PA qua TTBR0).
@@ -36,7 +38,8 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
   - `CONFIG_KERNEL_VIRTUAL=1` (mặc định):
     - `TTBR0_EL1`: identity map (VA == PA) — dùng cho boot path
     - `TTBR1_EL1`: kernel VA map (VA == PA + `0xFFFF000000000000`) — active sau trampoline
-    - `mmu table pages=10` (5 cho TTBR0 + 5 cho TTBR1)
+    - sau khi nhảy sang high VA, runtime cài `TTBR0_EL1` sang một empty lower-half root riêng và giải phóng boot TTBR0 identity tables
+    - `mmu table pages=6` ở runtime sau handoff (1 empty TTBR0 root + 5 TTBR1 pages)
   - `KERNEL_VIRTUAL=0`:
     - `TTBR0_EL1`: identity map (VA == PA) — active suốt runtime
     - `TTBR1_EL1`: tắt bằng `EPD1=1`
@@ -61,6 +64,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - Deliberate `brk` đã được verify lại sau khi thêm register dump; fault log hiện có cả `ESR/ELR/SPSR/FAR` lẫn `x0..x30`.
 - **VMA=VA pointer-in-data bug**: khi đặt VMA=0xFFFF... trong linker.ld, các `const char *` bên trong `static const struct` arrays (.rodata) chứa VA tuyệt đối. Pre-MMU C code dereference chúng trước khi TTBR1 active → infinite fault loop. Giải pháp: giữ VMA=PA, trampoline dùng `adrp+add+offset` để nhảy sang VA tại runtime.
 - **Post-TTBR0 static-table pointer lesson**: vì linker VMA vẫn là PA, các con trỏ string lưu trong `static const` tables tiếp tục là PA. Code chạy sau khi TTBR1 active và TTBR0 bị tắt phải translate các con trỏ đã lưu này (ví dụ `pa_to_va`) trước khi dereference.
+- **Post-empty-TTBR0 allocator lesson**: free-list metadata hoặc stored pointers không được ngầm assume lower-half identity còn sống. Page allocator free-list hiện giữ physical addresses để tiếp tục hoạt động sau khi TTBR0 runtime root trở thành empty map.
 
 ## Tài liệu nên đọc trước khi tiếp tục
 
@@ -207,13 +211,13 @@ bash scripts/run_qemu_debug.sh
 
 1. **Hoàn thành**: PA→VA migration — tất cả module đã được chuyển.
 2. **Hoàn thành**: Dual build variant (`CONFIG_KERNEL_VIRTUAL=1` / `0`).
-3. Xóa TTBR0 identity map khi `CONFIG_KERNEL_VIRTUAL=1`, hoặc repurpose cho user-space.
+3. Dùng empty TTBR0 runtime root hiện có làm base cho lower-half mappings riêng theo process/user.
 4. Thêm guard pages cho stack hoặc các vùng nhạy cảm.
-5. Chuẩn bị cho address spaces riêng ở các stage sau (Stage 10).
+5. Tiếp tục các increment Stage 10 tiếp theo cho address spaces riêng.
 
 ## Ghi chú quyết định kiến trúc
 
-- TTBR1 kernel VA map đã active (khi `CONFIG_KERNEL_VIRTUAL=1`). TTBR0 identity map giữ cho boot path.
+- TTBR1 kernel VA map đã active (khi `CONFIG_KERNEL_VIRTUAL=1`). TTBR0 identity map chỉ giữ cho boot path; runtime đổi sang empty lower-half root riêng.
 - Khi `KERNEL_VIRTUAL=0`, TTBR1 bị tắt bằng EPD1=1, kernel chạy hoàn toàn trên identity map.
 - VMA vẫn là PA trong linker.ld để tránh pointer-in-data bug (xem mục bài học kỹ thuật).
 - Trampoline dùng `adrp+add+offset` thay vì `ldr =symbol` vì VMA=PA khiến literal pool chứa PA, cần cộng offset runtime.

@@ -26,7 +26,7 @@ struct page_node {
 
 extern char __kernel_end[];
 
-static struct page_node *page_free_list;
+static unsigned long page_free_list_pa;
 static unsigned long total_pages;
 static unsigned long free_pages;
 static unsigned long reserved_bytes;
@@ -67,7 +67,7 @@ static void *page_pa_to_ptr(unsigned long pa)
  */
 static unsigned long page_ptr_to_pa(const void *ptr)
 {
-    if (mmu_is_enabled()) {
+    if (mmu_is_enabled() && (unsigned long)ptr >= KERNEL_VA_OFFSET) {
         return va_to_pa(ptr);
     }
 
@@ -125,14 +125,17 @@ static void page_allocator_warn(const char *message, unsigned long address)
 
 static unsigned long count_free_list_nodes(void)
 {
-    struct page_node *node;
+    unsigned long node_pa;
     unsigned long count;
 
     count = 0UL;
-    node = page_free_list;
-    while (node != (struct page_node *)0) {
+    node_pa = page_free_list_pa;
+    while (node_pa != 0UL) {
+        struct page_node *node;
+
+        node = (struct page_node *)page_pa_to_ptr(node_pa);
         count++;
-        node = node->next;
+        node_pa = page_ptr_to_pa(node->next);
     }
 
     return count;
@@ -142,14 +145,14 @@ static void page_allocator_rebuild_free_list(void)
 {
     unsigned long page_addr;
 
-    page_free_list = (struct page_node *)0;
+    page_free_list_pa = 0UL;
     for (page_addr = managed_end - PAGE_SIZE; page_addr >= managed_start; page_addr -= PAGE_SIZE) {
         if (page_state[page_index_from_address(page_addr)] == PAGE_STATE_FREE) {
             struct page_node *page;
 
             page = (struct page_node *)page_pa_to_ptr(page_addr);
-            page->next = page_free_list;
-            page_free_list = page;
+            page->next = (struct page_node *)page_free_list_pa;
+            page_free_list_pa = page_addr;
         }
 
         if (page_addr == managed_start) {
@@ -174,7 +177,7 @@ void page_allocator_init(void)
     managed_end = ram_end;
     reserved_bytes = managed_start - QEMU_VIRT_RAM_BASE;
 
-    page_free_list = (struct page_node *)0;
+    page_free_list_pa = 0UL;
     total_pages = 0UL;
     free_pages = 0UL;
     invalid_free_count = 0UL;
@@ -192,8 +195,8 @@ void page_allocator_init(void)
         struct page_node *page;
 
         page = (struct page_node *)page_pa_to_ptr(page_addr);
-        page->next = page_free_list;
-        page_free_list = page;
+        page->next = (struct page_node *)page_free_list_pa;
+        page_free_list_pa = page_addr;
         page_state[page_index_from_address(page_addr)] = PAGE_STATE_FREE;
         total_pages++;
         free_pages++;
@@ -216,18 +219,20 @@ void page_allocator_init(void)
 void *page_alloc(void)
 {
     struct page_node *page;
+    unsigned long page_pa;
 
     /* Pop from the head of the free list, mark allocated, then scrub the page. */
-    page = page_free_list;
-    if (page == (struct page_node *)0) {
+    page_pa = page_free_list_pa;
+    if (page_pa == 0UL) {
         return (void *)0;
     }
 
-    page_free_list = page->next;
-    page_state[page_index_from_address(page_ptr_to_pa(page))] = PAGE_STATE_ALLOCATED;
+    page = (struct page_node *)page_pa_to_ptr(page_pa);
+    page_free_list_pa = page_ptr_to_pa(page->next);
+    page_state[page_index_from_address(page_pa)] = PAGE_STATE_ALLOCATED;
     free_pages--;
-    zero_page(page_ptr_to_pa(page));
-    return (void *)page_ptr_to_pa(page);
+    zero_page(page_pa);
+    return (void *)page_pa;
 }
 
 void *page_alloc_contiguous(unsigned long page_count)
@@ -303,8 +308,8 @@ void page_free(void *page)
 
     /* Return the page to the free-list head and restore its metadata to FREE. */
     node = (struct page_node *)page_pa_to_ptr(page_addr);
-    node->next = page_free_list;
-    page_free_list = node;
+    node->next = (struct page_node *)page_free_list_pa;
+    page_free_list_pa = page_addr;
     page_state[page_index_from_address(page_addr)] = PAGE_STATE_FREE;
     free_pages++;
 }
