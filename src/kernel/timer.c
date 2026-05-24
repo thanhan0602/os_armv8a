@@ -44,13 +44,9 @@ void timer_init(void)
     timer_program_next_tick();
     local_irq_enable();
 
-    log_write("[info] generic timer frequency=");
-    log_write_u64(timer_frequency);
-    log_putc('\n');
-    log_write("[info] timer interval cycles=");
-    log_write_u64(timer_interval);
-    log_putc('\n');
-    log_info("stage 4 timer irq enabled");
+    KER_LOGF("[info] generic timer frequency=%lu\n", timer_frequency);
+    KER_LOGF("[info] timer interval cycles=%lu\n", timer_interval);
+    KER_INFO("stage 4 timer irq enabled");
 }
 
 int timer_handle_irq(unsigned int intid)
@@ -63,9 +59,7 @@ int timer_handle_irq(unsigned int intid)
     timer_program_next_tick();
 
     if (timer_ticks <= 4UL) {
-        log_write("[info] timer tick=");
-        log_write_u64(timer_ticks);
-        log_putc('\n');
+        KER_LOGF("[info] timer tick=%lu\n", timer_ticks);
     }
 
     return 1;

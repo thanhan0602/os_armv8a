@@ -13,6 +13,10 @@ volatile unsigned long boot_stage;
 volatile unsigned long boot_heartbeat;
 
 extern char __text_start[];
+#ifdef CONFIG_KERNEL_VIRTUAL
+extern char user_task_entry[];
+extern char user_task_entry_end[];
+#endif
 
 #define MMU_PAR_FAULT  (1UL << 0)
 
@@ -23,9 +27,7 @@ static void task_a_func(void)
     while (1) {
         count++;
         if (count <= 4UL) {
-            log_write("[task-a] run #");
-            log_write_u64(count);
-            log_putc('\n');
+            KER_LOGF("[task-a] run #%lu\n", count);
         }
         __asm__ volatile("wfe");
     }
@@ -38,9 +40,7 @@ static void task_b_func(void)
     while (1) {
         count++;
         if (count <= 4UL) {
-            log_write("[task-b] run #");
-            log_write_u64(count);
-            log_putc('\n');
+            KER_LOGF("[task-b] run #%lu\n", count);
         }
         __asm__ volatile("wfe");
     }
@@ -67,49 +67,33 @@ void kernel_main_early(void)
     boot_stage = 6;
 
     log_init();
-    log_info("entering kernel_main_early");
-    log_info("stage 2 console online");
-    log_info("stack and bss initialized");
+    KER_INFO("entering kernel_main_early");
+    KER_INFO("stage 2 console online");
+    KER_INFO("stack and bss initialized");
     exception_init();
-    log_info("stage 3 exception vectors installed");
+    KER_INFO("stage 3 exception vectors installed");
     page_allocator_init();
-    log_info("stage 5 physical page allocator online");
-    log_write("[info] reserved bytes=");
-    log_write_u64(page_allocator_reserved_bytes());
-    log_putc('\n');
-    log_write("[info] free pages=");
-    log_write_u64(page_allocator_free_pages());
-    log_putc('\n');
+    KER_INFO("stage 5 physical page allocator online");
+    KER_LOGF("[info] reserved bytes=%lu\n", page_allocator_reserved_bytes());
+    KER_LOGF("[info] free pages=%lu\n", page_allocator_free_pages());
     kernel_debug_log_pre_mmu_targets(0UL, 0UL);
     page_allocator_log_consistency();
 
     test_page_a = page_alloc();
     test_page_b = page_alloc();
-    log_write("[info] alloc page a=");
-    log_write_hex((unsigned long)test_page_a);
-    log_putc('\n');
-    log_write("[info] alloc page b=");
-    log_write_hex((unsigned long)test_page_b);
-    log_putc('\n');
+    KER_LOGF("[info] alloc page a=%p\n", test_page_a);
+    KER_LOGF("[info] alloc page b=%p\n", test_page_b);
     kernel_debug_log_pre_mmu_targets((unsigned long)test_page_a, (unsigned long)test_page_b);
-    log_write("[info] free pages after alloc=");
-    log_write_u64(page_allocator_free_pages());
-    log_putc('\n');
+    KER_LOGF("[info] free pages after alloc=%lu\n", page_allocator_free_pages());
     page_allocator_log_consistency();
 
     page_free(test_page_a);
     page_free(test_page_b);
     kernel_debug_log_pre_mmu_targets((unsigned long)test_page_a, (unsigned long)test_page_b);
-    log_write("[info] free pages after free=");
-    log_write_u64(page_allocator_free_pages());
-    log_putc('\n');
+    KER_LOGF("[info] free pages after free=%lu\n", page_allocator_free_pages());
     page_allocator_log_consistency();
-    log_write("[info] invalid free count=");
-    log_write_u64(page_allocator_invalid_free_count());
-    log_putc('\n');
-    log_write("[info] double free count=");
-    log_write_u64(page_allocator_double_free_count());
-    log_putc('\n');
+    KER_LOGF("[info] invalid free count=%lu\n", page_allocator_invalid_free_count());
+    KER_LOGF("[info] double free count=%lu\n", page_allocator_double_free_count());
 
     /*
      * MMU bring-up programs MAIR_EL1, TCR_EL1, TTBR0_EL1, TTBR1_EL1,
@@ -118,16 +102,12 @@ void kernel_main_early(void)
      * (TTBR1) are live.
      */
     mmu_init();
-    log_write("[info] mmu enabled=");
-    log_write_u64((unsigned long)mmu_is_enabled());
-    log_putc('\n');
-    log_write("[info] free pages after mmu=");
-    log_write_u64(page_allocator_free_pages());
-    log_putc('\n');
+    KER_LOGF("[info] mmu enabled=%lu\n", (unsigned long)mmu_is_enabled());
+    KER_LOGF("[info] free pages after mmu=%lu\n", page_allocator_free_pages());
     kernel_debug_log_post_mmu_targets((unsigned long)&boot_stage);
     page_allocator_log_consistency();
 
-    log_info("kernel_main_early done, returning for VA trampoline");
+    KER_INFO("kernel_main_early done, returning for VA trampoline");
 }
 
 /*
@@ -136,6 +116,65 @@ void kernel_main_early(void)
  * heap init happens here so dynamic kernel memory already runs under the
  * final Stage-1 translation regime at the intended VA.
  */
+#ifdef CONFIG_KERNEL_VIRTUAL
+static void create_user_task(void)
+{
+    struct mm_context *mm;
+    void *code_pa;
+    void *stack_pa;
+    unsigned char *code_va;
+    unsigned long code_size;
+    unsigned long i;
+
+    mm = mmu_context_create();
+    if (mm == (struct mm_context *)0) {
+        KER_INFO("[user] mmu_context_create failed");
+        return;
+    }
+
+    code_pa = page_alloc();
+    if (code_pa == (void *)0) {
+        KER_INFO("[user] code page alloc failed");
+        return;
+    }
+
+    stack_pa = page_alloc();
+    if (stack_pa == (void *)0) {
+        KER_INFO("[user] stack page alloc failed");
+        return;
+    }
+
+    /* Copy user task code to the allocated page (accessed via kernel VA). */
+    code_size = (unsigned long)user_task_entry_end - (unsigned long)user_task_entry;
+    code_va = (unsigned char *)pa_to_va(code_pa);
+    for (i = 0; i < code_size; i++) {
+        code_va[i] = ((unsigned char *)user_task_entry)[i];
+    }
+
+    /* Ensure I-cache coherency after writing instructions. */
+    __asm__ volatile("dsb ish\n ic iallu\n dsb nsh\n isb\n" ::: "memory");
+
+    /* Map code page (EL0 RO, executable). */
+    if (!mmu_map_user_page(mm, USER_CODE_VA, (unsigned long)code_pa,
+                           MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
+                           MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RO)) {
+        KER_INFO("[user] code page map failed");
+        return;
+    }
+
+    /* Map stack page (EL0 RW, non-executable). */
+    if (!mmu_map_user_page(mm, USER_STACK_TOP - PAGE_SIZE, (unsigned long)stack_pa,
+                           MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
+                           MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
+                           MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN)) {
+        KER_INFO("[user] stack page map failed");
+        return;
+    }
+
+    task_create_user(USER_CODE_VA, USER_STACK_TOP, mm, "user");
+}
+#endif /* CONFIG_KERNEL_VIRTUAL */
+
 void kernel_main(void)
 {
     unsigned long *heap_counter;
@@ -150,7 +189,7 @@ void kernel_main(void)
     unsigned long high_probe_par;
 
     exception_init();
-    log_info("kernel running at high VA");
+    KER_INFO("kernel running at high VA");
 
     /* Replace boot-time TTBR0 identity tables with an owned empty runtime root. */
     mmu_install_empty_ttbr0_root();
@@ -162,21 +201,13 @@ void kernel_main(void)
     low_probe_par = mmu_debug_probe_address(kernel_low_alias);
     high_probe_par = mmu_debug_probe_address(kernel_high_alias);
 
-    log_write("[info] ttbr0 empty low probe va=");
-    log_write_hex(kernel_low_alias);
-    log_write(" par=");
-    log_write_hex(low_probe_par);
-    log_write(" fault=");
-    log_write_u64((low_probe_par & MMU_PAR_FAULT) != 0UL);
-    log_putc('\n');
+    KER_LOGF("[info] ttbr0 empty low probe va=%lx par=%lx fault=%lu\n",
+             kernel_low_alias, low_probe_par,
+             (low_probe_par & MMU_PAR_FAULT) != 0UL);
 
-    log_write("[info] ttbr1 high probe va=");
-    log_write_hex(kernel_high_alias);
-    log_write(" par=");
-    log_write_hex(high_probe_par);
-    log_write(" fault=");
-    log_write_u64((high_probe_par & MMU_PAR_FAULT) != 0UL);
-    log_putc('\n');
+    KER_LOGF("[info] ttbr1 high probe va=%lx par=%lx fault=%lu\n",
+             kernel_high_alias, high_probe_par,
+             (high_probe_par & MMU_PAR_FAULT) != 0UL);
 #endif
 
     kernel_heap_init();
@@ -194,15 +225,10 @@ void kernel_main(void)
         heap_message[4] = '\0';
         heap_large[0] = 'L';
         heap_large[PAGE_SIZE + 511UL] = 'Z';
-        log_write("[info] heap self-test counter=");
-        log_write_u64(heap_counter[0]);
-        log_write(" label=");
-        log_write(heap_message);
-        log_write(" large=");
-        log_write_hex((unsigned long)heap_large);
-        log_putc('\n');
+        KER_LOGF("[info] heap self-test counter=%lu label=%s large=%p\n",
+                 heap_counter[0], heap_message, (void *)heap_large);
     } else {
-        log_info("heap self-test allocation failed");
+        KER_INFO("heap self-test allocation failed");
     }
     kernel_debug_log_heap_targets();
     kernel_heap_log_stats();
@@ -214,15 +240,16 @@ void kernel_main(void)
     page_allocator_log_consistency();
 
     timer_init();
-    log_write("[info] boot_stage=");
-    log_write_u64(boot_stage);
-    log_putc('\n');
+    KER_LOGF("[info] boot_stage=%lu\n", boot_stage);
 
     sched_init();
     task_create(task_a_func, "task-a");
     task_create(task_b_func, "task-b");
+#ifdef CONFIG_KERNEL_VIRTUAL
+    create_user_task();
+#endif
 
-    log_info("idle task running");
+    KER_INFO("idle task running");
 
     while (1) {
         boot_heartbeat++;

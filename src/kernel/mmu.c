@@ -2,6 +2,7 @@
 
 #include <arch/arm/virt.h>
 #include <kernel/debug_targets.h>
+#include <kernel/heap.h>
 #include <kernel/log.h>
 #include <kernel/page_alloc.h>
 #include <kernel/vm.h>
@@ -334,76 +335,66 @@ static unsigned long kernel_page_attrs(unsigned long address)
 #if MMU_USE_4LEVEL && MMU_DEBUG_WALK_ENABLED
 static void mmu_debug_print_index(const char *level_name, unsigned long index)
 {
-    log_write("[info] ");
-    log_write(level_name);
-    log_write(" index=");
-    log_write_u64(index);
-    log_putc('\n');
+    KER_LOGF("[info] %s index=%lu\n", level_name, index);
 }
 
 static void mmu_debug_print_entry(const char *level_name, unsigned long entry)
 {
-    log_write("[info] ");
-    log_write(level_name);
-    log_write(" entry=");
-    log_write_hex(entry);
-    log_putc('\n');
+    KER_LOGF("[info] %s entry=%lx\n", level_name, entry);
 }
 
 static void mmu_debug_print_leaf_attrs(unsigned long address, unsigned long entry)
 {
-    unsigned long attr_index;
+    const char *mem_kind;
+    const char *ap_kind;
+    const char *exec_kind;
+    const char *share_kind;
+    const char *af_kind;
 
-    log_write("[info] walk attrs: mem=");
-    attr_index = entry & MMU_ATTR_INDEX_MASK;
-    if (attr_index == MMU_ATTR_DEVICE) {
-        log_write("device");
-    } else if (attr_index == MMU_ATTR_NORMAL) {
-        log_write("normal");
+    if ((entry & MMU_ATTR_INDEX_MASK) == MMU_ATTR_DEVICE) {
+        mem_kind = "device";
+    } else if ((entry & MMU_ATTR_INDEX_MASK) == MMU_ATTR_NORMAL) {
+        mem_kind = "normal";
     } else {
-        log_write("unknown");
+        mem_kind = "unknown";
     }
 
-    log_write(" ap=");
     if ((entry & MMU_AP_RO) == MMU_AP_RO) {
-        log_write("ro");
+        ap_kind = "ro";
     } else {
-        log_write("rw");
+        ap_kind = "rw";
     }
 
-    log_write(" exec=");
     if ((entry & MMU_PXN) != 0) {
-        log_write("nx");
+        exec_kind = "nx";
     } else {
-        log_write("x");
+        exec_kind = "x";
     }
 
-    log_write(" sh=");
     if ((entry & MMU_SH_INNER_SHAREABLE) == MMU_SH_INNER_SHAREABLE) {
-        log_write("inner");
+        share_kind = "inner";
     } else {
-        log_write("non");
+        share_kind = "non";
     }
 
-    log_write(" af=");
     if ((entry & MMU_AF) != 0) {
-        log_write("1");
+        af_kind = "1";
     } else {
-        log_write("0");
+        af_kind = "0";
     }
 
-    log_write(" section=");
-    log_write(mmu_region_name(address));
-    log_putc('\n');
+    KER_LOGF("[info] walk attrs: mem=%s ap=%s exec=%s sh=%s af=%s section=%s\n",
+             mem_kind,
+             ap_kind,
+             exec_kind,
+             share_kind,
+             af_kind,
+             mmu_region_name(address));
 }
 
 static void mmu_debug_print_desc_kind(const char *level_name, const char *kind)
 {
-    log_write("[info] ");
-    log_write(level_name);
-    log_write(" type=");
-    log_write(kind);
-    log_putc('\n');
+    KER_LOGF("[info] %s type=%s\n", level_name, kind);
 }
 
 /*
@@ -446,16 +437,12 @@ static void mmu_debug_walk(unsigned long address)
     unsigned long *l3_walk_table;
     unsigned long pa;
 
-    log_write("[info] walk va=");
-    log_write_hex(address);
-    log_putc('\n');
-    log_write("[info] walk region=");
-    log_write(mmu_region_name(address));
-    log_putc('\n');
+    KER_LOGF("[info] walk va=%lx\n", address);
+    KER_LOGF("[info] walk region=%s\n", mmu_region_name(address));
 
     l0_walk_table = mmu_root_table_for_walk();
     if (l0_walk_table == (unsigned long *)0) {
-        log_info("walk unavailable: no active ttbr0 root");
+        KER_INFO("walk unavailable: no active ttbr0 root");
         return;
     }
 
@@ -465,7 +452,7 @@ static void mmu_debug_walk(unsigned long address)
     mmu_debug_print_entry("walk l0", l0_entry);
     if ((l0_entry & MMU_DESC_VALID) == 0) {
         mmu_debug_print_desc_kind("walk l0", "invalid");
-        log_info("walk stopped: invalid l0 entry");
+        KER_INFO("walk stopped: invalid l0 entry");
         return;
     }
     mmu_debug_print_desc_kind("walk l0", "table");
@@ -477,7 +464,7 @@ static void mmu_debug_walk(unsigned long address)
     mmu_debug_print_entry("walk l1", l1_entry);
     if ((l1_entry & MMU_DESC_VALID) == 0) {
         mmu_debug_print_desc_kind("walk l1", "invalid");
-        log_info("walk stopped: invalid l1 entry");
+        KER_INFO("walk stopped: invalid l1 entry");
         return;
     }
 
@@ -485,9 +472,7 @@ static void mmu_debug_walk(unsigned long address)
         mmu_debug_print_desc_kind("walk l1", "block");
         mmu_debug_print_leaf_attrs(address, l1_entry);
         pa = (l1_entry & MMU_L1_BLOCK_ADDR_MASK) | (address & (MMU_L1_BLOCK_SIZE - 1UL));
-        log_write("[info] walk pa from l1 block=");
-        log_write_hex(pa);
-        log_putc('\n');
+        KER_LOGF("[info] walk pa from l1 block=%lx\n", pa);
         return;
     }
     mmu_debug_print_desc_kind("walk l1", "table");
@@ -499,7 +484,7 @@ static void mmu_debug_walk(unsigned long address)
     mmu_debug_print_entry("walk l2", l2_entry);
     if ((l2_entry & MMU_DESC_VALID) == 0) {
         mmu_debug_print_desc_kind("walk l2", "invalid");
-        log_info("walk stopped: invalid l2 entry");
+        KER_INFO("walk stopped: invalid l2 entry");
         return;
     }
 
@@ -507,9 +492,7 @@ static void mmu_debug_walk(unsigned long address)
         mmu_debug_print_desc_kind("walk l2", "block");
         mmu_debug_print_leaf_attrs(address, l2_entry);
         pa = (l2_entry & MMU_L2_BLOCK_ADDR_MASK) | (address & (MMU_L2_BLOCK_SIZE - 1UL));
-        log_write("[info] walk pa from l2 block=");
-        log_write_hex(pa);
-        log_putc('\n');
+        KER_LOGF("[info] walk pa from l2 block=%lx\n", pa);
         return;
     }
     mmu_debug_print_desc_kind("walk l2", "table");
@@ -521,16 +504,14 @@ static void mmu_debug_walk(unsigned long address)
     mmu_debug_print_entry("walk l3", l3_entry);
     if ((l3_entry & MMU_DESC_VALID) == 0) {
         mmu_debug_print_desc_kind("walk l3", "invalid");
-        log_info("walk stopped: invalid l3 entry");
+        KER_INFO("walk stopped: invalid l3 entry");
         return;
     }
 
     mmu_debug_print_desc_kind("walk l3", "page");
     mmu_debug_print_leaf_attrs(address, l3_entry);
     pa = (l3_entry & MMU_L3_PAGE_ADDR_MASK) | (address & (PAGE_SIZE - 1UL));
-    log_write("[info] walk pa from l3 page=");
-    log_write_hex(pa);
-    log_putc('\n');
+    KER_LOGF("[info] walk pa from l3 page=%lx\n", pa);
 }
 
 static unsigned long mmu_probe_translate(unsigned long address)
@@ -553,14 +534,14 @@ void mmu_debug_walk_address(unsigned long address)
 {
 #if MMU_USE_4LEVEL && MMU_DEBUG_WALK_ENABLED
     if (l0_table == (unsigned long *)0) {
-        log_info("walk unavailable: mmu tables not initialized");
+        KER_INFO("walk unavailable: mmu tables not initialized");
         return;
     }
 
     mmu_debug_walk(address);
 #else
     (void)address;
-    log_info("walk unavailable: MMU debug walk disabled at build time");
+    KER_INFO("walk unavailable: MMU debug walk disabled at build time");
 #endif
 }
 
@@ -695,7 +676,7 @@ static int build_identity_map(void)
         mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], "l3-chunk-", chunk_index);
         l3_table = alloc_named_table_page(mmu_table_page_names[mmu_table_page_count]);
         if (l3_table == (unsigned long *)0) {
-            log_info("mmu init failed: no free pages for l3 table");
+            KER_INFO("mmu init failed: no free pages for l3 table");
             return 0;
         }
 
@@ -776,7 +757,7 @@ static int build_kernel_map(void)
         mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], "t1-l3-chunk-", chunk_index);
         l3_table = alloc_named_table_page(mmu_table_page_names[mmu_table_page_count]);
         if (l3_table == (unsigned long *)0) {
-            log_info("mmu init failed: no free pages for t1 l3 table");
+            KER_INFO("mmu init failed: no free pages for t1 l3 table");
             return 0;
         }
 
@@ -818,7 +799,7 @@ void mmu_init(void)
         return;
     }
 
-    log_info("mmu init start");
+    KER_INFO("mmu init start");
 
     mmu_table_page_count = 0UL;
 
@@ -828,11 +809,11 @@ void mmu_init(void)
     if (l0_table == (unsigned long *)0 ||
         l1_table == (unsigned long *)0 ||
         l2_ram_table == (unsigned long *)0) {
-        log_info("mmu init failed: no free pages for page tables");
+        KER_INFO("mmu init failed: no free pages for page tables");
         return;
     }
 
-    log_info("mmu tables allocated");
+    KER_INFO("mmu tables allocated");
 
 #ifdef CONFIG_KERNEL_VIRTUAL
     l0_table_ttbr1 = alloc_named_table_page("t1-l0-root");
@@ -841,11 +822,11 @@ void mmu_init(void)
     if (l0_table_ttbr1 == (unsigned long *)0 ||
         l1_table_ttbr1 == (unsigned long *)0 ||
         l2_ram_table_ttbr1 == (unsigned long *)0) {
-        log_info("mmu init failed: no free pages for ttbr1 tables");
+        KER_INFO("mmu init failed: no free pages for ttbr1 tables");
         return;
     }
 
-    log_info("mmu ttbr1 tables allocated");
+    KER_INFO("mmu ttbr1 tables allocated");
 #endif
 
     if (!build_identity_map()) {
@@ -857,26 +838,16 @@ void mmu_init(void)
         return;
     }
 
-    log_info("mmu maps built (identity + kernel)");
+    KER_INFO("mmu maps built (identity + kernel)");
 #else
-    log_info("mmu identity map built");
+    KER_INFO("mmu identity map built");
 #endif
 
-    log_write("[info] l0 root entry=");
-    log_write_hex(l0_table[l0_index_for(QEMU_VIRT_RAM_BASE)]);
-    log_putc('\n');
-    log_write("[info] l1 device entry=");
-    log_write_hex(l1_table[l1_index_for(0x00000000UL)]);
-    log_putc('\n');
-    log_write("[info] l1 ram entry=");
-    log_write_hex(l1_table[l1_index_for(QEMU_VIRT_RAM_BASE)]);
-    log_putc('\n');
-    log_write("[info] l2 ram[0] entry=");
-    log_write_hex(l2_ram_table[l2_index_for(QEMU_VIRT_RAM_BASE)]);
-    log_putc('\n');
-    log_write("[info] l3 fine map chunks=");
-    log_write_u64(fine_map_chunks_used);
-    log_putc('\n');
+    KER_LOGF("[info] l0 root entry=%lx\n", l0_table[l0_index_for(QEMU_VIRT_RAM_BASE)]);
+    KER_LOGF("[info] l1 device entry=%lx\n", l1_table[l1_index_for(0x00000000UL)]);
+    KER_LOGF("[info] l1 ram entry=%lx\n", l1_table[l1_index_for(QEMU_VIRT_RAM_BASE)]);
+    KER_LOGF("[info] l2 ram[0] entry=%lx\n", l2_ram_table[l2_index_for(QEMU_VIRT_RAM_BASE)]);
+    KER_LOGF("[info] l3 fine map chunks=%lu\n", fine_map_chunks_used);
 
     kernel_debug_log_mmu_boot_targets();
 
@@ -948,20 +919,16 @@ void mmu_init(void)
 #endif
         : "memory");
 
-    log_info("mmu control registers programmed");
+    KER_INFO("mmu control registers programmed");
 
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
 
-    log_write("[info] sctlr_el1 before=");
-    log_write_hex(sctlr);
-    log_putc('\n');
+    KER_LOGF("[info] sctlr_el1 before=%lx\n", sctlr);
 
     /* Enable the MMU and both caches with the required architectural RES1 bits. */
     sctlr = SCTLR_EL1_RES1 | SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_I;
 
-    log_write("[info] sctlr_el1 after=");
-    log_write_hex(sctlr);
-    log_putc('\n');
+    KER_LOGF("[info] sctlr_el1 after=%lx\n", sctlr);
 
     /*
      * Writing SCTLR_EL1 is the commit point:
@@ -979,18 +946,12 @@ void mmu_init(void)
 
     mmu_enabled = 1;
 
-    log_info("stage 6 mmu enabled");
-    log_write("[info] ttbr0_el1=");
-    log_write_hex((unsigned long)l0_table);
-    log_putc('\n');
+    KER_INFO("stage 6 mmu enabled");
+    KER_LOGF("[info] ttbr0_el1=%lx\n", (unsigned long)l0_table);
 #ifdef CONFIG_KERNEL_VIRTUAL
-    log_write("[info] ttbr1_el1=");
-    log_write_hex((unsigned long)l0_table_ttbr1);
-    log_putc('\n');
+    KER_LOGF("[info] ttbr1_el1=%lx\n", (unsigned long)l0_table_ttbr1);
 #endif
-    log_write("[info] mmu table pages=");
-    log_write_u64(table_pages_used);
-    log_putc('\n');
+    KER_LOGF("[info] mmu table pages=%lu\n", table_pages_used);
 }
 
 int mmu_is_enabled(void)
@@ -1020,7 +981,7 @@ void mmu_install_empty_ttbr0_root(void)
 
     new_root = (unsigned long *)page_alloc();
     if (new_root == (unsigned long *)0) {
-        log_info("ttbr0 empty-root install failed: no free pages");
+        KER_INFO("ttbr0 empty-root install failed: no free pages");
         return;
     }
 
@@ -1061,10 +1022,141 @@ void mmu_install_empty_ttbr0_root(void)
     mmu_debug_record_table_page((unsigned long)new_root, "t0-empty-root");
     table_pages_used++;
 
-    log_info("ttbr0 runtime root installed (empty lower half)");
+    KER_INFO("ttbr0 runtime root installed (empty lower half)");
 
-    log_write("[info] mmu table pages after ttbr0 free=");
-    log_write_u64(table_pages_used);
-    log_putc('\n');
+    KER_LOGF("[info] mmu table pages after ttbr0 free=%lu\n", table_pages_used);
 }
-#endif
+
+struct mm_context *mmu_context_create(void)
+{
+    struct mm_context *mm;
+    unsigned long *root;
+
+    mm = (struct mm_context *)kmalloc(sizeof(struct mm_context));
+    if (mm == (struct mm_context *)0) {
+        return (struct mm_context *)0;
+    }
+
+    root = (unsigned long *)page_alloc();
+    if (root == (unsigned long *)0) {
+        kfree(mm);
+        return (struct mm_context *)0;
+    }
+
+    mm->root_pa = (unsigned long)root;
+    return mm;
+}
+
+void mmu_context_destroy(struct mm_context *mm)
+{
+    if (mm == (struct mm_context *)0) {
+        return;
+    }
+
+    if (mm->root_pa != 0UL) {
+        page_free((void *)mm->root_pa);
+    }
+
+    kfree(mm);
+}
+
+void mmu_context_switch(struct mm_context *mm)
+{
+    unsigned long root_pa;
+
+    if (!mmu_enabled) {
+        return;
+    }
+
+    if (mm == (struct mm_context *)0) {
+        root_pa = (unsigned long)ttbr0_runtime_empty_root;
+    } else {
+        root_pa = mm->root_pa;
+    }
+
+    __asm__ volatile(
+        "msr ttbr0_el1, %0\n"
+        "isb\n"
+        "tlbi vmalle1\n"
+        "dsb ish\n"
+        "isb\n"
+        :
+        : "r"(root_pa)
+        : "memory");
+}
+
+/*
+ * Map a single 4 KiB page in the user address space described by mm.
+ *
+ * All descriptor values use physical addresses (page_alloc returns PA).
+ * Intermediate tables are accessed via pa_to_va() so they can be
+ * dereferenced while the kernel runs at high VA (TTBR1).
+ *
+ * The function does NOT track sub-table pages in the mmu_table_page_*
+ * debug arrays — Stage 9 is the first increment; that can be added later.
+ */
+int mmu_map_user_page(struct mm_context *mm, unsigned long va,
+                      unsigned long pa, unsigned long flags)
+{
+    unsigned long *l0;
+    unsigned long *l1;
+    unsigned long *l2;
+    unsigned long *l3;
+    void *new_page;
+    unsigned long idx;
+
+    if (mm == (struct mm_context *)0) {
+        return 0;
+    }
+
+    /* Access L0 via kernel VA (mm->root_pa is the PA of the L0 table). */
+    l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
+
+    /* L0 -> L1 */
+    idx = l0_index_for(va);
+    if ((l0[idx] & MMU_DESC_VALID) == 0UL) {
+        new_page = page_alloc();
+        if (new_page == (void *)0) {
+            return 0;
+        }
+        l0[idx] = (unsigned long)new_page | MMU_DESC_TABLE;
+    }
+    l1 = (unsigned long *)pa_to_va((void *)(l0[idx] & MMU_DESC_ADDR_MASK));
+
+    /* L1 -> L2 */
+    idx = l1_index_for(va);
+    if ((l1[idx] & MMU_DESC_VALID) == 0UL) {
+        new_page = page_alloc();
+        if (new_page == (void *)0) {
+            return 0;
+        }
+        l1[idx] = (unsigned long)new_page | MMU_DESC_TABLE;
+    }
+    l2 = (unsigned long *)pa_to_va((void *)(l1[idx] & MMU_DESC_ADDR_MASK));
+
+    /* L2 -> L3 */
+    idx = l2_index_for(va);
+    if ((l2[idx] & MMU_DESC_VALID) == 0UL) {
+        new_page = page_alloc();
+        if (new_page == (void *)0) {
+            return 0;
+        }
+        l2[idx] = (unsigned long)new_page | MMU_DESC_TABLE;
+    }
+    l3 = (unsigned long *)pa_to_va((void *)(l2[idx] & MMU_DESC_ADDR_MASK));
+
+    /* Install the L3 page descriptor. */
+    idx = l3_index_for(va);
+    l3[idx] = (pa & MMU_L3_PAGE_ADDR_MASK) | flags | MMU_DESC_PAGE;
+
+    /* Broadcast TLB invalidation so the new entry is visible immediately. */
+    __asm__ volatile(
+        "dsb ish\n"
+        "tlbi vmalle1\n"
+        "dsb ish\n"
+        "isb\n"
+        ::: "memory");
+
+    return 1;
+}
+#endif /* CONFIG_KERNEL_VIRTUAL */

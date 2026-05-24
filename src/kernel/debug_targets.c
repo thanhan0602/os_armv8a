@@ -131,70 +131,47 @@ static void kernel_debug_log_targets(unsigned long phase, unsigned long page_a, 
             continue;
         }
 
-        log_write("[info] debug target=");
-        log_write(kernel_debug_target_name(kernel_debug_targets[index].name));
+        KER_LOGF("[info] debug target=%s", kernel_debug_target_name(kernel_debug_targets[index].name));
 
         if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_PAGE_RANGE) {
-            log_write(" count=");
-            log_write_u64(kernel_debug_targets[index].page_count);
-            log_putc('\n');
+            KER_LOGF(" count=%lu\n", kernel_debug_targets[index].page_count);
             page_allocator_log_page_range(address, kernel_debug_targets[index].page_count);
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MANAGED_HEAD) {
-            log_write(" count=");
-            log_write_u64(kernel_debug_targets[index].page_count);
-            log_putc('\n');
+            KER_LOGF(" count=%lu\n", kernel_debug_targets[index].page_count);
             page_allocator_log_managed_head(kernel_debug_targets[index].page_count);
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MMU_TABLES) {
-            log_write(" count=");
-            log_write_u64(mmu_debug_table_page_count());
-            log_putc('\n');
+            KER_LOGF(" count=%lu\n", mmu_debug_table_page_count());
             for (table_index = 0UL; table_index < mmu_debug_table_page_count(); table_index++) {
-                log_write("[info] debug target=");
-                log_write(mmu_debug_table_page_name(table_index));
-                log_write(" count=1\n");
+                KER_LOGF("[info] debug target=%s count=1\n", mmu_debug_table_page_name(table_index));
                 page_allocator_log_page_state(mmu_debug_table_page_address(table_index));
             }
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MMU_WALK) {
-            log_write(" count=1\n");
+            KER_LOGF(" count=1\n");
             mmu_debug_walk_address(address);
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MMU_PROBE) {
-            log_write(" count=1\n");
-            log_write("[info] probe ");
-            log_write(kernel_debug_target_name(kernel_debug_targets[index].name));
-            log_write(" par=");
-            log_write_hex(mmu_debug_probe_address(address));
-            log_putc('\n');
+            KER_LOGF(" count=1\n");
+            KER_LOGF("[info] probe %s par=%lx\n",
+                     kernel_debug_target_name(kernel_debug_targets[index].name),
+                     mmu_debug_probe_address(address));
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MMU_BOOT_WALKS) {
-            log_write(" count=");
-            log_write_u64(mmu_debug_boot_target_count());
-            log_putc('\n');
+            KER_LOGF(" count=%lu\n", mmu_debug_boot_target_count());
             for (table_index = 0UL; table_index < mmu_debug_boot_target_count(); table_index++) {
-                log_write("[info] debug target=");
-                log_write(mmu_debug_boot_target_name(table_index));
-                log_write(" count=1\n");
+                KER_LOGF("[info] debug target=%s count=1\n", mmu_debug_boot_target_name(table_index));
                 mmu_debug_walk_address(mmu_debug_boot_target_address(table_index));
             }
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MMU_BOOT_PROBES) {
-            log_write(" count=");
-            log_write_u64(mmu_debug_boot_target_count());
-            log_putc('\n');
+            KER_LOGF(" count=%lu\n", mmu_debug_boot_target_count());
             for (table_index = 0UL; table_index < mmu_debug_boot_target_count(); table_index++) {
-                log_write("[info] probe ");
-                log_write(mmu_debug_boot_target_name(table_index));
-                log_write(" par=");
-                log_write_hex(mmu_debug_probe_address(mmu_debug_boot_target_address(table_index)));
-                log_putc('\n');
+                KER_LOGF("[info] probe %s par=%lx\n",
+                         mmu_debug_boot_target_name(table_index),
+                         mmu_debug_probe_address(mmu_debug_boot_target_address(table_index)));
             }
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_HEAP_ARENAS) {
-            log_write(" count=");
-            log_write_u64(kernel_heap_debug_arena_count(kernel_debug_targets[index].page_count));
-            log_putc('\n');
+            KER_LOGF(" count=%lu\n", kernel_heap_debug_arena_count(kernel_debug_targets[index].page_count));
             for (table_index = 0UL; table_index < kernel_heap_debug_arena_count(kernel_debug_targets[index].page_count); table_index++) {
-                log_write("[info] debug target=");
-                log_write(kernel_debug_target_name(kernel_debug_targets[index].name));
-                log_write(" arena_index=");
-                log_write_u64(table_index);
-                log_putc('\n');
+                KER_LOGF("[info] debug target=%s arena_index=%lu\n",
+                         kernel_debug_target_name(kernel_debug_targets[index].name),
+                         table_index);
                 kernel_heap_debug_log_arena(table_index, kernel_debug_targets[index].page_count);
             }
         }

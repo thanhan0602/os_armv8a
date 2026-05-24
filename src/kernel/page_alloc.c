@@ -114,13 +114,11 @@ static const char *page_state_name_from_value(unsigned char state)
 
 static void page_allocator_warn(const char *message, unsigned long address)
 {
-    log_write("[warn] ");
-    log_write(message);
     if (address != 0UL) {
-        log_write(": ");
-        log_write_hex(address);
+        KER_LOGF("[warn] %s: %lx\n", message, address);
+    } else {
+        KER_LOGF("[warn] %s\n", message);
     }
-    log_putc('\n');
 }
 
 static unsigned long count_free_list_nodes(void)
@@ -202,18 +200,10 @@ void page_allocator_init(void)
         free_pages++;
     }
 
-    log_write("[info] ram base=");
-    log_write_hex(QEMU_VIRT_RAM_BASE);
-    log_putc('\n');
-    log_write("[info] ram end=");
-    log_write_hex(ram_end);
-    log_putc('\n');
-    log_write("[info] page allocator start=");
-    log_write_hex(managed_start);
-    log_putc('\n');
-    log_write("[info] page allocator pages=");
-    log_write_u64(total_pages);
-    log_putc('\n');
+    KER_LOGF("[info] ram base=%lx\n", QEMU_VIRT_RAM_BASE);
+    KER_LOGF("[info] ram end=%lx\n", ram_end);
+    KER_LOGF("[info] page allocator start=%lx\n", managed_start);
+    KER_LOGF("[info] page allocator pages=%lu\n", total_pages);
 }
 
 void *page_alloc(void)
@@ -398,33 +388,21 @@ const char *page_allocator_page_state_name(unsigned long address)
 
 void page_allocator_log_page_state(unsigned long address)
 {
-    log_write("[info] page state addr=");
-    log_write_hex(address);
-
     if ((address & (PAGE_SIZE - 1UL)) != 0UL) {
-        log_write(" state=unaligned");
-        log_putc('\n');
+        KER_LOGF("[info] page state addr=%lx state=unaligned\n", address);
         return;
     }
 
     if (!page_address_is_in_ram(address)) {
-        log_write(" state=out-of-range");
-        log_putc('\n');
+        KER_LOGF("[info] page state addr=%lx state=out-of-range\n", address);
         return;
     }
 
-    log_write(" index=");
-    log_write_u64(page_index_from_address(address));
-    log_write(" state=");
-    log_write(page_allocator_page_state_name(address));
-
-    if (address < managed_start || address >= managed_end) {
-        log_write(" managed=no");
-    } else {
-        log_write(" managed=yes");
-    }
-
-    log_putc('\n');
+    KER_LOGF("[info] page state addr=%lx index=%lu state=%s managed=%s\n",
+             address,
+             page_index_from_address(address),
+             page_allocator_page_state_name(address),
+             (address < managed_start || address >= managed_end) ? "no" : "yes");
 }
 
 void page_allocator_log_page_range(unsigned long start_address, unsigned long page_count)
@@ -506,19 +484,9 @@ void page_allocator_log_consistency(void)
     free_list_nodes = count_free_list_nodes();
     mismatches = page_allocator_check_consistency();
 
-    log_write("[info] page allocator consistency mismatches=");
-    log_write_u64(mismatches);
-    log_write(" free_list_nodes=");
-    log_write_u64(free_list_nodes);
-    log_write(" state_free=");
-    log_write_u64(state_free_pages);
-    log_write(" state_allocated=");
-    log_write_u64(state_allocated_pages);
-    log_write(" tracked_free_pages=");
-    log_write_u64(free_pages);
-    log_write(" total_pages=");
-    log_write_u64(total_pages);
-    log_putc('\n');
+    KER_LOGF("[info] page allocator consistency mismatches=%lu free_list_nodes=%lu state_free=%lu state_allocated=%lu tracked_free_pages=%lu total_pages=%lu\n",
+             mismatches, free_list_nodes, state_free_pages, state_allocated_pages,
+             free_pages, total_pages);
 }
 
 unsigned long page_allocator_managed_start(void)
@@ -528,10 +496,6 @@ unsigned long page_allocator_managed_start(void)
 
 void page_allocator_log_managed_head(unsigned long page_count)
 {
-    log_write("[info] page managed head count=");
-    log_write_u64(page_count);
-    log_write(" start=");
-    log_write_hex(managed_start);
-    log_putc('\n');
+    KER_LOGF("[info] page managed head count=%lu start=%lx\n", page_count, managed_start);
     page_allocator_log_page_range(managed_start, page_count);
 }

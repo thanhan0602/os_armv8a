@@ -3,11 +3,12 @@
 #include <drivers/interrupt/gicv2.h>
 #include <kernel/log.h>
 #include <kernel/sched.h>
+#include <kernel/syscall.h>
 #include <kernel/timer.h>
 
 extern char exception_vector_table[];
 
-#define EXCEPTION_CONTEXT_SIZE 784UL
+#define EXCEPTION_CONTEXT_SIZE 800UL
 
 static const char *exception_vector_name(unsigned long vector_id)
 {
@@ -42,43 +43,42 @@ static void exception_dump_registers(const struct exception_context *context)
     unsigned long index;
 
     if (context == (const struct exception_context *)0) {
-        log_info("exception register dump unavailable");
+        KER_INFO("exception register dump unavailable");
         return;
     }
 
     for (index = 0UL; index < 31UL; index += 2UL) {
-        log_write("[fault] x");
-        log_write_u64(index);
-        log_write("=");
-        log_write_hex(context->gpr[index]);
-
         if ((index + 1UL) < 31UL) {
-            log_write(" x");
-            log_write_u64(index + 1UL);
-            log_write("=");
-            log_write_hex(context->gpr[index + 1UL]);
+            KER_LOGF("[fault] x%lu=%lx x%lu=%lx\n",
+                     index, context->gpr[index],
+                     index + 1UL, context->gpr[index + 1UL]);
+        } else {
+            KER_LOGF("[fault] x%lu=%lx\n", index, context->gpr[index]);
         }
-
-        log_putc('\n');
     }
 
-    log_write("[fault] SP_EL1(ex-entry)=");
-    log_write_hex((unsigned long)context + EXCEPTION_CONTEXT_SIZE);
-    log_putc('\n');
-    log_write("[fault] FPCR=");
-    log_write_hex(context->fpcr);
-    log_write(" FPSR=");
-    log_write_hex(context->fpsr);
-    log_putc('\n');
+    KER_LOGF("[fault] SP_EL1(ex-entry)=%lx\n",
+             (unsigned long)context + EXCEPTION_CONTEXT_SIZE);
+    KER_LOGF("[fault] FPCR=%lx FPSR=%lx\n", context->fpcr, context->fpsr);
 }
 
 void exception_init(void)
 {
+    unsigned long vbar;
+
+    /*
+     * Use adrp+add to compute the PC-relative address of the vector table.
+     * This returns the physical address when running pre-trampoline and the
+     * kernel virtual address when running post-trampoline, so the same
+     * function works correctly in both contexts.
+     */
     __asm__ volatile(
+        "adrp %0, exception_vector_table\n"
+        "add  %0, %0, :lo12:exception_vector_table\n"
         "msr vbar_el1, %0\n"
         "isb\n"
+        : "=r"(vbar)
         :
-        : "r"(exception_vector_table)
         : "memory");
 }
 
@@ -89,43 +89,50 @@ static void exception_dump(unsigned long vector_id,
                            unsigned long far_el1,
                            const struct exception_context *context)
 {
-    log_write("[fault] vector=");
-    log_write(exception_vector_name(vector_id));
-    log_putc('\n');
-
-    log_write("[fault] ESR_EL1=");
-    log_write_hex(esr_el1);
-    log_putc('\n');
-
-    log_write("[fault] ELR_EL1=");
-    log_write_hex(elr_el1);
-    log_putc('\n');
-
-    log_write("[fault] SPSR_EL1=");
-    log_write_hex(spsr_el1);
-    log_putc('\n');
-
-    log_write("[fault] FAR_EL1=");
-    log_write_hex(far_el1);
-    log_putc('\n');
+    KER_LOGF("[fault] vector=%s\n", exception_vector_name(vector_id));
+    KER_LOGF("[fault] ESR_EL1=%lx\n", esr_el1);
+    KER_LOGF("[fault] ELR_EL1=%lx\n", elr_el1);
+    KER_LOGF("[fault] SPSR_EL1=%lx\n", spsr_el1);
+    KER_LOGF("[fault] FAR_EL1=%lx\n", far_el1);
 
     exception_dump_registers(context);
 
-    log_info("exception handler parked the CPU");
+    KER_INFO("exception handler parked the CPU");
 }
 
-void exception_handle_sync(unsigned long vector_id,
+/*
+ * ESR_EL1 exception class (EC) field: bits [31:26].
+ * EC = 0x15 means "SVC instruction in AArch64 state from EL0".
+ */
+#define ESR_EC_SHIFT   26UL
+#define ESR_EC_MASK    0x3FUL
+#define ESR_EC_SVC64   0x15UL
+
+int exception_handle_sync(unsigned long vector_id,
                            unsigned long esr_el1,
                            unsigned long elr_el1,
                            unsigned long spsr_el1,
                            unsigned long far_el1,
-                           const struct exception_context *context)
+                           struct exception_context *context)
 {
+    unsigned long ec = (esr_el1 >> ESR_EC_SHIFT) & ESR_EC_MASK;
+
+    /*
+     * SVC from EL0 (AArch64): dispatch to the syscall handler and
+     * return 1 so the assembly stub does restore_context + eret.
+     */
+    if (ec == ESR_EC_SVC64) {
+        syscall_dispatch(context->gpr[8], context);
+        return 1;
+    }
+
     exception_dump(vector_id, esr_el1, elr_el1, spsr_el1, far_el1, context);
 
     while (1) {
         __asm__ volatile("wfe");
     }
+
+    return 0;
 }
 
 void exception_handle_irq(unsigned long vector_id,
@@ -149,12 +156,8 @@ void exception_handle_irq(unsigned long vector_id,
     }
 
     if (!timer_handle_irq(intid)) {
-        log_write("[irq] unexpected vector=");
-        log_write(exception_vector_name(vector_id));
-        log_putc('\n');
-        log_write("[irq] unexpected intid=");
-        log_write_u64(intid);
-        log_putc('\n');
+        KER_LOGF("[irq] unexpected vector=%s\n", exception_vector_name(vector_id));
+        KER_LOGF("[irq] unexpected intid=%u\n", intid);
     }
 
     gicv2_end_of_interrupt(intid);

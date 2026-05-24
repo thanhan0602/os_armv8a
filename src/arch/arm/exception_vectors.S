@@ -2,9 +2,11 @@
 .align 11
 
 .equ GPR_CTX_SIZE, 256
-.equ FPCR_OFFSET, 256
-.equ SIMD_OFFSET, 272
-.equ CTX_SIZE, 784
+.equ ELR_OFFSET,  248   /* ELR_EL1 saved here */
+.equ SPSR_OFFSET, 256   /* SPSR_EL1 saved here */
+.equ FPCR_OFFSET, 264   /* was 256 */
+.equ SIMD_OFFSET, 288   /* was 272 */
+.equ CTX_SIZE,    800   /* was 784 (+16 for ELR+SPSR) */
 
 .global exception_vector_table
 .type exception_vector_table, %function
@@ -32,6 +34,10 @@
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    /* Save ELR_EL1 and SPSR_EL1 so they survive task switches. */
+    mrs x9, elr_el1
+    mrs x10, spsr_el1
+    stp x9, x10, [sp, #ELR_OFFSET]  /* ELR at 248, SPSR at 256 */
     mrs x9, fpcr
     mrs x10, fpsr
     stp x9, x10, [sp, #FPCR_OFFSET]
@@ -73,6 +79,11 @@
     ldp x9, x10, [sp, #FPCR_OFFSET]
     msr fpcr, x9
     msr fpsr, x10
+    /* Restore ELR_EL1 and SPSR_EL1 before eret. */
+    ldp x9, x10, [sp, #ELR_OFFSET]
+    msr elr_el1, x9
+    msr spsr_el1, x10
+    isb
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
@@ -149,6 +160,10 @@ exception_sync_entry:
     mrs x4, far_el1
     mov x5, sp
     bl exception_handle_sync
+    /* Non-zero return value means the exception was handled; eret back. */
+    cbz x0, 1f
+    restore_context
+    eret
 
 1:
     wfe

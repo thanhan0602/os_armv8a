@@ -58,4 +58,60 @@ task_entry_trampoline:
     bl task_exit
 1:
     wfe
+
+.global el0_entry_trampoline
+.type el0_entry_trampoline, %function
+
+/*
+ * First-run entry for EL0 user tasks.
+ *
+ * Reached via switch_context when a user task runs for the first time
+ * (x30 was set to this address by task_create_user).
+ *
+ * x19 = EL0 entry virtual address (set by task_create_user)
+ * x20 = EL0 user stack pointer    (set by task_create_user)
+ *
+ * Sets ELR_EL1, SPSR_EL1 (EL0t, DAIF=0 so IRQs are enabled at EL0),
+ * and SP_EL0, then eret.  The kernel stack (SP_EL1) is left clean so
+ * subsequent EL0->EL1 exceptions naturally use it for save_context.
+ */
+el0_entry_trampoline:
+    msr     elr_el1, x19        /* EL0 program counter */
+    msr     sp_el0,  x20        /* EL0 stack pointer */
+    mov     x0,  xzr
+    msr     spsr_el1, x0        /* EL0t mode, DAIF=0 (all interrupts enabled) */
+    isb
+    /* Zero all caller-visible registers so user code starts clean. */
+    mov     x0,  xzr
+    mov     x1,  xzr
+    mov     x2,  xzr
+    mov     x3,  xzr
+    mov     x4,  xzr
+    mov     x5,  xzr
+    mov     x6,  xzr
+    mov     x7,  xzr
+    mov     x8,  xzr
+    mov     x9,  xzr
+    mov     x10, xzr
+    mov     x11, xzr
+    mov     x12, xzr
+    mov     x13, xzr
+    mov     x14, xzr
+    mov     x15, xzr
+    mov     x16, xzr
+    mov     x17, xzr
+    mov     x18, xzr
+    mov     x19, xzr
+    mov     x20, xzr
+    mov     x21, xzr
+    mov     x22, xzr
+    mov     x23, xzr
+    mov     x24, xzr
+    mov     x25, xzr
+    mov     x26, xzr
+    mov     x27, xzr
+    mov     x28, xzr
+    mov     x29, xzr
+    mov     x30, xzr
+    eret
     b 1b

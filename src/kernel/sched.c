@@ -1,6 +1,7 @@
 #include <kernel/sched.h>
 
 #include <kernel/log.h>
+#include <kernel/mmu.h>
 #include <kernel/page_alloc.h>
 #include <kernel/vm.h>
 
@@ -33,7 +34,7 @@ void sched_init(void)
 
     current = idle;
 
-    log_info("scheduler initialized");
+    KER_INFO("scheduler initialized");
 }
 
 struct task *task_create(task_fn_t entry, const char *name)
@@ -44,7 +45,7 @@ struct task *task_create(task_fn_t entry, const char *name)
     unsigned long sp;
 
     if (next_task_id >= MAX_TASKS) {
-        log_info("task_create: max tasks reached");
+        KER_INFO("task_create: max tasks reached");
         return (struct task *)0;
     }
 
@@ -58,7 +59,7 @@ struct task *task_create(task_fn_t entry, const char *name)
      */
     stack_pa = page_alloc_contiguous(TASK_TOTAL_PAGES);
     if (stack_pa == (void *)0) {
-        log_info("task_create: stack alloc failed");
+        KER_INFO("task_create: stack alloc failed");
         return (struct task *)0;
     }
 
@@ -74,6 +75,7 @@ struct task *task_create(task_fn_t entry, const char *name)
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
+    t->mm = (struct mm_context *)0;
 
     /* Initial callee-saved context: x19=entry, x30=trampoline, SP=top */
     t->context.x19 = (unsigned long)entry;
@@ -96,16 +98,71 @@ struct task *task_create(task_fn_t entry, const char *name)
 
     next_task_id++;
 
-    log_write("[sched] created task ");
-    log_write(name);
-    log_write(" id=");
-    log_write_u64(t->id);
-    log_write(" stack=");
-    log_write_hex((unsigned long)stack_va);
-    log_putc('\n');
+    KER_LOGF("[sched] created task %s id=%lu stack=%p\n", name, t->id, (void *)stack_va);
 
     return t;
 }
+
+#ifdef CONFIG_KERNEL_VIRTUAL
+struct task *task_create_user(unsigned long entry_va,
+                               unsigned long user_sp,
+                               struct mm_context *mm,
+                               const char *name)
+{
+    struct task *t;
+    void *stack_pa;
+    unsigned char *stack_va;
+    unsigned long sp;
+
+    if (next_task_id >= MAX_TASKS) {
+        KER_INFO("task_create_user: max tasks reached");
+        return (struct task *)0;
+    }
+
+    stack_pa = page_alloc_contiguous(TASK_TOTAL_PAGES);
+    if (stack_pa == (void *)0) {
+        KER_INFO("task_create_user: kernel stack alloc failed");
+        return (struct task *)0;
+    }
+
+    stack_va = (unsigned char *)pa_to_va(stack_pa);
+    sp = (unsigned long)(stack_va + TASK_TOTAL_PAGES * PAGE_SIZE);
+    sp &= ~0xFUL;
+
+    t = &tasks[next_task_id];
+    t->id = next_task_id;
+    t->state = TASK_STATE_READY;
+    t->stack_base = stack_va;
+    t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
+    t->name = name;
+    t->mm = mm;
+
+    /* x19 = user entry VA, x20 = user SP_EL0, x30 = el0_entry_trampoline */
+    t->context.x19 = entry_va;
+    t->context.x20 = user_sp;
+    t->context.x21 = 0;
+    t->context.x22 = 0;
+    t->context.x23 = 0;
+    t->context.x24 = 0;
+    t->context.x25 = 0;
+    t->context.x26 = 0;
+    t->context.x27 = 0;
+    t->context.x28 = 0;
+    t->context.x29 = 0;
+    t->context.x30 = (unsigned long)el0_entry_trampoline;
+    t->context.sp = sp;
+
+    t->next = current->next;
+    current->next = t;
+
+    next_task_id++;
+
+    KER_LOGF("[sched] created user task %s id=%lu kernel_stack=%p el0_entry=%lx\n",
+             name, t->id, (void *)stack_va, entry_va);
+
+    return t;
+}
+#endif /* CONFIG_KERNEL_VIRTUAL */
 
 /*
  * Reclaim resources from dead tasks.  Called at the start of schedule()
@@ -125,16 +182,19 @@ static void sched_reap_dead(void)
             prev->next = t->next;
 
             if (t->stack_base != (void *)0) {
-                log_write("[sched] reap task ");
-                log_write(t->name);
-                log_write(" id=");
-                log_write_u64(t->id);
-                log_putc('\n');
+                KER_LOGF("[sched] reap task %s id=%lu\n", t->name, t->id);
                 page_free_contiguous(
                     (void *)va_to_pa(t->stack_base),
                     TASK_TOTAL_PAGES);
                 t->stack_base = (void *)0;
             }
+
+#ifdef CONFIG_KERNEL_VIRTUAL
+            if (t->mm != (struct mm_context *)0) {
+                mmu_context_destroy(t->mm);
+                t->mm = (struct mm_context *)0;
+            }
+#endif
 
             t = prev->next;
         } else {
@@ -172,15 +232,13 @@ void schedule(void)
     next->state = TASK_STATE_RUNNING;
     current = next;
 
+#ifdef CONFIG_KERNEL_VIRTUAL
+    mmu_context_switch(next->mm);
+#endif
+
     switch_count++;
     if (switch_count <= 8UL) {
-        log_write("[sched] ");
-        log_write(prev->name);
-        log_write(" -> ");
-        log_write(next->name);
-        log_write(" (#");
-        log_write_u64(switch_count);
-        log_write(")\n");
+        KER_LOGF("[sched] %s -> %s (#%lu)\n", prev->name, next->name, switch_count);
     }
 
     switch_context(&prev->context, &next->context);
@@ -188,9 +246,7 @@ void schedule(void)
 
 void task_exit(void)
 {
-    log_write("[sched] task ");
-    log_write(current->name);
-    log_write(" exited\n");
+    KER_LOGF("[sched] task %s exited\n", current->name);
 
     current->state = TASK_STATE_DEAD;
     schedule();

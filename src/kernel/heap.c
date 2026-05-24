@@ -278,11 +278,11 @@ void kernel_heap_init(void)
     kernel_heap_failed = 0UL;
 
     if (kernel_heap_add_arena(1UL) == (struct kernel_heap_page *)0) {
-        log_info("kernel heap init failed");
+        KER_INFO("kernel heap init failed");
         return;
     }
 
-    log_info("stage 7 kernel heap online");
+    KER_INFO("stage 7 kernel heap online");
 }
 
 void *kmalloc(unsigned long size)
@@ -329,17 +329,13 @@ void kfree(void *ptr)
 
     page = kernel_heap_page_from_pointer(ptr);
     if (page == (struct kernel_heap_page *)0) {
-        log_write("[warn] ignoring invalid heap free: ");
-        log_write_hex((unsigned long)ptr);
-        log_putc('\n');
+        KER_LOGF("[warn] ignoring invalid heap free: %p\n", ptr);
         return;
     }
 
     block = ((struct kernel_heap_block *)ptr) - 1;
     if (block->is_free != 0UL) {
-        log_write("[warn] ignoring duplicate heap free: ");
-        log_write_hex((unsigned long)ptr);
-        log_putc('\n');
+        KER_LOGF("[warn] ignoring duplicate heap free: %p\n", ptr);
         return;
     }
 
@@ -411,38 +407,16 @@ void kernel_heap_debug_log_arena(unsigned long arena_index, unsigned long min_pa
     used_bytes = page->usable_bytes - free_bytes;
     physical_base = va_to_pa((unsigned long)page);
 
-    log_write("[info] heap arena index=");
-    log_write_u64(arena_index);
-    log_write(" base=");
-    log_write_hex((unsigned long)page);
-    log_write(" physical=");
-    log_write_hex(physical_base);
-    log_write(" pages=");
-    log_write_u64(page->page_count);
-    log_write(" usable_bytes=");
-    log_write_u64(page->usable_bytes);
-    log_write(" used_bytes=");
-    log_write_u64(used_bytes);
-    log_write(" free_bytes=");
-    log_write_u64(free_bytes);
-    log_write(" largest_free=");
-    log_write_u64(largest_free_block);
-    log_putc('\n');
+    KER_LOGF("[info] heap arena index=%lu base=%p physical=%lx pages=%lu usable_bytes=%lu used_bytes=%lu free_bytes=%lu largest_free=%lu\n",
+             arena_index, (void *)page, physical_base, page->page_count,
+             page->usable_bytes, used_bytes, free_bytes, largest_free_block);
 
     page_allocator_log_page_range(physical_base, page->page_count);
 }
 
 void kernel_heap_log_stats(void)
 {
-    log_write("[info] heap pages=");
-    log_write_u64(kernel_heap_total_pages());
-    log_write(" used_bytes=");
-    log_write_u64(kernel_heap_used_bytes());
-    log_write(" free_bytes=");
-    log_write_u64(kernel_heap_free_bytes());
-    log_write(" allocations=");
-    log_write_u64(kernel_heap_allocation_count());
-    log_write(" failed_allocations=");
-    log_write_u64(kernel_heap_failed_allocations());
-    log_putc('\n');
+    KER_LOGF("[info] heap pages=%lu used_bytes=%lu free_bytes=%lu allocations=%lu failed_allocations=%lu\n",
+             kernel_heap_total_pages(), kernel_heap_used_bytes(), kernel_heap_free_bytes(),
+             kernel_heap_allocation_count(), kernel_heap_failed_allocations());
 }

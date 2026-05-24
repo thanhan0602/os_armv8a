@@ -6,7 +6,8 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 
 ## Trạng thái hiện tại
 
-- Stage 1 đến Stage 8 đã hoàn thành.
+- Stage 1 đến Stage 9 đã hoàn thành.
+- **Stage 9 (EL0 + Syscall ABI)**: user task chạy ở EL0, SVC syscalls hoạt động (SYS_WRITE=1, SYS_YIELD=2, SYS_EXIT=3), user task in "hello from EL0" 3 lần rồi exit sạch sẽ.
 - Kernel virtual layout hoàn thành: TTBR1 active, trampoline works, PA→VA migration done.
 - Scheduler hoạt động: round-robin preemptive scheduling qua timer IRQ.
 - Hỗ trợ hai build variant qua `CONFIG_KERNEL_VIRTUAL`:
@@ -56,6 +57,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 
 ## Các bài học kỹ thuật quan trọng
 
+- **ELR_EL1/SPSR_EL1 must be saved in the exception frame**: these are hardware registers that get overwritten by any new exception (e.g. timer IRQ on another task). If not saved in `save_context` and restored in `restore_context`, `eret` after `sys_yield` jumps to the wrong address (another task's interrupted EL1 PC instead of back to EL0 user code). Fix: extend frame CTX_SIZE 784→800, save ELR at offset 248 and SPSR at offset 256; `restore_context` does `msr elr_el1`/`msr spsr_el1` + `isb` before `eret`. This also fixes a latent bug affecting EL1 tasks.
 - Một bug MMU lớn trước đây đến từ việc table descriptor thiếu bit `VALID`.
 - Table descriptor đúng phải là `VALID | TABLE`.
 - `AT S1E1R` và `PAR_EL1` hữu ích nhưng không đủ để thay thế việc kiểm tra instruction fetch thực tế.
@@ -77,6 +79,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 ## Các file code quan trọng
 
 - `src/kernel/main.c`
+- `src/kernel/syscall.c`
 - `src/kernel/debug_targets.c`
 - `src/kernel/heap.c`
 - `src/kernel/mmu.c`
@@ -85,6 +88,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - `src/kernel/exception.c`
 - `src/kernel/sched.c`
 - `src/arch/arm/switch.S`
+- `src/arch/arm/user_task.S`
 - `src/arch/arm/start.S`
 - `src/arch/arm/exception_vectors.S`
 - `src/linker.ld`
@@ -92,7 +96,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 ## Trạng thái AI tooling hiện tại
 
 - `.github/copilot-instructions.md` đã define workflow đọc context theo lớp: bắt đầu từ `handoff.md`, rồi chỉ đọc đúng doc/subsystem cần thiết.
-- Workspace hiện có custom agent set trong `.github/agents`: `Orchestrator` để điều phối, `Code` để implement, `Scheduler`, `MMU`, `ARM Architecture` cho phân tích subsystem, `Test` để validate/reproduce, `Document` để cập nhật note, và `Code Review` để review không sửa code.
+- Workspace hiện có custom agent set trong `.github/agents` theo flow `Orchestrator -> Code -> Review`: `Orchestrator` điều phối, `Code` implement và validate, `Review` kiểm tra correctness/regression mà không sửa code.
 - Local RAG API hiện nằm ở `tools/rag`, dùng shared SQLite + FAISS/Numpy retrieval tại `.rag-store/index.sqlite3`.
 - MCP prototype hiện nằm ở `tools/mcp` với topology `1 + 3`:
   - `gateway`: route query và merge kết quả
@@ -102,6 +106,8 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - Gateway và specialist MCP đều reuse cùng RAG store, không tạo index riêng.
 - Gateway hiện giữ warm in-process specialist adapters để tránh respawn routing logic qua từng request; các specialist MCP server riêng vẫn còn để chạy standalone.
 - Tài liệu thiết kế MCP hiện ở `document/mcp_architecture.md`.
+- `tools/vscode-qemu-log` hiện có thêm command `qemuInspector.start`: một webview visualizer cho page/MMU state. Inspector resolve symbol từ `build/kernel8.elf` bằng `aarch64-linux-gnu-nm`, rồi đọc physical memory live qua QEMU **HMP monitor socket** (`xp`, `stop`, `cont`, `info status`) thay vì dựa vào UART log hoặc external GDB.
+- Hướng QMP/GDB đã được loại trong workspace hiện tại vì `aarch64-linux-gnu-gdb` không có sẵn và QMP greeting không ổn định khi validate; HMP monitor đã được verify runtime thành công.
 
 ## Trạng thái Scheduler hiện tại
 
