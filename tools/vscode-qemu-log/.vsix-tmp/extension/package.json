@@ -1,0 +1,134 @@
+{
+  "name": "qemu-log-viewer",
+  "displayName": "QEMU Log and Inspector",
+  "description": "QEMU UART log viewer plus MMU/page visual inspector for ARMv8-A kernel development",
+  "version": "0.1.1",
+  "publisher": "os-armv8a-dev",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "extensionKind": ["workspace"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "qemuLog.start",
+        "title": "QEMU Log: Start Viewer",
+        "icon": "$(play)"
+      },
+      {
+        "command": "qemuLog.stop",
+        "title": "QEMU Log: Stop QEMU",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "qemuLog.restart",
+        "title": "QEMU Log: Restart QEMU",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "qemuInspector.start",
+        "title": "QEMU Inspector: Open Page Visualizer",
+        "icon": "$(symbol-array)"
+      }
+    ],
+    "configuration": {
+        "title": "QEMU Log and Inspector",
+      "properties": {
+        "qemuLog.qemuBinary": {
+          "type": "string",
+          "default": "/home/a/qemu/build/qemu-system-aarch64",
+          "description": "Absolute path to QEMU binary"
+        },
+        "qemuLog.kernelImage": {
+          "type": "string",
+          "default": "${workspaceFolder}/build/kernel8.img",
+          "description": "Path to kernel ELF/image. Supports ${workspaceFolder}."
+        },
+        "qemuLog.qemuArgs": {
+          "type": "array",
+          "default": [
+            "-machine", "virt,gic-version=2",
+            "-cpu",     "max",
+            "-nographic",
+            "-serial",  "mon:stdio"
+          ],
+          "description": "QEMU arguments inserted before -kernel <image>"
+        },
+        "qemuLog.maxLines": {
+          "type": "number",
+          "default": 20000,
+          "description": "Maximum number of lines kept in the viewer before the oldest are dropped"
+        },
+        "qemuLog.colorRules": {
+          "type": "array",
+          "description": "Ordered color rules — first match wins. Each rule has pattern (regex string), color (CSS), optional background (CSS), optional bold (bool).",
+          "default": [
+            { "pattern": "\\[panic\\]|\\[PANIC\\]|PANIC",                           "color": "#ff5555", "background": "#3d0000", "bold": true  },
+            { "pattern": "\\[error\\]|\\[ERROR\\]|error:|Data abort|Instr abort",   "color": "#f44747", "background": "#2a0000"                },
+            { "pattern": "\\[warn\\]|\\[WARN\\]|\\[warning\\]|warn:",               "color": "#e5c07b", "background": ""                       },
+            { "pattern": "\\[info\\]",                                               "color": "#4ec9b0", "background": ""                       },
+            { "pattern": "\\[debug\\]|\\[DEBUG\\]",                                 "color": "#569cd6", "background": ""                       },
+            { "pattern": "\\[trace\\]|\\[TRACE\\]",                                 "color": "#9cdcfe", "background": ""                       },
+            { "pattern": "\\[task-[a-z0-9_]+\\]",                                   "color": "#c586c0", "background": ""                       },
+            { "pattern": "\\[sched\\]|\\[timer\\]",                                 "color": "#4fc1ff", "background": ""                       },
+            { "pattern": "\\[mmu\\]|\\[heap\\]|\\[page",                            "color": "#ce9178", "background": ""                       },
+            { "pattern": "qemu-stderr",                                              "color": "#6a6a6a", "background": ""                       }
+          ]
+        },
+        "qemuInspector.qemuBinary": {
+          "type": "string",
+          "default": "/home/a/qemu/build/qemu-system-aarch64",
+          "description": "Absolute path to QEMU binary used by the page inspector"
+        },
+        "qemuInspector.kernelImage": {
+          "type": "string",
+          "default": "${workspaceFolder}/build/kernel8.img",
+          "description": "Kernel image started by the page inspector"
+        },
+        "qemuInspector.elfPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/build/kernel8.elf",
+          "description": "ELF file used to resolve kernel symbols for the inspector"
+        },
+        "qemuInspector.monitorHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "HMP monitor host used by the page inspector"
+        },
+        "qemuInspector.monitorPort": {
+          "type": "number",
+          "default": 4444,
+          "description": "HMP monitor TCP port used by the page inspector"
+        },
+        "qemuInspector.autoStartQemu": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start a QEMU instance when the page inspector opens"
+        },
+        "qemuInspector.defaultWalkAddress": {
+          "type": "string",
+          "default": "0xffff000040097000",
+          "description": "Initial VA shown in the walk input"
+        },
+        "qemuInspector.qemuArgs": {
+          "type": "array",
+          "default": [
+            "-machine", "virt,gic-version=2",
+            "-cpu", "max",
+            "-nographic",
+            "-serial", "stdio"
+          ],
+          "description": "QEMU arguments inserted before the monitor socket and kernel flags for the page inspector"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile":           "tsc -p ./",
+    "watch":             "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "package":           "bash scripts/build_vsix.sh",
+    "install:vsix":      "bash scripts/install_vsix.sh"
+  },
+  "_comment": "out/ contains pre-compiled JS so no npm install is required to run the extension"
+}

@@ -45,6 +45,68 @@
                     "endsPattern": "^Starting QEMU"
                 }
             }
+        },
+        {
+            "label": "Extension: Build and Install VSIX",
+            "type": "shell",
+            "command": "bash",
+            "args": [
+                "${workspaceFolder}/tools/vscode-qemu-log/scripts/install_vsix.sh"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Inspector: Start Web App",
+            "type": "shell",
+            "isBackground": true,
+            "command": "bash",
+            "args": [
+                "${workspaceFolder}/scripts/run_inspector.sh"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "group": "inspector"
+            },
+            "problemMatcher": {
+                "pattern": { "regexp": "^never$" },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "\\[qemu-inspector\\]",
+                    "endsPattern": "UI:.*http"
+                }
+            }
+        },
+        {
+            "label": "Inspector: Start QEMU with Monitor",
+            "type": "shell",
+            "isBackground": true,
+            "command": "/home/a/qemu/build/qemu-system-aarch64",
+            "args": [
+                "-machine", "virt,gic-version=2",
+                "-cpu", "max",
+                "-display", "none",
+                "-serial", "file:/tmp/qemu-serial.log",
+                "-monitor", "tcp:127.0.0.1:4445,server,nowait",
+                "-kernel", "${workspaceFolder}/build/kernel8.img"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "group": "inspector"
+            },
+            "problemMatcher": {
+                "pattern": { "regexp": "^never$" },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": ".",
+                    "endsPattern": "."
+                }
+            }
         }
     ]
 }
