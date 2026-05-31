@@ -15,6 +15,7 @@
 #define PL011_ICR  (PL011_BASE + 0x44UL)
 
 #define PL011_FR_TXFF (1U << 5)
+#define PL011_FR_RXFE (1U << 4)
 #define PL011_LCRH_FEN  (1U << 4)
 #define PL011_LCRH_WLEN (3U << 5)
 #define PL011_CR_UARTEN (1U << 0)
@@ -55,4 +56,17 @@ void pl011_write(unsigned int value)
     }
 
     mmio_write(PL011_DR, value);
+}
+
+int pl011_can_read(void)
+{
+    return (mmio_read(PL011_FR) & PL011_FR_RXFE) == 0U;
+}
+
+unsigned int pl011_read(void)
+{
+    while (!pl011_can_read()) {
+    }
+
+    return mmio_read(PL011_DR) & 0xffU;
 }

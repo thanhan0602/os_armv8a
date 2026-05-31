@@ -3,6 +3,7 @@
 #include <kernel/log.h>
 #include <kernel/mmu.h>
 #include <kernel/page_alloc.h>
+#include <kernel/process.h>
 #include <kernel/vm.h>
 
 extern void task_entry_trampoline(void);
@@ -11,6 +12,59 @@ static struct task tasks[MAX_TASKS];
 static unsigned long next_task_id;
 static struct task *current;
 static unsigned long switch_count;
+
+static const char *sched_state_name(unsigned long state)
+{
+    if (state == TASK_STATE_RUNNING) {
+        return "running";
+    }
+    if (state == TASK_STATE_READY) {
+        return "ready";
+    }
+    if (state == TASK_STATE_DEAD) {
+        return "dead";
+    }
+
+    return "unknown";
+}
+
+static void sched_clear_task(struct task *task)
+{
+    task->context.x19 = 0UL;
+    task->context.x20 = 0UL;
+    task->context.x21 = 0UL;
+    task->context.x22 = 0UL;
+    task->context.x23 = 0UL;
+    task->context.x24 = 0UL;
+    task->context.x25 = 0UL;
+    task->context.x26 = 0UL;
+    task->context.x27 = 0UL;
+    task->context.x28 = 0UL;
+    task->context.x29 = 0UL;
+    task->context.x30 = 0UL;
+    task->context.sp = 0UL;
+    task->id = 0UL;
+    task->state = 0UL;
+    task->stack_base = (void *)0;
+    task->stack_size = 0UL;
+    task->name = (const char *)0;
+    task->mm = (struct mm_context *)0;
+    task->process = (struct process *)0;
+    task->next = (struct task *)0;
+}
+
+static struct task *sched_allocate_task_slot(void)
+{
+    unsigned long index;
+
+    for (index = 1UL; index < MAX_TASKS; index++) {
+        if (tasks[index].name == (const char *)0) {
+            return &tasks[index];
+        }
+    }
+
+    return (struct task *)0;
+}
 
 void sched_init(void)
 {
@@ -33,8 +87,6 @@ void sched_init(void)
     idle->next = idle;
 
     current = idle;
-
-    KER_INFO("scheduler initialized");
 }
 
 struct task *task_create(task_fn_t entry, const char *name)
@@ -44,7 +96,8 @@ struct task *task_create(task_fn_t entry, const char *name)
     unsigned char *stack_va;
     unsigned long sp;
 
-    if (next_task_id >= MAX_TASKS) {
+    t = sched_allocate_task_slot();
+    if (t == (struct task *)0) {
         KER_INFO("task_create: max tasks reached");
         return (struct task *)0;
     }
@@ -69,13 +122,13 @@ struct task *task_create(task_fn_t entry, const char *name)
     /* AArch64 requires 16-byte aligned SP */
     sp &= ~0xFUL;
 
-    t = &tasks[next_task_id];
     t->id = next_task_id;
     t->state = TASK_STATE_READY;
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
     t->mm = (struct mm_context *)0;
+    t->process = (struct process *)0;
 
     /* Initial callee-saved context: x19=entry, x30=trampoline, SP=top */
     t->context.x19 = (unsigned long)entry;
@@ -98,15 +151,11 @@ struct task *task_create(task_fn_t entry, const char *name)
 
     next_task_id++;
 
-    KER_LOGF("[sched] created task %s id=%lu stack=%p\n", name, t->id, (void *)stack_va);
-
     return t;
 }
 
 #ifdef CONFIG_KERNEL_VIRTUAL
-struct task *task_create_user(unsigned long entry_va,
-                               unsigned long user_sp,
-                               struct mm_context *mm,
+struct task *task_create_user(struct process *process,
                                const char *name)
 {
     struct task *t;
@@ -114,7 +163,13 @@ struct task *task_create_user(unsigned long entry_va,
     unsigned char *stack_va;
     unsigned long sp;
 
-    if (next_task_id >= MAX_TASKS) {
+    if (process == (struct process *)0 || process->mm == (struct mm_context *)0) {
+        KER_INFO("task_create_user: invalid process");
+        return (struct task *)0;
+    }
+
+    t = sched_allocate_task_slot();
+    if (t == (struct task *)0) {
         KER_INFO("task_create_user: max tasks reached");
         return (struct task *)0;
     }
@@ -129,17 +184,17 @@ struct task *task_create_user(unsigned long entry_va,
     sp = (unsigned long)(stack_va + TASK_TOTAL_PAGES * PAGE_SIZE);
     sp &= ~0xFUL;
 
-    t = &tasks[next_task_id];
     t->id = next_task_id;
     t->state = TASK_STATE_READY;
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
-    t->mm = mm;
+    t->mm = process->mm;
+    t->process = process;
 
     /* x19 = user entry VA, x20 = user SP_EL0, x30 = el0_entry_trampoline */
-    t->context.x19 = entry_va;
-    t->context.x20 = user_sp;
+    t->context.x19 = process->entry_va;
+    t->context.x20 = process->stack_top;
     t->context.x21 = 0;
     t->context.x22 = 0;
     t->context.x23 = 0;
@@ -156,9 +211,6 @@ struct task *task_create_user(unsigned long entry_va,
     current->next = t;
 
     next_task_id++;
-
-    KER_LOGF("[sched] created user task %s id=%lu kernel_stack=%p el0_entry=%lx\n",
-             name, t->id, (void *)stack_va, entry_va);
 
     return t;
 }
@@ -182,7 +234,6 @@ static void sched_reap_dead(void)
             prev->next = t->next;
 
             if (t->stack_base != (void *)0) {
-                KER_LOGF("[sched] reap task %s id=%lu\n", t->name, t->id);
                 page_free_contiguous(
                     (void *)va_to_pa(t->stack_base),
                     TASK_TOTAL_PAGES);
@@ -190,11 +241,14 @@ static void sched_reap_dead(void)
             }
 
 #ifdef CONFIG_KERNEL_VIRTUAL
-            if (t->mm != (struct mm_context *)0) {
-                mmu_context_destroy(t->mm);
+            if (t->process != (struct process *)0) {
+                process_destroy(t->process);
+                t->process = (struct process *)0;
                 t->mm = (struct mm_context *)0;
             }
 #endif
+
+            sched_clear_task(t);
 
             t = prev->next;
         } else {
@@ -236,18 +290,11 @@ void schedule(void)
     mmu_context_switch(next->mm);
 #endif
 
-    switch_count++;
-    if (switch_count <= 8UL) {
-        KER_LOGF("[sched] %s -> %s (#%lu)\n", prev->name, next->name, switch_count);
-    }
-
     switch_context(&prev->context, &next->context);
 }
 
 void task_exit(void)
 {
-    KER_LOGF("[sched] task %s exited\n", current->name);
-
     current->state = TASK_STATE_DEAD;
     schedule();
 
@@ -259,4 +306,54 @@ void task_exit(void)
 struct task *sched_current(void)
 {
     return current;
+}
+
+void sched_dump_tasks(void)
+{
+    unsigned long index;
+
+    log_write("[shell] task list:\n");
+    for (index = 0UL; index < MAX_TASKS; index++) {
+        struct task *task;
+
+        task = &tasks[index];
+        if (task->name == (const char *)0) {
+            continue;
+        }
+
+        KER_LOGF("[shell]   id=%lu state=%s name=%s mode=%s",
+                 task->id,
+                 sched_state_name(task->state),
+                 task->name,
+                 task->process != (struct process *)0 ? "user" : "kernel");
+#ifdef CONFIG_KERNEL_VIRTUAL
+        if (task->process != (struct process *)0) {
+            KER_LOGF(" brk=%lx", task->process->brk);
+        }
+#endif
+        log_write("\n");
+    }
+}
+
+int sched_kill_task(unsigned long task_id)
+{
+    unsigned long index;
+
+    for (index = 0UL; index < MAX_TASKS; index++) {
+        struct task *task;
+
+        task = &tasks[index];
+        if (task->name == (const char *)0 || task->id != task_id) {
+            continue;
+        }
+
+        if (task == current || task->id == 0UL || task->state == TASK_STATE_DEAD) {
+            return 0;
+        }
+
+        task->state = TASK_STATE_DEAD;
+        return 1;
+    }
+
+    return 0;
 }

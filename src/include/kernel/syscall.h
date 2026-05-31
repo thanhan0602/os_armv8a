@@ -4,12 +4,13 @@
 #include <kernel/exception.h>
 
 /*
- * Syscall numbers (Linux AArch64-compatible subset).
+ * Syscall numbers matching the Linux AArch64 ABI where practical.
  * The caller places the number in x8 before executing svc #0.
  */
-#define SYS_WRITE   1UL
-#define SYS_YIELD   2UL
-#define SYS_EXIT    3UL
+#define SYS_WRITE   64UL
+#define SYS_EXIT    93UL
+#define SYS_YIELD   124UL
+#define SYS_BRK     214UL
 
 /*
  * Dispatch a syscall from EL0.

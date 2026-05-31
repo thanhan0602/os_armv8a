@@ -1,6 +1,8 @@
 #include <kernel/syscall.h>
 
 #include <kernel/log.h>
+#include <kernel/mmu.h>
+#include <kernel/process.h>
 #include <kernel/sched.h>
 
 /*
@@ -15,16 +17,24 @@ static unsigned long sys_write(unsigned long fd,
                                 unsigned long buf_va,
                                 unsigned long len)
 {
-    const char *buf;
+    struct task *task;
+    char byte;
     unsigned long i;
 
     if (fd != 1UL) {
         return (unsigned long)-1;
     }
 
-    buf = (const char *)buf_va;
+    task = sched_current();
+    if (task == (struct task *)0 || task->mm == (struct mm_context *)0) {
+        return (unsigned long)-1;
+    }
+
     for (i = 0UL; i < len; i++) {
-        log_putc(buf[i]);
+        if (!mmu_copy_from_user(task->mm, &byte, buf_va + i, 1UL)) {
+            return (i != 0UL) ? i : (unsigned long)-1;
+        }
+        log_putc(byte);
     }
 
     return len;
@@ -55,6 +65,18 @@ static unsigned long sys_exit(unsigned long code)
     return 0UL;
 }
 
+static unsigned long sys_brk(unsigned long new_break)
+{
+    struct task *task;
+
+    task = sched_current();
+    if (task == (struct task *)0 || task->process == (struct process *)0) {
+        return 0UL;
+    }
+
+    return process_brk(task->process, new_break);
+}
+
 void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
 {
     unsigned long ret;
@@ -69,6 +91,9 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
     case SYS_EXIT:
         ret = sys_exit(ctx->gpr[0]);
         ret = 0UL; /* unreachable, but suppresses missing-return warning */
+        break;
+    case SYS_BRK:
+        ret = sys_brk(ctx->gpr[0]);
         break;
     default:
         KER_LOGF("[syscall] unknown nr=%lu\n", nr);

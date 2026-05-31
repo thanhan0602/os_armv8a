@@ -5,5 +5,6 @@ void console_init(void);
 void console_putc(char ch);
 void console_write(const char *message);
 void console_write_hex(unsigned long value);
+int console_try_getc(char *ch);
 
 #endif

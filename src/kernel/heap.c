@@ -281,8 +281,6 @@ void kernel_heap_init(void)
         KER_INFO("kernel heap init failed");
         return;
     }
-
-    KER_INFO("stage 7 kernel heap online");
 }
 
 void *kmalloc(unsigned long size)

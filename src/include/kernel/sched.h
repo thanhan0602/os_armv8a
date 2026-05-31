@@ -2,6 +2,7 @@
 #define KERNEL_SCHED_H
 
 struct mm_context; /* defined in kernel/mmu.h */
+struct process;
 
 typedef void (*task_fn_t)(void);
 
@@ -43,6 +44,7 @@ struct task {
     unsigned long stack_size;
     const char *name;
     struct mm_context *mm;
+    struct process *process;
     struct task *next;
 };
 
@@ -51,29 +53,19 @@ struct task *task_create(task_fn_t entry, const char *name);
 
 #ifdef CONFIG_KERNEL_VIRTUAL
 /*
- * User-space virtual address layout for Stage 9 EL0 tasks.
- * Each user task gets a single code page and a single stack page mapped
- * in its own lower-half address space (TTBR0).
- */
-#define USER_CODE_VA    0x00010000UL    /* user code page start VA */
-#define USER_STACK_TOP  0x00020000UL    /* user stack top (grows down) */
-
-/*
  * Create a task that enters EL0 on first run.
- * entry_va : user-space virtual address of the first instruction.
- * user_sp  : initial SP_EL0 (must be within mm's mapped stack page).
- * mm       : mm_context with the user code and stack pages already mapped.
+ * process  : process descriptor owning the mm_context and user VA layout.
  * name     : task name for logging.
  */
-struct task *task_create_user(unsigned long entry_va,
-                               unsigned long user_sp,
-                               struct mm_context *mm,
+struct task *task_create_user(struct process *process,
                                const char *name);
 #endif
 
 void schedule(void);
 void task_exit(void);
 struct task *sched_current(void);
+void sched_dump_tasks(void);
+int sched_kill_task(unsigned long task_id);
 
 extern void switch_context(struct task_context *old_ctx,
                            struct task_context *new_ctx);

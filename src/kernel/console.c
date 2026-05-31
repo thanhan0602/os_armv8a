@@ -45,3 +45,13 @@ void console_write_hex(unsigned long value)
     buffer[index] = '\0';
     console_write(buffer);
 }
+
+int console_try_getc(char *ch)
+{
+    if (ch == (char *)0 || !pl011_can_read()) {
+        return 0;
+    }
+
+    *ch = (char)pl011_read();
+    return 1;
+}

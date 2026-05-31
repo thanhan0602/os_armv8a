@@ -799,8 +799,6 @@ void mmu_init(void)
         return;
     }
 
-    KER_INFO("mmu init start");
-
     mmu_table_page_count = 0UL;
 
     l0_table = alloc_named_table_page("l0-root");
@@ -813,8 +811,6 @@ void mmu_init(void)
         return;
     }
 
-    KER_INFO("mmu tables allocated");
-
 #ifdef CONFIG_KERNEL_VIRTUAL
     l0_table_ttbr1 = alloc_named_table_page("t1-l0-root");
     l1_table_ttbr1 = alloc_named_table_page("t1-l1-root");
@@ -825,8 +821,6 @@ void mmu_init(void)
         KER_INFO("mmu init failed: no free pages for ttbr1 tables");
         return;
     }
-
-    KER_INFO("mmu ttbr1 tables allocated");
 #endif
 
     if (!build_identity_map()) {
@@ -838,16 +832,7 @@ void mmu_init(void)
         return;
     }
 
-    KER_INFO("mmu maps built (identity + kernel)");
-#else
-    KER_INFO("mmu identity map built");
 #endif
-
-    KER_LOGF("[info] l0 root entry=%lx\n", l0_table[l0_index_for(QEMU_VIRT_RAM_BASE)]);
-    KER_LOGF("[info] l1 device entry=%lx\n", l1_table[l1_index_for(0x00000000UL)]);
-    KER_LOGF("[info] l1 ram entry=%lx\n", l1_table[l1_index_for(QEMU_VIRT_RAM_BASE)]);
-    KER_LOGF("[info] l2 ram[0] entry=%lx\n", l2_ram_table[l2_index_for(QEMU_VIRT_RAM_BASE)]);
-    KER_LOGF("[info] l3 fine map chunks=%lu\n", fine_map_chunks_used);
 
     kernel_debug_log_mmu_boot_targets();
 
@@ -919,16 +904,10 @@ void mmu_init(void)
 #endif
         : "memory");
 
-    KER_INFO("mmu control registers programmed");
-
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
-
-    KER_LOGF("[info] sctlr_el1 before=%lx\n", sctlr);
 
     /* Enable the MMU and both caches with the required architectural RES1 bits. */
     sctlr = SCTLR_EL1_RES1 | SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_I;
-
-    KER_LOGF("[info] sctlr_el1 after=%lx\n", sctlr);
 
     /*
      * Writing SCTLR_EL1 is the commit point:
@@ -945,13 +924,6 @@ void mmu_init(void)
         : "memory");
 
     mmu_enabled = 1;
-
-    KER_INFO("stage 6 mmu enabled");
-    KER_LOGF("[info] ttbr0_el1=%lx\n", (unsigned long)l0_table);
-#ifdef CONFIG_KERNEL_VIRTUAL
-    KER_LOGF("[info] ttbr1_el1=%lx\n", (unsigned long)l0_table_ttbr1);
-#endif
-    KER_LOGF("[info] mmu table pages=%lu\n", table_pages_used);
 }
 
 int mmu_is_enabled(void)
@@ -1022,15 +994,242 @@ void mmu_install_empty_ttbr0_root(void)
     mmu_debug_record_table_page((unsigned long)new_root, "t0-empty-root");
     table_pages_used++;
 
-    KER_INFO("ttbr0 runtime root installed (empty lower half)");
+}
 
-    KER_LOGF("[info] mmu table pages after ttbr0 free=%lu\n", table_pages_used);
+/*
+ * ASID allocation state.
+ * ASID 0 is reserved for kernel tasks / the empty lower-half root.
+ * 8-bit ASIDs (TCR_EL1.AS=0): valid user range is 1–255.
+ * Recycle ASIDs when processes are destroyed instead of assuming the
+ * lifetime number of processes never exceeds the live-task limit.
+ */
+static unsigned int next_asid = 1;
+static unsigned char asid_in_use[256];
+
+static void mmu_tlbi_asid(unsigned int asid)
+{
+    unsigned long tlbi_val;
+
+    if (asid == 0U) {
+        return;
+    }
+
+    tlbi_val = (unsigned long)asid << 48;
+    __asm__ volatile(
+        "dsb ish\n"
+        "tlbi aside1is, %0\n"
+        "dsb ish\n"
+        "isb\n"
+        :
+        : "r"(tlbi_val)
+        : "memory");
+}
+
+static unsigned int mmu_asid_alloc(void)
+{
+    unsigned int attempts;
+    unsigned int asid;
+
+    for (attempts = 0U; attempts < 255U; attempts++) {
+        asid = next_asid;
+        next_asid++;
+        if (next_asid == 0U) {
+            next_asid = 1U;
+        }
+
+        if (asid == 0U || asid_in_use[asid] != 0U) {
+            continue;
+        }
+
+        asid_in_use[asid] = 1U;
+        mmu_tlbi_asid(asid);
+        return asid;
+    }
+
+    return 0U;
+}
+
+static void mmu_asid_free(unsigned int asid)
+{
+    if (asid == 0U) {
+        return;
+    }
+
+    mmu_tlbi_asid(asid);
+    asid_in_use[asid] = 0U;
+}
+
+static int mmu_context_has_page(const struct mm_context *mm, unsigned long pa)
+{
+    unsigned int index;
+
+    if (mm == (const struct mm_context *)0) {
+        return 0;
+    }
+
+    for (index = 0U; index < mm->page_count; index++) {
+        if (mm->pages[index] == pa) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+int mmu_context_add_page(struct mm_context *mm, unsigned long pa)
+{
+    if (mm == (struct mm_context *)0 || pa == 0UL) {
+        return 0;
+    }
+
+    if (mmu_context_has_page(mm, pa)) {
+        return 1;
+    }
+
+    if (mm->page_count >= MM_MAX_TRACKED_PAGES) {
+        return 0;
+    }
+
+    mm->pages[mm->page_count++] = pa;
+    return 1;
+}
+
+int mmu_context_remove_page(struct mm_context *mm, unsigned long pa)
+{
+    unsigned int index;
+
+    if (mm == (struct mm_context *)0 || pa == 0UL) {
+        return 0;
+    }
+
+    for (index = 0U; index < mm->page_count; index++) {
+        unsigned int tail;
+
+        if (mm->pages[index] != pa) {
+            continue;
+        }
+
+        for (tail = index + 1U; tail < mm->page_count; tail++) {
+            mm->pages[tail - 1U] = mm->pages[tail];
+        }
+
+        mm->page_count--;
+        mm->pages[mm->page_count] = 0UL;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int mmu_resolve_user_page(const struct mm_context *mm,
+                                 unsigned long va,
+                                 unsigned long *page_pa,
+                                 unsigned long *entry_out)
+{
+    unsigned long *l0;
+    unsigned long *l1;
+    unsigned long *l2;
+    unsigned long *l3;
+    unsigned long entry;
+
+    if (mm == (const struct mm_context *)0 || page_pa == (unsigned long *)0) {
+        return 0;
+    }
+
+    l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
+    entry = l0[l0_index_for(va)];
+    if ((entry & MMU_DESC_VALID) == 0UL || (entry & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
+        return 0;
+    }
+
+    l1 = (unsigned long *)pa_to_va((void *)(entry & MMU_DESC_ADDR_MASK));
+    entry = l1[l1_index_for(va)];
+    if ((entry & MMU_DESC_VALID) == 0UL || (entry & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
+        return 0;
+    }
+
+    l2 = (unsigned long *)pa_to_va((void *)(entry & MMU_DESC_ADDR_MASK));
+    entry = l2[l2_index_for(va)];
+    if ((entry & MMU_DESC_VALID) == 0UL || (entry & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
+        return 0;
+    }
+
+    l3 = (unsigned long *)pa_to_va((void *)(entry & MMU_DESC_ADDR_MASK));
+    entry = l3[l3_index_for(va)];
+    if ((entry & MMU_DESC_VALID) == 0UL || (entry & MMU_DESC_TYPE_MASK) != MMU_DESC_PAGE) {
+        return 0;
+    }
+
+    *page_pa = entry & MMU_L3_PAGE_ADDR_MASK;
+    if (entry_out != (unsigned long *)0) {
+        *entry_out = entry;
+    }
+
+    return 1;
+}
+
+static int mmu_user_access_allowed(unsigned long entry, int write)
+{
+    unsigned long ap_bits;
+
+    ap_bits = entry & (3UL << 6);
+    if (write != 0) {
+        return ap_bits == MMU_USER_PAGE_AP_RW;
+    }
+
+    return ap_bits == MMU_USER_PAGE_AP_RW || ap_bits == MMU_USER_PAGE_AP_RO;
+}
+
+static int mmu_copy_user_range(const struct mm_context *mm,
+                               unsigned char *kernel_buffer,
+                               unsigned long user_va,
+                               unsigned long len,
+                               int write_to_user)
+{
+    while (len != 0UL) {
+        unsigned long page_pa;
+        unsigned long entry;
+        unsigned long page_offset;
+        unsigned long chunk;
+        unsigned char *page_va;
+        unsigned long index;
+
+        if (!mmu_resolve_user_page(mm, user_va, &page_pa, &entry)) {
+            return 0;
+        }
+
+        if (!mmu_user_access_allowed(entry, write_to_user)) {
+            return 0;
+        }
+
+        page_offset = user_va & (PAGE_SIZE - 1UL);
+        chunk = PAGE_SIZE - page_offset;
+        if (chunk > len) {
+            chunk = len;
+        }
+
+        page_va = (unsigned char *)pa_to_va((void *)(page_pa + page_offset));
+        for (index = 0UL; index < chunk; index++) {
+            if (write_to_user != 0) {
+                page_va[index] = kernel_buffer[index];
+            } else {
+                kernel_buffer[index] = page_va[index];
+            }
+        }
+
+        kernel_buffer += chunk;
+        user_va += chunk;
+        len -= chunk;
+    }
+
+    return 1;
 }
 
 struct mm_context *mmu_context_create(void)
 {
     struct mm_context *mm;
     unsigned long *root;
+    unsigned int index;
 
     mm = (struct mm_context *)kmalloc(sizeof(struct mm_context));
     if (mm == (struct mm_context *)0) {
@@ -1044,6 +1243,25 @@ struct mm_context *mmu_context_create(void)
     }
 
     mm->root_pa = (unsigned long)root;
+    mm->asid    = mmu_asid_alloc();
+    mm->page_count = 0U;
+    for (index = 0U; index < MM_MAX_TRACKED_PAGES; index++) {
+        mm->pages[index] = 0UL;
+    }
+
+    if (mm->asid == 0U) {
+        page_free(root);
+        kfree(mm);
+        return (struct mm_context *)0;
+    }
+
+    if (!mmu_context_add_page(mm, mm->root_pa)) {
+        page_free(root);
+        mmu_asid_free(mm->asid);
+        kfree(mm);
+        return (struct mm_context *)0;
+    }
+
     return mm;
 }
 
@@ -1053,35 +1271,94 @@ void mmu_context_destroy(struct mm_context *mm)
         return;
     }
 
-    if (mm->root_pa != 0UL) {
-        page_free((void *)mm->root_pa);
+    while (mm->page_count > 0U) {
+        mm->page_count--;
+        if (mm->pages[mm->page_count] != 0UL) {
+            page_free((void *)mm->pages[mm->page_count]);
+        }
     }
+
+    mmu_asid_free(mm->asid);
 
     kfree(mm);
 }
 
+int mmu_copy_from_user(const struct mm_context *mm, void *dst,
+                       unsigned long src_va, unsigned long len)
+{
+    if (len == 0UL) {
+        return 1;
+    }
+
+    if (dst == (void *)0) {
+        return 0;
+    }
+
+    return mmu_copy_user_range(mm, (unsigned char *)dst, src_va, len, 0);
+}
+
+int mmu_copy_to_user(const struct mm_context *mm, unsigned long dst_va,
+                     const void *src, unsigned long len)
+{
+    if (len == 0UL) {
+        return 1;
+    }
+
+    if (src == (const void *)0) {
+        return 0;
+    }
+
+    return mmu_copy_user_range(mm, (unsigned char *)src, dst_va, len, 1);
+}
+
+int mmu_user_page_pa(const struct mm_context *mm, unsigned long va,
+                     unsigned long *page_pa_out)
+{
+    unsigned long page_pa;
+
+    if (page_pa_out == (unsigned long *)0) {
+        return 0;
+    }
+
+    if (!mmu_resolve_user_page(mm, va, &page_pa, (unsigned long *)0)) {
+        return 0;
+    }
+
+    *page_pa_out = page_pa;
+    return 1;
+}
+
 void mmu_context_switch(struct mm_context *mm)
 {
-    unsigned long root_pa;
+    unsigned long ttbr0_val;
 
     if (!mmu_enabled) {
         return;
     }
 
     if (mm == (struct mm_context *)0) {
-        root_pa = (unsigned long)ttbr0_runtime_empty_root;
+        /*
+         * Kernel task: ASID=0, empty lower-half root.
+         * TLB entries for user processes (ASID > 0) are automatically
+         * invisible while ASID=0 is active.
+         */
+        ttbr0_val = (unsigned long)ttbr0_runtime_empty_root;
     } else {
-        root_pa = mm->root_pa;
+        /*
+         * User task: embed the 8-bit ASID in TTBR0_EL1[55:48].
+         * TCR_EL1.AS=0 (8-bit), TCR_EL1.A1=0 (TTBR0 provides ASID).
+         * No TLB invalidation is needed: each process has a unique ASID,
+         * so its TLB entries (tagged at creation) are never visible while
+         * another ASID is active.
+         */
+        ttbr0_val = mm->root_pa | ((unsigned long)mm->asid << 48);
     }
 
     __asm__ volatile(
         "msr ttbr0_el1, %0\n"
         "isb\n"
-        "tlbi vmalle1\n"
-        "dsb ish\n"
-        "isb\n"
         :
-        : "r"(root_pa)
+        : "r"(ttbr0_val)
         : "memory");
 }
 
@@ -1119,6 +1396,10 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
         if (new_page == (void *)0) {
             return 0;
         }
+        if (!mmu_context_add_page(mm, (unsigned long)new_page)) {
+            page_free(new_page);
+            return 0;
+        }
         l0[idx] = (unsigned long)new_page | MMU_DESC_TABLE;
     }
     l1 = (unsigned long *)pa_to_va((void *)(l0[idx] & MMU_DESC_ADDR_MASK));
@@ -1128,6 +1409,10 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
     if ((l1[idx] & MMU_DESC_VALID) == 0UL) {
         new_page = page_alloc();
         if (new_page == (void *)0) {
+            return 0;
+        }
+        if (!mmu_context_add_page(mm, (unsigned long)new_page)) {
+            page_free(new_page);
             return 0;
         }
         l1[idx] = (unsigned long)new_page | MMU_DESC_TABLE;
@@ -1141,21 +1426,92 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
         if (new_page == (void *)0) {
             return 0;
         }
+        if (!mmu_context_add_page(mm, (unsigned long)new_page)) {
+            page_free(new_page);
+            return 0;
+        }
         l2[idx] = (unsigned long)new_page | MMU_DESC_TABLE;
     }
     l3 = (unsigned long *)pa_to_va((void *)(l2[idx] & MMU_DESC_ADDR_MASK));
 
-    /* Install the L3 page descriptor. */
+    /* Install the L3 page descriptor.
+     * Force nG=1 (bit 11) so the TLB entry is tagged with the current ASID
+     * rather than being global — required for correct ASID-based isolation.
+     */
     idx = l3_index_for(va);
-    l3[idx] = (pa & MMU_L3_PAGE_ADDR_MASK) | flags | MMU_DESC_PAGE;
+    l3[idx] = (pa & MMU_L3_PAGE_ADDR_MASK) | flags | MMU_DESC_PAGE | (1UL << 11);
 
-    /* Broadcast TLB invalidation so the new entry is visible immediately. */
+    /*
+     * Invalidate the specific VA / ASID combination in the Inner Shareable
+     * domain.  TLBI VAE1IS Xt: bits[63:48]=ASID, bits[43:0]=VA[55:12].
+     * This is cheaper than VMALLE1 (all-VA flush) and correct because the
+     * page was either unmapped before (no cached translation) or is being
+     * remapped to a new PA (stale entry must go).
+     */
+    {
+        unsigned long tlbi_val = ((unsigned long)mm->asid << 48) | (va >> 12);
+
+        __asm__ volatile(
+            "dsb ish\n"
+            "tlbi vae1is, %0\n"
+            "dsb ish\n"
+            "isb\n"
+            :
+            : "r"(tlbi_val)
+            : "memory");
+    }
+
+    return 1;
+}
+
+int mmu_unmap_user_page(struct mm_context *mm, unsigned long va)
+{
+    unsigned long *l0;
+    unsigned long *l1;
+    unsigned long *l2;
+    unsigned long *l3;
+    unsigned long idx;
+    unsigned long tlbi_val;
+
+    if (mm == (struct mm_context *)0) {
+        return 0;
+    }
+
+    l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
+    idx = l0_index_for(va);
+    if ((l0[idx] & MMU_DESC_VALID) == 0UL || (l0[idx] & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
+        return 0;
+    }
+
+    l1 = (unsigned long *)pa_to_va((void *)(l0[idx] & MMU_DESC_ADDR_MASK));
+    idx = l1_index_for(va);
+    if ((l1[idx] & MMU_DESC_VALID) == 0UL || (l1[idx] & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
+        return 0;
+    }
+
+    l2 = (unsigned long *)pa_to_va((void *)(l1[idx] & MMU_DESC_ADDR_MASK));
+    idx = l2_index_for(va);
+    if ((l2[idx] & MMU_DESC_VALID) == 0UL || (l2[idx] & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
+        return 0;
+    }
+
+    l3 = (unsigned long *)pa_to_va((void *)(l2[idx] & MMU_DESC_ADDR_MASK));
+    idx = l3_index_for(va);
+    if ((l3[idx] & MMU_DESC_VALID) == 0UL || (l3[idx] & MMU_DESC_TYPE_MASK) != MMU_DESC_PAGE) {
+        return 0;
+    }
+
+    l3[idx] = 0UL;
+
+    tlbi_val = ((unsigned long)mm->asid << 48) | (va >> 12);
     __asm__ volatile(
         "dsb ish\n"
-        "tlbi vmalle1\n"
+        "tlbi vae1is, %0\n"
         "dsb ish\n"
         "isb\n"
-        ::: "memory");
+        :
+        : "r"(tlbi_val)
+        : "memory");
 
     return 1;
 }

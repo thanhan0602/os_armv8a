@@ -1,36 +1,34 @@
 #include <kernel/log.h>
 
 #include <kernel/console.h>
+#include <kernel/spinlock.h>
 
 #include <stdarg.h>
 
-void log_init(void)
-{
-    console_init();
-}
+static struct spinlock log_lock = SPINLOCK_INITIALIZER;
 
-void log_putc(char ch)
+static void log_putc_unlocked(char ch)
 {
     console_putc(ch);
 }
 
-void log_write(const char *message)
+static void log_write_unlocked(const char *message)
 {
     console_write(message);
 }
 
-void log_write_hex(unsigned long value)
+static void log_write_hex_unlocked(unsigned long value)
 {
     console_write_hex(value);
 }
 
-void log_write_u64(unsigned long value)
+static void log_write_u64_unlocked(unsigned long value)
 {
     char buffer[21];
     unsigned int index;
 
     if (value == 0UL) {
-        log_putc('0');
+        log_putc_unlocked('0');
         return;
     }
 
@@ -41,8 +39,50 @@ void log_write_u64(unsigned long value)
     }
 
     while (index > 0U) {
-        log_putc(buffer[--index]);
+        log_putc_unlocked(buffer[--index]);
     }
+}
+
+void log_init(void)
+{
+    console_init();
+    spinlock_init(&log_lock);
+}
+
+void log_putc(char ch)
+{
+    unsigned long flags;
+
+    flags = spin_lock_irqsave(&log_lock);
+    log_putc_unlocked(ch);
+    spin_unlock_irqrestore(&log_lock, flags);
+}
+
+void log_write(const char *message)
+{
+    unsigned long flags;
+
+    flags = spin_lock_irqsave(&log_lock);
+    log_write_unlocked(message);
+    spin_unlock_irqrestore(&log_lock, flags);
+}
+
+void log_write_hex(unsigned long value)
+{
+    unsigned long flags;
+
+    flags = spin_lock_irqsave(&log_lock);
+    log_write_hex_unlocked(value);
+    spin_unlock_irqrestore(&log_lock, flags);
+}
+
+void log_write_u64(unsigned long value)
+{
+    unsigned long flags;
+
+    flags = spin_lock_irqsave(&log_lock);
+    log_write_u64_unlocked(value);
+    spin_unlock_irqrestore(&log_lock, flags);
 }
 
 /*
@@ -60,12 +100,14 @@ void log_printf(const char *fmt, ...)
     va_list args;
     const char *p;
     int is_long;
+    unsigned long flags;
 
     va_start(args, fmt);
+    flags = spin_lock_irqsave(&log_lock);
 
     for (p = fmt; *p != '\0'; p++) {
         if (*p != '%') {
-            log_putc(*p);
+            log_putc_unlocked(*p);
             continue;
         }
 
@@ -79,17 +121,17 @@ void log_printf(const char *fmt, ...)
         switch (*p) {
         case 's': {
             const char *s = va_arg(args, const char *);
-            log_write((s != (const char *)0) ? s : "(null)");
+            log_write_unlocked((s != (const char *)0) ? s : "(null)");
             break;
         }
         case 'c':
-            log_putc((char)va_arg(args, int));
+            log_putc_unlocked((char)va_arg(args, int));
             break;
         case 'u': {
             unsigned long v = is_long
                 ? va_arg(args, unsigned long)
                 : (unsigned long)va_arg(args, unsigned int);
-            log_write_u64(v);
+            log_write_u64_unlocked(v);
             break;
         }
         case 'd': {
@@ -97,10 +139,10 @@ void log_printf(const char *fmt, ...)
                 ? va_arg(args, long)
                 : (long)va_arg(args, int);
             if (v < 0L) {
-                log_putc('-');
-                log_write_u64((unsigned long)(-v));
+                log_putc_unlocked('-');
+                log_write_u64_unlocked((unsigned long)(-v));
             } else {
-                log_write_u64((unsigned long)v);
+                log_write_u64_unlocked((unsigned long)v);
             }
             break;
         }
@@ -108,24 +150,25 @@ void log_printf(const char *fmt, ...)
             unsigned long v = is_long
                 ? va_arg(args, unsigned long)
                 : (unsigned long)va_arg(args, unsigned int);
-            log_write_hex(v);
+            log_write_hex_unlocked(v);
             break;
         }
         case 'p':
-            log_write_hex((unsigned long)va_arg(args, void *));
+            log_write_hex_unlocked((unsigned long)va_arg(args, void *));
             break;
         case '%':
-            log_putc('%');
+            log_putc_unlocked('%');
             break;
         default:
-            log_putc('%');
+            log_putc_unlocked('%');
             if (is_long != 0) {
-                log_putc('l');
+                log_putc_unlocked('l');
             }
-            log_putc(*p);
+            log_putc_unlocked(*p);
             break;
         }
     }
 
+    spin_unlock_irqrestore(&log_lock, flags);
     va_end(args);
 }

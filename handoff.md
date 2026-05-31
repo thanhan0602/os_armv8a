@@ -1,5 +1,20 @@
 # Handoff
 
+## Subsystem handoff
+
+- [MMU](document/handoff_mmu.md)
+- [Heap](document/handoff_heap.md)
+- [Loader](document/handoff_loader.md)
+- [Shell](document/handoff_shell.md)
+- [QEMU Inspector](document/handoff_inspector.md)
+- [Scheduler](document/handoff_scheduler.md)
+- [Exception](document/handoff_exception.md)
+- [UART](document/handoff_uart.md)
+- [Page Allocator](document/handoff_page_alloc.md)
+- [Process](document/handoff_process.md)
+- [Timer](document/handoff_timer.md)
+- [Filesystem](document/handoff_fs.md)
+
 ## Mục tiêu của repo
 
 Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang được phát triển theo từng stage từ boot, logging, exception, timer, memory management, đến MMU.
@@ -8,6 +23,17 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 
 - Stage 1 đến Stage 9 đã hoàn thành.
 - **Stage 9 (EL0 + Syscall ABI)**: user task chạy ở EL0, SVC syscalls hoạt động (SYS_WRITE=1, SYS_YIELD=2, SYS_EXIT=3), user task in "hello from EL0" 3 lần rồi exit sạch sẽ.
+- **Stage 10 (User Address Spaces)** — increments 1–4 đã hoàn thành và đã verify trên QEMU:
+  - Inc 1: `mmu_install_empty_ttbr0_root()` — owned empty TTBR0 root, boot identity map released
+  - Inc 2: EL0 fault handler — DABT/IABT từ EL0 được bắt ở EL1, log + `task_exit()` sạch
+  - Inc 3: Multi-process isolation — `user-a` và `user-b` mỗi task có `mm_context` riêng, code+stack được copy vào pages riêng, `mmu_map_user_page()` map vào user L0→L3
+  - Inc 4: Fault classification — phân loại FSC type (translation/permission/access-flag) và WnR bit (read/write), dùng `KER_LOGF` + `log_write()` pattern an toàn (không `const char *` jump-table). Kết quả QEMU verify:
+    - `user-b` stores to 0x10000 (RO code page) → `write permission L3`: FAR=0x10000
+    - `user-a` stores to 0xDEAD0000 (unmapped) → `write translation L1`: FAR=0xdead0000
+  - Inc 5: ASID (Address Space Identifier) — mỗi `mm_context` có một 8-bit ASID riêng (1–254), ASID=0 reserved cho kernel/empty root. ASID được encode vào TTBR0_EL1[55:48] khi context switch. Không cần `tlbi vmalle1` (full flush) trên mỗi context switch nữa — ASID tags trong TLB tự partition TLB entries. User page L3 descriptors được force nG=1 (non-global bit) để TLB entries được ASID-tagged. `mmu_map_user_page` dùng `tlbi vae1is` (per-VA per-ASID) thay vì `tlbi vmalle1`.
+  - Inc 6: Linux-like syscall/process base — syscall numbers đã chuyển sang gần Linux AArch64 (`write=64`, `exit=93`, `sched_yield=124`, `brk=214`); `sys_write` không còn dereference user VA trực tiếp mà đi qua `mmu_copy_from_user()` dựa trên software walk của `mm_context`.
+  - Inc 7: Process image abstraction + user heap — thêm `process_create_from_image()`/`process_destroy()` để đóng gói code image + stack + heap metadata; `process_brk()` hỗ trợ grow và shrink user heap bằng unmap/free page thực sự; `mm_context` hiện track mọi page sở hữu (root/subtables/code/stack/heap) và free sạch khi process bị reap.
+  - Inc 8: Hardening pass cho process runtime — user code page được map RO + EL0 execute nhưng `PXN` tại EL1; `sys_write` trả partial byte count nếu fault sau khi đã emit một phần buffer; ASID hiện được recycle an toàn khi `mm_context_destroy()` thay vì tăng đơn điệu suốt lifetime kernel.
 - Kernel virtual layout hoàn thành: TTBR1 active, trampoline works, PA→VA migration done.
 - Scheduler hoạt động: round-robin preemptive scheduling qua timer IRQ.
 - Hỗ trợ hai build variant qua `CONFIG_KERNEL_VIRTUAL`:
@@ -15,6 +41,9 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
   - `make KERNEL_VIRTUAL=0`: kernel chạy tại PA qua identity map (TTBR0 only, EPD1=1)
 - Build hiện tại thành công qua `make`.
 - Runtime hiện tại boot ổn định trên QEMU cho cả hai variant.
+- Mặc định build hiện tắt `DEBUG_PRE_MMU`, `DEBUG_MMU_BOOT`, và `DEBUG_POST_MMU` (`0/0/0`), nên boot thành công chỉ còn log `[info] kernel init complete`; có thể override lại qua `make DEBUG_PRE_MMU=1 DEBUG_MMU_BOOT=1 DEBUG_POST_MMU=1` khi cần soi boot path.
+- `kernel_main()` hiện không còn tự spawn các task demo (`task-a`, `task-b`, `user-a`, `user-b`) trên đường boot thành công, để console giữ trạng thái quiet boot; code demo vẫn còn trong tree để bật lại khi cần kiểm thử scheduler/EL0.
+- Có thêm build flag `RUN_OS_DEMOS=1` để spawn hai user process demo bằng process abstraction mới; vì đây là compile-time flag, cần `make clean all RUN_OS_DEMOS=1` để tránh dùng lại image cũ.
 - UART logging hoạt động.
 - Exception vectors hoạt động.
 - Sync fault path hiện dump đầy đủ `x0..x30`, `SP_EL1`, `FPCR`, và `FPSR`.
@@ -28,6 +57,37 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - Cache `SCTLR_EL1.M/C/I` đã được bật và verify.
 - Boot flow khi `CONFIG_KERNEL_VIRTUAL=1`: `_start` (PA) → `kernel_main_early` (PA) → trampoline → `kernel_main` (VA qua TTBR1).
 - Boot flow khi `KERNEL_VIRTUAL=0`: `_start` (PA) → `kernel_main_early` (PA) → `kernel_main` (PA qua TTBR0).
+- Runtime verify mới nhất với `RUN_OS_DEMOS=1`: `user-a` và `user-b` in hello bằng syscall numbers kiểu Linux; `user-a` grow heap bằng `brk`, in `[user] brk ok`, rồi fault `0xDEAD0000`; `user-b` fault khi ghi vào code page `0x10000`. Cả hai đều bị kill và reap sạch.
+- **Stage 11 (IPC And Synchronization)** — increment 1 đã bắt đầu: thêm `spinlock` IRQ-safe (`spin_lock_irqsave` / `spin_unlock_irqrestore`) và `wfe`/`sev` wait hints trong `src/kernel/spinlock.c`; logger hiện là consumer đầu tiên nên output kernel đã được serialize qua cùng primitive này.
+- **Stage 12 (Filesystem And Program Loading)** — increment 1 đã hoàn thành và đã verify trên QEMU:
+  - thêm kernel-only read-only `ramfs` trong `src/kernel/fs.c` với hai node `/bin/user-a` và `/bin/user-b`
+  - thêm `loader_load_process_image()` trong `src/kernel/loader.c` để nối `file -> loader -> process`
+  - thêm `process_create_from_buffer()` để process image không còn phụ thuộc trực tiếp vào symbol linker
+  - `kernel_main()` khi build với `RUN_OS_DEMOS=1` hiện spawn demo qua đường file-backed loader thay vì nạp trực tiếp từ symbol range
+  - runtime verify mới nhất: path `ramfs -> loader -> process` hoạt động end-to-end; `user-a` và `user-b` lại chạy, `brk` vẫn pass, permission fault tại `0x10000` và translation fault tại `0xDEAD0000` vẫn được phân loại và kill sạch như trước
+- **Stage 13 (Console Shell)** — increment 1 đã hoàn thành và đã verify trên QEMU:
+  - thêm polling RX cho PL011 (`pl011_can_read()` / `pl011_read()`) và `console_try_getc()` để kernel nhận input UART mà chưa cần IRQ-driven console
+  - thêm shell tối thiểu trong `src/kernel/shell.c`, đang chạy trực tiếp từ idle loop ở `kernel_main()`
+  - command hiện có: `read <path> [count]`, `write <text>`, `show process` / `ps`, `show memory` / `memory` / `mem`, `load <path> [task-name]`, `unload <task-id>`, `help`
+  - `read` hiện dump bytes theo dạng hex + ASCII từ `ramfs`; `load` đi qua đúng path `ramfs -> loader -> process -> task_create_user`
+  - runtime verify mới nhất: shell prompt lên ổn định trên serial, `ps`, `memory`, `read`, `write`, `load` hoạt động; `unload` hiện kill theo task id nhưng demo user programs đang kết thúc quá nhanh nên positive-path runtime verify chưa ổn định như các lệnh còn lại
+- **User ELF apps + external loading** — đã hoàn thành và đã verify trên QEMU:
+  - thêm cây `user/` với user runtime riêng: `user/common/start.S`, `user/include/user/syscall.h`, `user/linker.ld`, và các app `hello`, `fault`, `ticker`
+  - built-in user apps hiện được build thành ELF thật (`/bin/hello.elf`, `/bin/fault.elf`) rồi embed vào kernel image dưới dạng blob, thay cho flat binary cũ
+  - kernel loader hiện parse ELF64 AArch64 qua `process_create_from_elf()`; `loader_load_process_image()` dùng chung path này cho cả built-in và external images
+  - `ramfs` đã có dynamic nodes qua `fs_register_file()` / `fs_unregister_file()`, và shell có thêm `receive <path> <size>` để nhận hex stream rồi đăng ký file runtime
+  - runtime verify mới nhất: `receive /ext/ticker.elf 8496` nhận file ELF ngoài thành công, `read /ext/ticker.elf 32` trả ELF header hợp lệ, `load /ext/ticker.elf ticker` spawn task user chạy `[user-ticker] tick`, và `unload 2` reap task sạch (`ps` chỉ còn idle)
+  - user ELF hiện đã chuyển sang `ET_DYN`/PIE thay vì `ET_EXEC`; loader chọn load bias theo từng process trong user image window, nên app không còn phụ thuộc vào VMA link cứng như `0x10000`
+  - `process_create_from_elf()` hiện map PT_LOAD tại `load_bias + p_vaddr`, cộng `load_bias` vào `e_entry`, và nếu có `R_AARCH64_RELATIVE` trong `PT_DYNAMIC` thì áp relocation tối thiểu trong kernel trước khi task chạy
+  - heap của ELF process không còn cố định ở `0x00040000`; `brk(0)` giờ bắt đầu ngay sau image đã map, có một page guard giữa image và heap
+  - runtime verify mới nhất cho PIE path: `hello` được load tại `entry=0x10000 brk=0x14000`, `fault` tại `entry=0x20000 brk=0x24000`, và một instance `hello` khác tại `entry=0x30000 brk=0x34000`; `fault` vẫn tạo permission fault bằng cách ghi vào chính image read-only của nó thay vì hardcode `0x10000`
+- **Shared-library groundwork** — đã chạy được end-to-end trên QEMU:
+  - build hiện tạo thêm shared object mẫu `build/user/lib/libshared.so` và app phụ thuộc `build/user/external/shared_client.elf`
+  - `ramfs` built-in hiện expose `/lib/libshared.so` và `/bin/shared_client.elf`; app external `/ext/shared_client.elf` có thể được upload bằng shell `receive`
+  - loader trong `src/kernel/process.c` hiện parse `DT_NEEDED`, `DT_STRTAB`, `DT_SYMTAB`, `DT_STRSZ`, `DT_SYMENT`, `DT_SONAME`, `DT_RELA`, `DT_JMPREL`, `DT_PLTRELSZ`, `DT_PLTREL`
+  - relocation runtime hiện hỗ trợ `R_AARCH64_RELATIVE`, `R_AARCH64_JUMP_SLOT`, `R_AARCH64_GLOB_DAT`, và `R_AARCH64_ABS64`
+  - runtime verify mới nhất: `load /bin/shared_client.elf` in `[shared-client] hello via shared lib`; external path `receive /ext/shared_client.elf 5904` rồi `load /ext/shared_client.elf` cũng pass với cùng output
+  - limitation hiện tại: library vẫn được map private theo từng process; chưa có page sharing giữa process, inode/object cache dùng chung, ABI versioning, hay copy-on-write cho text/data
 
 ## Trạng thái MMU hiện tại
 
@@ -57,6 +117,16 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 
 ## Các bài học kỹ thuật quan trọng
 
+- **GCC -O2 PA-pointer jump-table bug (critical for post-TTBR0 code)**: Khi dùng `const char *const arr[]` (pointer array) hoặc gán `const char *p = ...` qua nhiều nhánh if-else, GCC `-O2 -fno-pie` có thể sinh ra một **switch jump table** trong `.rodata` chứa các **link-time PA absolute address** của string literals. Sau khi `mmu_install_empty_ttbr0_root()` thay TTBR0 thành empty root, các PA address này không còn accessible → EL1 DABT → recursive crash. Dù Makefile đã dùng `-fno-jump-tables`, vẫn cần tránh pattern nguy hiểm:
+  - **KHÔNG dùng**: `static const char *const names[16]` — GCC tạo PA pointer table trong `.rodata`
+  - **KHÔNG dùng**: `const char *p; if (...) p = "a"; else p = "b"; log(p)` — GCC jump-table-ize if-else chain
+  - **DÙNG thay thế**:
+    - `static const char names[16][32]` — char data inline trong `.rodata`, địa chỉ computed tại runtime qua `adrp` (PC-relative → kernel VA)
+    - Direct `log_write("literal")` call tại từng nhánh — string literal address computed qua `adrp` tại call site
+    - Ternary `? "a" : "b"` cho 2-way choice — GCC sinh `csel`, không tạo table
+  - Root cause: với VMA=LMA=PA (không có PIE relocation), link-time absolute address = PA. Khi kernel chạy qua TTBR1 tại high VA, `adrp` (PC-relative) tự động cho ra kernel VA → works. Nhưng stored absolute values trong `.rodata` vẫn là PA → breaks sau khi TTBR0 empty.
+  - Fix đã áp dụng trong `src/kernel/exception.c`: `exception_vector_name()` và fault-type logging đều đã được rewrite theo pattern an toàn trên.
+
 - **ELR_EL1/SPSR_EL1 must be saved in the exception frame**: these are hardware registers that get overwritten by any new exception (e.g. timer IRQ on another task). If not saved in `save_context` and restored in `restore_context`, `eret` after `sys_yield` jumps to the wrong address (another task's interrupted EL1 PC instead of back to EL0 user code). Fix: extend frame CTX_SIZE 784→800, save ELR at offset 248 and SPSR at offset 256; `restore_context` does `msr elr_el1`/`msr spsr_el1` + `isb` before `eret`. This also fixes a latent bug affecting EL1 tasks.
 - Một bug MMU lớn trước đây đến từ việc table descriptor thiếu bit `VALID`.
 - Table descriptor đúng phải là `VALID | TABLE`.
@@ -67,6 +137,10 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - **VMA=VA pointer-in-data bug**: khi đặt VMA=0xFFFF... trong linker.ld, các `const char *` bên trong `static const struct` arrays (.rodata) chứa VA tuyệt đối. Pre-MMU C code dereference chúng trước khi TTBR1 active → infinite fault loop. Giải pháp: giữ VMA=PA, trampoline dùng `adrp+add+offset` để nhảy sang VA tại runtime.
 - **Post-TTBR0 static-table pointer lesson**: vì linker VMA vẫn là PA, các con trỏ string lưu trong `static const` tables tiếp tục là PA. Code chạy sau khi TTBR1 active và TTBR0 bị tắt phải translate các con trỏ đã lưu này (ví dụ `pa_to_va`) trước khi dereference.
 - **Post-empty-TTBR0 allocator lesson**: free-list metadata hoặc stored pointers không được ngầm assume lower-half identity còn sống. Page allocator free-list hiện giữ physical addresses để tiếp tục hoạt động sau khi TTBR0 runtime root trở thành empty map.
+- **Stage 12 loader lifetime lesson**: nếu metadata file bị reset trong `fs_close()`, loader phải snapshot các field cần dùng trước khi đóng file. Bug vừa gặp đã xuất hiện ở cả `loader_load_process_image()` lẫn helper shared-lib `process_load_file_image()`: nếu so `read_count` với `file.size` sau `fs_close()`, mọi load sẽ fail giả vì `fs_close()` zero lại `size`.
+- **Stage 13 shell formatting lesson**: logger hiện chỉ hỗ trợ `%s %c %d %ld %u %lu %x %lx %p %%`; các width specifier kiểu `%08lx` hay `%02x` sẽ bị in literal, nên shell hexdump phải tự format nibble/byte thay vì dựa vào `log_printf()`.
+- **User ELF linker lesson**: AArch64 `ld` có thể mặc định dùng `max-page-size = 0x10000`, làm PT_LOAD đầu tiên của user ELF bị đẩy tới offset `0x10000` và phình file lên khoảng `70 KiB` dù payload chỉ vài byte. Build user apps hiện phải force `-Wl,-z,max-page-size=0x1000`; sau fix, `ticker.elf` giảm còn khoảng `8.5 KiB` và external upload qua shell thực tế mới khả thi.
+- **User PIE lesson**: chỉ bật `-pie` là chưa đủ nếu linker script vẫn đặt `.` tại `0x10000`; image vẫn có thể bị link như `ET_EXEC`. Để user app thật sự không phụ thuộc load address, linker script phải zero-base (`. = 0`) và loader phải cộng `load_bias` vào `p_vaddr`/`e_entry` khi map.
 
 ## Tài liệu nên đọc trước khi tiếp tục
 
@@ -108,6 +182,15 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - Tài liệu thiết kế MCP hiện ở `document/mcp_architecture.md`.
 - `tools/vscode-qemu-log` hiện có thêm command `qemuInspector.start`: một webview visualizer cho page/MMU state. Inspector resolve symbol từ `build/kernel8.elf` bằng `aarch64-linux-gnu-nm`, rồi đọc physical memory live qua QEMU **HMP monitor socket** (`xp`, `stop`, `cont`, `info status`) thay vì dựa vào UART log hoặc external GDB.
 - Hướng QMP/GDB đã được loại trong workspace hiện tại vì `aarch64-linux-gnu-gdb` không có sẵn và QMP greeting không ổn định khi validate; HMP monitor đã được verify runtime thành công.
+
+## QEMU Inspector
+
+Inspector handoff đã được tách riêng khỏi handoff của OS.
+
+- Handoff riêng: `tools/qemu-inspector/handoff.md`
+- Tài liệu kiến trúc: `document/qemu_inspector_hmp_architecture.md`
+
+Khi làm việc với inspector, ưu tiên đọc handoff riêng của inspector thay vì dùng phần này.
 
 ## Trạng thái Scheduler hiện tại
 

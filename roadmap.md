@@ -195,12 +195,30 @@ Current behavior:
 
 ### Stage 9: EL0 And Syscalls
 
-Status: planned
+Status: completed
 
 Goals:
 - Enter user mode at EL0
 - Define a minimal syscall ABI
 - Support basic calls such as write, yield, and exit
+
+Implemented:
+- `el0_entry_trampoline` in `switch.S`: sets `ELR_EL1`=user entry VA, `SP_EL0`=user stack, `SPSR_EL1`=0 (EL0t, DAIF=0), zeros all GPRs, then `eret` to EL0
+- Syscall ABI: `x8`=number, `x0-x5`=args, `x0`=return; `SYS_WRITE=1`, `SYS_YIELD=2`, `SYS_EXIT=3`
+- `sys_write`: reads user-VA buffer via kernel mapping and outputs each byte via `log_putc`
+- `sys_yield`: calls `schedule()` to voluntarily relinquish the CPU
+- `sys_exit`: logs exit and calls `task_exit()` to mark task dead and schedule away
+- `exception_handle_sync` updated: EC=0x15 (SVC) dispatches to `syscall_dispatch`; returns 1 for handled (eret), 0 for fatal (park)
+- Exception frame extended by 16 bytes (CTX_SIZE 784→800) to save/restore `ELR_EL1` and `SPSR_EL1`: this fixed a critical bug where `sys_yield` followed by a timer IRQ on another task corrupted `ELR_EL1`, causing `eret` to return to kernel EL1 code instead of the user continuation address
+- `mmu_map_user_page`: walks/allocates L0→L3 tables in the user `mm_context`; installs a 4 KiB page descriptor with caller-supplied flags
+- `task_create_user`: allocates a kernel stack, sets `x19`=user entry VA, `x20`=SP_EL0, `x30`=`el0_entry_trampoline`, attaches `mm`
+- Demo user task (`user_task.S`): position-independent EL0 code that prints `[user] hello from EL0\n` 3 times with yield, then accesses `0xDEAD0000` to trigger the Stage 10 fault test
+
+Current behavior:
+- Kernel boots to EL1, schedules user task at EL0
+- User task executes three `sys_write` + `sys_yield` rounds, printing via UART from EL0
+- After iteration 3, user task stores to unmapped VA → handled by Stage 10 fault handler (not sys_exit)
+- round-robin of idle/task-a/task-b continues after user task is killed
 
 ### Stage 10: Processes And Address Spaces
 
@@ -216,27 +234,119 @@ Implemented (first increment):
 - `TTBR0` is replaced with an owned empty lower-half root instead of being disabled, so the lower half is ready to be populated later
 - The old boot identity tables are freed after the handoff, reducing virtual runtime MMU table usage from `10` to `6` pages
 
+Implemented (second increment — EL0 fault handling):
+- Added `ESR_EC_DABT_LOW` (EC=0x24) and `ESR_EC_IABT_LOW` (EC=0x20) cases to `exception_handle_sync`
+- On EL0 data or instruction abort: logs `FAR_EL1`, `ELR_EL1`, `ESR_EL1`, and the fault status code (FSC), then calls `task_exit()` to kill the offending user task cleanly
+- Kernel scheduler reaps the dead user task; timer and remaining kernel tasks continue unaffected
+- User task demo updated to trigger a deliberate store to `0xDEAD0000` after its normal work, validating the full fault → kill → reap path
+
 Current behavior:
-- In `KERNEL_VIRTUAL=1`, the low kernel alias now faults at runtime while the high `TTBR1` alias still translates
-- This establishes the first incremental Stage 10 base for future per-process lower-half mappings
+- In `KERNEL_VIRTUAL=1`, the low kernel alias faults at runtime while the high `TTBR1` alias still translates
+- User task runs at EL0, does 3 `sys_write` + `sys_yield` iterations, then accesses unmapped VA
+- Fault handler logs `[fault] EL0 data abort: FAR=0xdead0000 ELR=... ESR=... FSC=5` (translation fault level 1)
+- User task is killed and reaped; idle/task-a/task-b continue scheduling normally
 
 ### Stage 11: IPC And Synchronization
 
-Status: planned
+Status: in progress
 
 Goals:
 - Add spinlocks and simple waiting primitives
 - Support kernel coordination between tasks
 
+Implemented (first increment — spinlock primitive):
+- Added `spinlock` primitive in `src/kernel/spinlock.c` and `src/include/kernel/spinlock.h`
+- Lock acquire uses AArch64 `ldaxr/stxr`; unlock uses `stlr`
+- Added `spin_lock_irqsave()` / `spin_unlock_irqrestore()` helpers so kernel code can serialize shared state without being preempted by local IRQ handlers while holding the lock
+- Added `cpu_wait()` / `cpu_wake()` wrappers around `wfe` / `sev` so contended spin paths can block briefly instead of pure busy-waiting
+- Kernel logger (`src/kernel/log.c`) is now the first user of this primitive, serializing console output across normal task, syscall, and fault-reporting paths
+
+Current behavior:
+- Kernel still boots and logs correctly in quiet-boot mode
+- `RUN_OS_DEMOS=1` runtime verify still shows Stage 10 user/syscall/fault traces after the logger moved under the new spinlock
+
 ### Stage 12: Filesystem And Program Loading
 
-Status: planned
+Status: in progress
 
 Goals:
 - Start with ramfs or initramfs
 - Add an ELF loader
 - Launch an init program from the kernel
 
+Implemented (first increment — read-only ramfs + flat-binary loader):
+- Added `src/include/kernel/fs.h` and `src/kernel/fs.c` with a kernel-only read-only `ramfs`
+- Added `src/include/kernel/loader.h` and `src/kernel/loader.c` so program loading now goes through `file -> loader -> process`
+- `ramfs` currently exports `/bin/user-a` and `/bin/user-b`, backed by the existing demo user images linked into the kernel
+- Added `process_create_from_buffer()` so process creation can consume bytes loaded from a file instead of depending on linker symbol ranges
+- `kernel_main()` with `RUN_OS_DEMOS=1` now loads both demo processes from `/bin/user-a` and `/bin/user-b`
+- Runtime verified on QEMU: both user processes run again, `user-a` still passes the `brk` smoke test, and both EL0 fault paths remain correct after the filesystem/loader refactor
+
+Implemented (second increment — ELF loader + dynamic external files):
+- Added a dedicated `user/` tree with real ELF64 AArch64 user apps, a minimal `_start`, syscall wrappers, and a user linker script
+- Built-in programs are now embedded as `/bin/hello.elf` and `/bin/fault.elf` instead of flat binaries
+- `process_create_from_elf()` now parses ELF headers/program headers and maps PT_LOAD segments into a fresh user address space
+- `src/kernel/fs.c` now supports dynamic ramfs nodes through `fs_register_file()` / `fs_unregister_file()`
+- `src/kernel/shell.c` now supports `receive <path> <size>` to upload an external ELF as a hex stream at runtime
+- Runtime verified on QEMU: `/ext/ticker.elf` uploads successfully, `read` shows a valid ELF header, `load` starts a long-running user task, and `unload` reaps it cleanly
+
+Implemented (third increment — multiple isolated user processes):
+- `create_user_task()` in `main.c` refactored to accept `code_start`, `code_end`, `name` params; can now spawn arbitrary user tasks from any user code blob
+- Added `user_task_b.S`: second independent EL0 task that prints `[user-b] hello from EL0\n` three times with yields, then faults at `0xCAFE0000`
+- Two user tasks (`user-a` and `user-b`) created at boot, each with a completely separate `mm_context` (distinct `root_pa`, separate L0→L3 page tables for code and stack)
+- Both user tasks interleave with each other and with kernel tasks on each timer tick via `sys_yield`
+- `user-b` faults at `0xCAFE0000` → killed; `user-a` continues running unaffected
+- `user-a` subsequently faults at `0xDEAD0000` → killed; scheduler continues with kernel tasks
+- Address isolation confirmed: each `mm_context` maps `USER_CODE_VA=0x10000` to a different physical page
+
+Current behavior:
+- Kernel boots, creates 5 tasks: idle, task-a, task-b, user-a, user-b
+- user-a and user-b run interleaved, printing messages and yielding
+- user-b's fault (`FAR=0xCAFE0000`) does not affect user-a's execution
+- After both user tasks are killed, idle/task-a/task-b continue round-robin scheduling normally
+
+Implemented (fourth increment — fault classification):
+- EL0 DABT/IABT handler now decodes FSC type (translation / permission / access-flag) and the WnR bit
+- Logs: `[fault] EL0 data abort (write translation L1): FAR=...` or `(write permission L3): ...`
+- `user-a` triggers translation fault at `0xDEAD0000` (L1: no page table entry); `user-b` triggers permission fault at `0x10000` (L3: AP_RO code page)
+- All string-literal selection uses `log_write()` calls (not `const char *` pointer tables) to avoid GCC -O2 PA-pointer jump-table bug
+
+Implemented (fifth increment — ASID support):
+- `struct mm_context` now carries an `unsigned int asid` (1–254; ASID=0 reserved for kernel/empty root)
+- `mmu_context_create()` assigns the next ASID from a global `next_asid` counter
+- `mmu_context_switch()` writes `root_pa | (asid << 48)` to TTBR0_EL1; the full `tlbi vmalle1` on every context switch is removed — ASID tags partition the TLB automatically
+- User L3 page descriptors have nG=1 forced inside `mmu_map_user_page()` so TLB entries are ASID-tagged (non-global)
+- `mmu_map_user_page()` uses `tlbi vae1is` (per-VA per-ASID) instead of `tlbi vmalle1`
+- TCR_EL1.AS=0 (8-bit ASID, values 0–255) and A1=0 (TTBR0 provides ASID) — both are hardware defaults, no TCR changes needed
+
 ## Immediate Next Steps
 
-1. Build the next Stage 10 increment on top of the owned empty `TTBR0` runtime root: per-process lower-half mappings and fault handling.
+1. ~~Stage 10 increment 4: handle permission faults (FSC=0x0C–0x0F) separately from translation faults; log access type (read/write) from `ESR_EL1[6]` (WnR bit).~~ ✅ Done.
+2. ~~Stage 10 increment 5: ASID support.~~ ✅ Done.
+3. ~~Stage 10 increment 6: user page tracking + unmap on exit.~~ ✅ Done.
+4. ~~Stage 10 increment 7: multi-page code mapping.~~ ✅ Done.
+5. ~~Stage 12 increment 2: define executable file format boundary clearly, starting with either a small flat-header format or a minimal ELF loader.~~ ✅ Done.
+6. Stage 12 increment 3: add a real init-style launch path so the kernel boots one named program from the filesystem instead of hardcoding demo pairs in `main.c`.
+7. Stage 13 increment 2: replace raw hex `receive` with a host-assisted upload path or a framed protocol so large external programs are less fragile over UART.
+8. User runtime increment 1: add a tiny libc surface for argv/env-style startup or reusable printing/string helpers beyond the current syscall wrappers.
+
+### Stage 13: Console Shell
+
+Status: in progress
+
+Goals:
+- Add an interactive serial console shell for bring-up and inspection
+- Expose minimal file, process, and memory inspection commands
+- Support loading and unloading user programs without rebuilding the image
+
+Implemented (first increment — polling shell over UART):
+- Added non-blocking PL011 RX polling and `console_try_getc()`
+- Added a minimal shell in `src/kernel/shell.c` that runs from the idle loop after boot completes
+- Current commands: `help`, `read <path> [count]`, `write <text>`, `show process` / `ps`, `show memory` / `memory` / `mem`, `load <path> [task-name]`, `unload <task-id>`
+- `read` currently dumps a file from the read-only `ramfs` as hex + ASCII; `load` reuses the Stage 12 loader path to spawn a user task from the named file
+- `show process` is backed by new scheduler inspection helpers; `unload` marks a task dead by id so the normal scheduler reap path can reclaim it
+
+Current behavior:
+- Default boot now reaches a serial shell prompt after `[info] kernel init complete`
+- `ps`, `memory`, `read`, `write`, `load`, `receive`, and `unload` have been verified on QEMU
+- External user ELF flow is now validated end-to-end with `/ext/ticker.elf`: upload through shell, `read` header check, `load`, repeated user output, then `unload`

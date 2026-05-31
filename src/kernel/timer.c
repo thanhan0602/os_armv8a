@@ -43,10 +43,6 @@ void timer_init(void)
 
     timer_program_next_tick();
     local_irq_enable();
-
-    KER_LOGF("[info] generic timer frequency=%lu\n", timer_frequency);
-    KER_LOGF("[info] timer interval cycles=%lu\n", timer_interval);
-    KER_INFO("stage 4 timer irq enabled");
 }
 
 int timer_handle_irq(unsigned int intid)
@@ -57,10 +53,6 @@ int timer_handle_irq(unsigned int intid)
 
     timer_ticks++;
     timer_program_next_tick();
-
-    if (timer_ticks <= 4UL) {
-        KER_LOGF("[info] timer tick=%lu\n", timer_ticks);
-    }
 
     return 1;
 }

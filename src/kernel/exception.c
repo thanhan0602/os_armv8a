@@ -12,7 +12,15 @@ extern char exception_vector_table[];
 
 static const char *exception_vector_name(unsigned long vector_id)
 {
-    static const char *const names[16] = {
+    /*
+     * Use a 2D char array — NOT a const char *[] pointer array.
+     * A pointer array stores absolute link-time VMA (= PA) values in
+     * .rodata.  After mmu_install_empty_ttbr0_root() those PA values
+     * cannot be dereferenced (TTBR0 is empty).  A char[][] stores the
+     * strings inline; &names[i][0] is computed at runtime via adrp
+     * (PC-relative) and therefore gives a correct kernel VA.
+     */
+    static const char names[16][28] = {
         "current_el_sp0_sync",
         "current_el_sp0_irq",
         "current_el_sp0_fiq",
@@ -102,11 +110,28 @@ static void exception_dump(unsigned long vector_id,
 
 /*
  * ESR_EL1 exception class (EC) field: bits [31:26].
- * EC = 0x15 means "SVC instruction in AArch64 state from EL0".
+ * EC = 0x15 : SVC from EL0 (AArch64)
+ * EC = 0x20 : Instruction Abort from lower EL
+ * EC = 0x24 : Data Abort from lower EL
  */
-#define ESR_EC_SHIFT   26UL
-#define ESR_EC_MASK    0x3FUL
-#define ESR_EC_SVC64   0x15UL
+#define ESR_EC_SHIFT      26UL
+#define ESR_EC_MASK       0x3FUL
+#define ESR_EC_SVC64      0x15UL
+#define ESR_EC_IABT_LOW   0x20UL
+#define ESR_EC_DABT_LOW   0x24UL
+/* EL1 self-faults — used to catch nested kernel exceptions */
+#define ESR_EC_IABT_CUR   0x21UL
+#define ESR_EC_DABT_CUR   0x25UL
+
+/* Fault Status Code (FSC): ESR_EL1[5:0] */
+#define ESR_ISS_FSC_MASK       0x3FUL
+#define ESR_ISS_FSC_TRANSL     0x04UL   /* translation fault (bits [5:2]=0001) */
+#define ESR_ISS_FSC_ACCFLAG    0x08UL   /* access flag fault (bits [5:2]=0010) */
+#define ESR_ISS_FSC_PERM       0x0CUL   /* permission fault  (bits [5:2]=0011) */
+#define ESR_ISS_FSC_TYPE_MASK  0x3CUL   /* bits [5:2]: fault type */
+#define ESR_ISS_FSC_LEVEL_MASK 0x03UL   /* bits [1:0]: table walk level */
+/* WnR (Write not Read): ESR_EL1[6] — set for data abort on write */
+#define ESR_DABT_WNR           (1UL << 6)
 
 int exception_handle_sync(unsigned long vector_id,
                            unsigned long esr_el1,
@@ -126,7 +151,55 @@ int exception_handle_sync(unsigned long vector_id,
         return 1;
     }
 
+    /*
+     * Data or Instruction Abort from EL0: log the faulting address and
+     * kill the offending user task.  task_exit() marks the task DEAD
+     * and calls schedule(), so it does not return.
+     */
+    if (ec == ESR_EC_DABT_LOW || ec == ESR_EC_IABT_LOW) {
+        unsigned long fsc       = esr_el1 & ESR_ISS_FSC_MASK;
+        unsigned long fsc_type  = fsc & ESR_ISS_FSC_TYPE_MASK;
+        unsigned long fsc_level = fsc & ESR_ISS_FSC_LEVEL_MASK;
+        const char *kind   = (ec == ESR_EC_DABT_LOW) ? "data" : "instruction";
+        const char *access = (ec == ESR_EC_DABT_LOW)
+                               ? ((esr_el1 & ESR_DABT_WNR) ? "write" : "read")
+                               : "fetch";
+
+        /*
+         * Do NOT store fault-type as a const char * variable: GCC -O2
+         * may optimise the if-else into a jump table whose entries are
+         * link-time PA addresses stored in .rodata.  After the empty
+         * TTBR0 root is installed those PA values are inaccessible.
+         * Use separate log_write() calls so each string literal address
+         * is computed via adrp (PC-relative → kernel VA) at the call site.
+         */
+        KER_LOGF("[fault] EL0 %s abort (%s ", kind, access);
+        if (fsc_type == ESR_ISS_FSC_TRANSL) {
+            log_write("translation");
+        } else if (fsc_type == ESR_ISS_FSC_PERM) {
+            log_write("permission");
+        } else if (fsc_type == ESR_ISS_FSC_ACCFLAG) {
+            log_write("access-flag");
+        } else {
+            log_write("other");
+        }
+        KER_LOGF(" L%lu): FAR=%lx ELR=%lx ESR=%lx\n",
+                 fsc_level, far_el1, elr_el1, esr_el1);
+        KER_INFO("[fault] killing user task");
+        task_exit();
+        while (1) {
+            __asm__ volatile("wfe");
+        }
+    }
+
     exception_dump(vector_id, esr_el1, elr_el1, spsr_el1, far_el1, context);
+
+    /* Distinguish nested EL1 aborts so they are visible in the log. */
+    if (ec == ESR_EC_DABT_CUR || ec == ESR_EC_IABT_CUR) {
+        KER_LOGF("[PANIC] EL1 %s abort FAR=%lx ELR=%lx ESR=%lx\n",
+                 (ec == ESR_EC_DABT_CUR) ? "data" : "instruction",
+                 far_el1, elr_el1, esr_el1);
+    }
 
     while (1) {
         __asm__ volatile("wfe");

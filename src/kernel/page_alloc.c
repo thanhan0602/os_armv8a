@@ -200,10 +200,6 @@ void page_allocator_init(void)
         free_pages++;
     }
 
-    KER_LOGF("[info] ram base=%lx\n", QEMU_VIRT_RAM_BASE);
-    KER_LOGF("[info] ram end=%lx\n", ram_end);
-    KER_LOGF("[info] page allocator start=%lx\n", managed_start);
-    KER_LOGF("[info] page allocator pages=%lu\n", total_pages);
 }
 
 void *page_alloc(void)

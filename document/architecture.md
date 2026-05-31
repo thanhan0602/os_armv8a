@@ -19,10 +19,11 @@
 9. [Kernel heap](#9-kernel-heap)
 10. [Exception và interrupt](#10-exception-và-interrupt)
 11. [Scheduler](#11-scheduler)
-12. [Debug target framework](#12-debug-target-framework)
-13. [Stack các hệ thống con](#13-stack-các-hệ-thống-con)
-14. [Quyết định thiết kế quan trọng và bài học kỹ thuật](#14-quyết-định-thiết-kế-quan-trọng-và-bài-học-kỹ-thuật)
-15. [Trạng thái các stage](#15-trạng-thái-các-stage)
+12. [Console shell, ramfs, và user ELF loader](#12-console-shell-ramfs-và-user-elf-loader)
+13. [Debug target framework](#13-debug-target-framework)
+14. [Stack các hệ thống con](#14-stack-các-hệ-thống-con)
+15. [Quyết định thiết kế quan trọng và bài học kỹ thuật](#15-quyết-định-thiết-kế-quan-trọng-và-bài-học-kỹ-thuật)
+16. [Trạng thái các stage](#16-trạng-thái-các-stage)
 
 ---
 
@@ -461,7 +462,70 @@ Guard page nằm trong L2 block mapping nên không thể unmapped ở hardware 
 
 ---
 
-## 12. Debug target framework
+## 12. Console shell, ramfs, và user ELF loader
+
+**Files**: [src/kernel/shell.c](../src/kernel/shell.c), [src/kernel/fs.c](../src/kernel/fs.c), [src/kernel/loader.c](../src/kernel/loader.c), [src/kernel/process.c](../src/kernel/process.c), [user/linker.ld](../user/linker.ld), [Makefile](../Makefile)
+
+### Console shell
+
+Shell hiện chạy trực tiếp từ idle loop của `kernel_main()` và poll input qua PL011.
+
+Các command runtime hiện có:
+
+- `read <path> [count]`
+- `write <text>`
+- `show process` / `ps`
+- `show memory` / `mem` / `memory`
+- `load <path> [task-name]`
+- `unload <task-id>`
+- `receive <path> <size>`
+
+`receive` nhận hex stream từ UART, decode trực tiếp thành bytes, rồi đăng ký file runtime vào dynamic ramfs. Cách này cho phép nạp ELF từ bên ngoài mà không cần rebuild kernel image.
+
+### Ramfs và external file path
+
+Filesystem hiện là kernel-only ramfs với hai nhóm node:
+
+- built-in nodes embed vào kernel image: `/bin/hello.elf`, `/bin/fault.elf`, `/bin/shared_client.elf`, `/lib/libshared.so`
+- dynamic nodes đăng ký lúc runtime qua `fs_register_file()`, hiện được shell sử dụng cho các path kiểu `/ext/*.elf`
+
+`loader_load_process_image()` giữ vai trò nối `fs_open()` với `process_create_from_elf()`: đọc toàn bộ file vào heap kernel, validate ELF, rồi tạo process user từ buffer đó.
+
+### User ELF runtime
+
+User apps hiện được build từ cây `user/` thành ELF64 AArch64 thật. Các app tự chứa dùng linker script zero-based và được link kiểu `ET_DYN`/PIE thay vì `ET_EXEC`, nên image không còn phụ thuộc vào một load address cố định.
+
+Luồng load hiện tại:
+
+1. đọc toàn bộ ELF image vào heap kernel
+2. validate ELF header và program headers
+3. chọn `load_bias` cho object nếu là `ET_DYN`
+4. map từng `PT_LOAD` tại `load_bias + p_vaddr`
+5. đặt `entry_va = load_bias + e_entry`
+6. đặt `heap_start` và `brk` ngay sau vùng image đã map, kèm một page guard
+
+Vì `brk` bắt đầu sau image thay vì tại một địa chỉ cố định, user heap cũng di chuyển theo load bias của mỗi process.
+
+### Shared-library groundwork
+
+Loader user-space hiện đã hỗ trợ một bước tiến thực dụng tới shared library:
+
+- đọc `DT_NEEDED` để tự load dependency object từ `/lib`
+- parse `DT_STRTAB`, `DT_SYMTAB`, `DT_STRSZ`, `DT_SYMENT`, `DT_SONAME`, `DT_RELA`, `DT_JMPREL`, `DT_PLTRELSZ`, `DT_PLTREL`
+- resolve symbol xuyên qua tập object đã load cho cùng process
+- apply các relocation `R_AARCH64_RELATIVE`, `R_AARCH64_JUMP_SLOT`, `R_AARCH64_GLOB_DAT`, `R_AARCH64_ABS64`
+
+Sample đã được verify runtime:
+
+- `/lib/libshared.so`: shared object mẫu export `shared_write()`
+- `/bin/shared_client.elf`: app built-in phụ thuộc `libshared.so`
+- `/ext/shared_client.elf`: cùng app nhưng nạp từ bên ngoài qua shell `receive`
+
+Hiện tại đây mới là shared-library support ở mức loader và relocation. Mỗi process vẫn map một bản private của library; chưa có cơ chế chia sẻ page text/data giữa các process, chưa có object cache dùng chung, và chưa có ABI/version resolver.
+
+---
+
+## 13. Debug target framework
 
 **File**: [src/kernel/debug_targets.c](../src/kernel/debug_targets.c), [src/include/kernel/debug_targets.h](../src/include/kernel/debug_targets.h)
 
@@ -493,16 +557,17 @@ Framework thống nhất cho boot-time inspection. Mỗi target có thể đư�
 
 ---
 
-## 13. Stack các hệ thống con
+## 14. Stack các hệ thống con
 
 ```
 ┌────────────────────────────────────────────────────────────┐
 │                    kernel_main()                           │
 │   (chạy tại VA qua TTBR1 hoặc PA qua TTBR0)              │
 ├────────────────┬───────────────┬───────────────────────────┤
-│   Scheduler    │  Heap kmalloc │  Exception / IRQ handler  │
-│   sched.c      │  heap.c       │  exception.c              │
-│   switch.S     │               │  exception_vectors.S      │
+│ Shell / loader │  Heap kmalloc │  Exception / IRQ handler  │
+│ shell.c fs.c   │  heap.c       │  exception.c              │
+│ loader.c       │               │  exception_vectors.S      │
+│ process.c      │               │                           │
 ├────────────────┴───────────────┴───────────────────────────┤
 │               Page allocator  page_alloc.c                 │
 ├────────────────────────────────────────────────────────────┤
@@ -519,7 +584,7 @@ Framework thống nhất cho boot-time inspection. Mỗi target có thể đư�
 
 ---
 
-## 14. Quyết định thiết kế quan trọng và bài học kỹ thuật
+## 15. Quyết định thiết kế quan trọng và bài học kỹ thuật
 
 ### VMA = PA trong linker.ld
 
@@ -549,9 +614,19 @@ Free-list metadata lưu PA để tiếp tục hoạt động sau khi TTBR0 runti
 
 Công cụ hữu ích nhất: QEMU trace với `-d int,mmu,guest_errors`. `AT S1E1R` + `PAR_EL1` hữu ích nhưng không thay thế được việc kiểm tra instruction fetch thực tế.
 
+### Loader phải snapshot metadata file trước `fs_close()`
+
+`fs_close()` reset lại `struct file`. Vì vậy mọi loader helper phải snapshot các field như `file.size` trước khi đóng file. Nếu đọc xong rồi mới so `read_count` với `file.size` sau `fs_close()`, kết quả sẽ fail giả dù I/O đã thành công.
+
+### User ELF và shared library cần layout linker nhất quán
+
+- user app tự chứa dùng linker script zero-based + `-pie` để tạo `ET_DYN` thật, rồi runtime cộng `load_bias`
+- shared object và app có `DT_NEEDED` phải giữ nguyên metadata động cần thiết; vì vậy build hiện strip bằng `--strip-debug`, không dùng `--strip-all`
+- AArch64 `ld` cần được force `-Wl,-z,max-page-size=0x1000` để tránh PT_LOAD đầu tiên bị đẩy tới offset `0x10000` và làm file phình vô ích
+
 ---
 
-## 15. Trạng thái các stage
+## 16. Trạng thái các stage
 
 | Stage | Tên | Trạng thái |
 |---|---|---|
@@ -563,10 +638,11 @@ Công cụ hữu ích nhất: QEMU trace với `-d int,mmu,guest_errors`. `AT S1
 | 6 | MMU and kernel virtual memory | ✅ Hoàn thành |
 | 7 | Kernel heap | ✅ Hoàn thành |
 | 8 | Scheduler and kernel threads | ✅ Hoàn thành |
-| 9 | EL0 and syscalls | 🔲 Planned |
-| 10 | Processes and address spaces | 🔄 Đang tiến hành (increment 1 done) |
-| 11 | IPC and synchronization | 🔲 Planned |
-| 12 | Filesystem and program loading | 🔲 Planned |
+| 9 | EL0 and syscalls | ✅ Hoàn thành |
+| 10 | Processes and address spaces | 🔄 Đang tiến hành (increments 1-8 đã chạy ổn) |
+| 11 | IPC and synchronization | 🔄 Đang tiến hành (spinlock increment đã có) |
+| 12 | Filesystem and program loading | ✅ Hoàn thành |
+| 13 | Console shell | ✅ Hoàn thành |
 
 ### Stage 10 — trạng thái increment 1
 
@@ -574,7 +650,7 @@ Công cụ hữu ích nhất: QEMU trace với `-d int,mmu,guest_errors`. `AT S1
 - Low VA kernel alias fault như mong đợi
 - TTBR1 high alias vẫn translates
 - Boot TTBR0 identity tables đã được freed (runtime: 6 table pages)
-- Bước tiếp theo: per-process lower-half mappings và fault handling
+- Bước tiếp theo: physical sharing cho shared library pages, object cache/refcount, và ABI/version policy cho dependency resolution
 
 ---
 
