@@ -5,6 +5,7 @@ struct exception_context {
     unsigned long gpr[31];   /* x0-x30 */
     unsigned long elr_el1;   /* ELR_EL1 at time of exception (was reserved0) */
     unsigned long spsr_el1;  /* SPSR_EL1 at time of exception */
+    unsigned long sp_el0;    /* SP_EL0 at time of exception */
     unsigned long fpcr;
     unsigned long fpsr;
 };

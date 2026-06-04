@@ -1,11 +1,13 @@
 #ifndef KERNEL_FS_H
 #define KERNEL_FS_H
 
+struct vnode;
+
 struct file {
+    struct vnode *vn;
     const char *name;
-    const unsigned char *data;
-    unsigned long size;
     unsigned long offset;
+    unsigned long size;
 };
 
 void fs_init(void);

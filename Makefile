@@ -20,7 +20,7 @@ USER_ASFLAGS := -g -ffreestanding -I$(USER_DIR)/include -MMD -MP
 USER_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie -Wl,--build-id=none -Wl,--no-dynamic-linker -Wl,-z,max-page-size=0x1000 -T $(USER_LINKER_SCRIPT)
 USER_DYNAMIC_APP_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie -Wl,--build-id=none -Wl,--no-dynamic-linker -Wl,-z,max-page-size=0x1000
 
-USER_BUILTIN_APPS := hello fault
+USER_BUILTIN_APPS := hello fault ipc_recv ipc_send
 USER_EXTERNAL_APPS := ticker shared_client
 USER_BUILTIN_LIBS := shared
 USER_COMMON_OBJECT := $(BUILD_DIR)/user/common/start_s.o

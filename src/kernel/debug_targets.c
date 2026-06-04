@@ -3,6 +3,7 @@
 #include <kernel/heap.h>
 #include <kernel/log.h>
 #include <kernel/mmu.h>
+#include <kernel/mmu_debug.h>
 #include <kernel/page_alloc.h>
 #include <kernel/vm.h>
 

@@ -1,5 +1,6 @@
 #include <kernel/syscall.h>
 
+#include <kernel/ipc.h>
 #include <kernel/log.h>
 #include <kernel/mmu.h>
 #include <kernel/process.h>
@@ -77,6 +78,74 @@ static unsigned long sys_brk(unsigned long new_break)
     return process_brk(task->process, new_break);
 }
 
+static unsigned long sys_ipc_send(unsigned long channel_id,
+                                  unsigned long buf_va,
+                                  unsigned long len)
+{
+    struct task *task;
+    unsigned char buffer[IPC_MESSAGE_MAX];
+    unsigned long index;
+    long result;
+
+    if (len == 0UL || len > IPC_MESSAGE_MAX) {
+        return (unsigned long)-1;
+    }
+
+    task = sched_current();
+    if (task == (struct task *)0 || task->mm == (struct mm_context *)0) {
+        return (unsigned long)-1;
+    }
+
+    for (index = 0UL; index < len; index++) {
+        if (!mmu_copy_from_user(task->mm, &buffer[index], buf_va + index, 1UL)) {
+            return (unsigned long)-1;
+        }
+    }
+
+    result = ipc_send(channel_id, buffer, len);
+    return (result < 0L) ? (unsigned long)-1 : (unsigned long)result;
+}
+
+static unsigned long sys_ipc_recv(unsigned long channel_id,
+                                  unsigned long buf_va,
+                                  unsigned long capacity)
+{
+    struct task *task;
+    unsigned char buffer[IPC_MESSAGE_MAX];
+    long result;
+
+    if (capacity == 0UL || capacity > IPC_MESSAGE_MAX) {
+        return (unsigned long)-1;
+    }
+
+    task = sched_current();
+    if (task == (struct task *)0 || task->mm == (struct mm_context *)0) {
+        return (unsigned long)-1;
+    }
+
+    for (;;) {
+        unsigned long index;
+
+        result = ipc_receive(channel_id, task, buffer, capacity);
+        if (result == IPC_RESULT_BLOCKED) {
+            schedule();
+            continue;
+        }
+
+        if (result < 0L) {
+            return (unsigned long)-1;
+        }
+
+        for (index = 0UL; index < (unsigned long)result; index++) {
+            if (!mmu_copy_to_user(task->mm, buf_va + index, &buffer[index], 1UL)) {
+                return (unsigned long)-1;
+            }
+        }
+
+        return (unsigned long)result;
+    }
+}
+
 void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
 {
     unsigned long ret;
@@ -94,6 +163,12 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
         break;
     case SYS_BRK:
         ret = sys_brk(ctx->gpr[0]);
+        break;
+    case SYS_IPC_SEND:
+        ret = sys_ipc_send(ctx->gpr[0], ctx->gpr[1], ctx->gpr[2]);
+        break;
+    case SYS_IPC_RECV:
+        ret = sys_ipc_recv(ctx->gpr[0], ctx->gpr[1], ctx->gpr[2]);
         break;
     default:
         KER_LOGF("[syscall] unknown nr=%lu\n", nr);

@@ -4,6 +4,7 @@
 
 - [MMU](document/handoff_mmu.md)
 - [Heap](document/handoff_heap.md)
+- [IPC](document/handoff_ipc.md)
 - [Loader](document/handoff_loader.md)
 - [Shell](document/handoff_shell.md)
 - [QEMU Inspector](document/handoff_inspector.md)
@@ -45,6 +46,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - `kernel_main()` hiện không còn tự spawn các task demo (`task-a`, `task-b`, `user-a`, `user-b`) trên đường boot thành công, để console giữ trạng thái quiet boot; code demo vẫn còn trong tree để bật lại khi cần kiểm thử scheduler/EL0.
 - Có thêm build flag `RUN_OS_DEMOS=1` để spawn hai user process demo bằng process abstraction mới; vì đây là compile-time flag, cần `make clean all RUN_OS_DEMOS=1` để tránh dùng lại image cũ.
 - UART logging hoạt động.
+- Driver system layer hiện gom UART, GIC, và timer qua `driver_system_init()`; `driver_system_dump()` báo trạng thái sau khi logger sẵn sàng.
 - Exception vectors hoạt động.
 - Sync fault path hiện dump đầy đủ `x0..x30`, `SP_EL1`, `FPCR`, và `FPSR`.
 - GICv2 và generic timer IRQ hoạt động.
@@ -58,20 +60,36 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - Boot flow khi `CONFIG_KERNEL_VIRTUAL=1`: `_start` (PA) → `kernel_main_early` (PA) → trampoline → `kernel_main` (VA qua TTBR1).
 - Boot flow khi `KERNEL_VIRTUAL=0`: `_start` (PA) → `kernel_main_early` (PA) → `kernel_main` (PA qua TTBR0).
 - Runtime verify mới nhất với `RUN_OS_DEMOS=1`: `user-a` và `user-b` in hello bằng syscall numbers kiểu Linux; `user-a` grow heap bằng `brk`, in `[user] brk ok`, rồi fault `0xDEAD0000`; `user-b` fault khi ghi vào code page `0x10000`. Cả hai đều bị kill và reap sạch.
-- **Stage 11 (IPC And Synchronization)** — increment 1 đã bắt đầu: thêm `spinlock` IRQ-safe (`spin_lock_irqsave` / `spin_unlock_irqrestore`) và `wfe`/`sev` wait hints trong `src/kernel/spinlock.c`; logger hiện là consumer đầu tiên nên output kernel đã được serialize qua cùng primitive này.
+- **Stage 11 (IPC And Synchronization)** — increments 1–2 đã chạy được trên QEMU:
+  - increment 1: thêm `spinlock` IRQ-safe (`spin_lock_irqsave` / `spin_unlock_irqrestore`) và `wfe`/`sev` wait hints trong `src/kernel/spinlock.c`; logger hiện là consumer đầu tiên nên output kernel đã được serialize qua cùng primitive này
+  - increment 2: thêm fixed IPC channels trong `src/kernel/ipc.c` với một-message mailbox (`IPC_CHANNEL_MAX=8`, `IPC_MESSAGE_MAX=64`), `ipc_send()`, `ipc_receive()`, và detach path cho waiter khi task chết
+  - scheduler hiện có thêm `TASK_STATE_BLOCKED`, `sched_block_task()`, và `sched_wake_task()` để task có thể sleep trong `SYS_IPC_RECV` thay vì spin/yield loop
+  - syscall ABI hiện có thêm `SYS_IPC_SEND=451` và `SYS_IPC_RECV=452`; user runtime expose `user_ipc_send()` / `user_ipc_recv()`
+  - built-in demo apps mới: `/bin/ipc_recv.elf` và `/bin/ipc_send.elf`
+  - runtime verify mới nhất: `load /bin/ipc_recv.elf`, sau đó `load /bin/ipc_send.elf` in `[ipc-send] sent message on channel 1`, `[ipc-recv] got: hello from ipc_send`, và cả hai task exit sạch
+  - limitation hiện tại: channel id là fixed global integer, mailbox chỉ giữ một message tại một thời điểm, `recv` là blocking còn `send` hiện fail nếu mailbox còn đầy; chưa có multi-waiter queue, close semantics, select/poll, hay stream/pipe abstraction
 - **Stage 12 (Filesystem And Program Loading)** — increment 1 đã hoàn thành và đã verify trên QEMU:
   - thêm kernel-only read-only `ramfs` trong `src/kernel/fs.c` với hai node `/bin/user-a` và `/bin/user-b`
   - thêm `loader_load_process_image()` trong `src/kernel/loader.c` để nối `file -> loader -> process`
   - thêm `process_create_from_buffer()` để process image không còn phụ thuộc trực tiếp vào symbol linker
   - `kernel_main()` khi build với `RUN_OS_DEMOS=1` hiện spawn demo qua đường file-backed loader thay vì nạp trực tiếp từ symbol range
   - runtime verify mới nhất: path `ramfs -> loader -> process` hoạt động end-to-end; `user-a` và `user-b` lại chạy, `brk` vẫn pass, permission fault tại `0x10000` và translation fault tại `0xDEAD0000` vẫn được phân loại và kill sạch như trước
-- **Stage 13 (Console Shell)** — increment 1 đã hoàn thành và đã verify trên QEMU:
-  - thêm polling RX cho PL011 (`pl011_can_read()` / `pl011_read()`) và `console_try_getc()` để kernel nhận input UART mà chưa cần IRQ-driven console
-  - thêm shell tối thiểu trong `src/kernel/shell.c`, đang chạy trực tiếp từ idle loop ở `kernel_main()`
-  - command hiện có: `read <path> [count]`, `write <text>`, `show process` / `ps`, `show memory` / `memory` / `mem`, `load <path> [task-name]`, `unload <task-id>`, `help`
-  - `read` hiện dump bytes theo dạng hex + ASCII từ `ramfs`; `load` đi qua đúng path `ramfs -> loader -> process -> task_create_user`
-  - runtime verify mới nhất: shell prompt lên ổn định trên serial, `ps`, `memory`, `read`, `write`, `load` hoạt động; `unload` hiện kill theo task id nhưng demo user programs đang kết thúc quá nhanh nên positive-path runtime verify chưa ổn định như các lệnh còn lại
-- **User ELF apps + external loading** — đã hoàn thành và đã verify trên QEMU:
+  - external uploads qua shell `receive` hiện được copy vào buffer do ramfs sở hữu, nên program nạp từ bên ngoài QEMU được lưu độc lập với buffer tạm của shell
+  - `kernel_main_early()` hiện nhận và lưu DTB pointer từ boot entry; DTB được validate sớm để mở đường cho driver/device-tree init sau này
+- **Stage 13 (Console Shell)** — increment 1 đã hoàn thành và đã verify trên QEMU...
+- **VFS (Virtual File System) Implementation** — hoàn thành và verify trên QEMU:
+  - Tách core FS thành VFS layer ([src/kernel/fs.c](src/kernel/fs.c)) và RamFS provider ([src/kernel/ramfs.c](src/kernel/ramfs.c)).
+  - Thêm `struct vfs_ops` và `struct vnode_ops` để trừu tượng hóa các thao tác trên filesystem.
+  - Hỗ trợ `vfs_register_fs` và `vfs_mount` để gắn các filesystem khác nhau vào cây thư mục (mặc định mount `ramfs` vào `/`).
+  - Path lookup hỗ trợ tìm kiếm mount point dài nhất (longest matching mount point).
+  - Khắc phục lỗi con trỏ hàm tuyệt đối trong static structs khi chạy ở VA (runtime initialization cho ops structs).
+  - Shell `read` và `load` đã được chuyển sang dùng VFS API xuyên suốt.
+- **VMA = VA Linker Script Transition** — hoàn thành và verify:
+  - Linker script ([src/linker.ld](src/linker.ld)) cập nhật link address tại `0xFFFF000040080000`.
+  - Dùng `AT()` để giữ LMA tại `0x40080000` cho QEMU loading.
+  - Page allocator ([src/kernel/page_alloc.c](src/kernel/page_alloc.c)) đã được cập nhật để dùng `va_to_pa(__kernel_end)` khi khởi tạo pool, tránh conflict với high virtual address symbols.
+  - Hệ thống hiện boot sạch sẽ vào shell, hỗ trợ đầy đủ ELF loading và user fault handling.
+- **User ELF apps + external loading** — đã hoàn thành và đã verify trên QEMU...
   - thêm cây `user/` với user runtime riêng: `user/common/start.S`, `user/include/user/syscall.h`, `user/linker.ld`, và các app `hello`, `fault`, `ticker`
   - built-in user apps hiện được build thành ELF thật (`/bin/hello.elf`, `/bin/fault.elf`) rồi embed vào kernel image dưới dạng blob, thay cho flat binary cũ
   - kernel loader hiện parse ELF64 AArch64 qua `process_create_from_elf()`; `loader_load_process_image()` dùng chung path này cho cả built-in và external images
@@ -128,6 +146,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
   - Fix đã áp dụng trong `src/kernel/exception.c`: `exception_vector_name()` và fault-type logging đều đã được rewrite theo pattern an toàn trên.
 
 - **ELR_EL1/SPSR_EL1 must be saved in the exception frame**: these are hardware registers that get overwritten by any new exception (e.g. timer IRQ on another task). If not saved in `save_context` and restored in `restore_context`, `eret` after `sys_yield` jumps to the wrong address (another task's interrupted EL1 PC instead of back to EL0 user code). Fix: extend frame CTX_SIZE 784→800, save ELR at offset 248 and SPSR at offset 256; `restore_context` does `msr elr_el1`/`msr spsr_el1` + `isb` before `eret`. This also fixes a latent bug affecting EL1 tasks.
+- **SP_EL0 must also survive blocking syscalls**: once `SYS_IPC_RECV` started scheduling user tasks out from inside the syscall path, another latent exception-frame bug surfaced. Preserving only `ELR_EL1`/`SPSR_EL1` was not enough; `SP_EL0` also had to be saved and restored in `exception_vectors.S`. Without that, a task that slept inside a syscall resumed at the right EL0 PC but with the wrong user stack pointer and faulted on local stack accesses after wakeup.
 - Một bug MMU lớn trước đây đến từ việc table descriptor thiếu bit `VALID`.
 - Table descriptor đúng phải là `VALID | TABLE`.
 - `AT S1E1R` và `PAR_EL1` hữu ích nhưng không đủ để thay thế việc kiểm tra instruction fetch thực tế.
@@ -153,6 +172,8 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 ## Các file code quan trọng
 
 - `src/kernel/main.c`
+- `src/kernel/driver.c`
+- `src/kernel/device_tree.c`
 - `src/kernel/syscall.c`
 - `src/kernel/debug_targets.c`
 - `src/kernel/heap.c`

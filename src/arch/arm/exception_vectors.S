@@ -4,7 +4,8 @@
 .equ GPR_CTX_SIZE, 256
 .equ ELR_OFFSET,  248   /* ELR_EL1 saved here */
 .equ SPSR_OFFSET, 256   /* SPSR_EL1 saved here */
-.equ FPCR_OFFSET, 264   /* was 256 */
+.equ SP_EL0_OFFSET, 264 /* SP_EL0 saved here */
+.equ FPCR_OFFSET, 272
 .equ SIMD_OFFSET, 288   /* was 272 */
 .equ CTX_SIZE,    800   /* was 784 (+16 for ELR+SPSR) */
 
@@ -38,6 +39,8 @@
     mrs x9, elr_el1
     mrs x10, spsr_el1
     stp x9, x10, [sp, #ELR_OFFSET]  /* ELR at 248, SPSR at 256 */
+    mrs x9, sp_el0
+    str x9, [sp, #SP_EL0_OFFSET]
     mrs x9, fpcr
     mrs x10, fpsr
     stp x9, x10, [sp, #FPCR_OFFSET]
@@ -83,6 +86,8 @@
     ldp x9, x10, [sp, #ELR_OFFSET]
     msr elr_el1, x9
     msr spsr_el1, x10
+    ldr x9, [sp, #SP_EL0_OFFSET]
+    msr sp_el0, x9
     isb
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]

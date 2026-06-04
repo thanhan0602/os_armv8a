@@ -1,287 +1,130 @@
-#include <kernel/fs.h>
-
+#include <kernel/vfs.h>
+#include <kernel/ramfs.h>
 #include <kernel/heap.h>
+#include <kernel/log.h>
 #include <kernel/vm.h>
 
-#ifdef CONFIG_KERNEL_VIRTUAL
+static struct fs_type *fs_types = (struct fs_type *)0;
+static struct vfs_mount *mounts = (struct vfs_mount *)0;
 
-#define FS_DYNAMIC_FILES_MAX  8UL
-#define FS_DYNAMIC_PATH_MAX   64UL
-
-extern unsigned char _binary_build_user_builtin_hello_elf_start[];
-extern unsigned char _binary_build_user_builtin_hello_elf_end[];
-extern unsigned char _binary_build_user_builtin_fault_elf_start[];
-extern unsigned char _binary_build_user_builtin_fault_elf_end[];
-extern unsigned char _binary_build_user_lib_libshared_so_start[];
-extern unsigned char _binary_build_user_lib_libshared_so_end[];
-extern unsigned char _binary_build_user_external_shared_client_elf_start[];
-extern unsigned char _binary_build_user_external_shared_client_elf_end[];
-
-struct dynamic_ramfs_node {
-    int in_use;
-    char path[FS_DYNAMIC_PATH_MAX];
-    unsigned char *data;
-    unsigned long size;
-};
-
-static struct dynamic_ramfs_node dynamic_ramfs_nodes[FS_DYNAMIC_FILES_MAX];
-
-static int fs_path_equals(const char *lhs, const char *rhs)
+void vfs_init(void)
 {
-    while (*lhs != '\0' && *rhs != '\0') {
-        if (*lhs != *rhs) {
-            return 0;
-        }
-        lhs++;
-        rhs++;
-    }
-
-    return *lhs == *rhs;
+    fs_types = (struct fs_type *)0;
+    mounts = (struct vfs_mount *)0;
 }
 
-static int fs_copy_path(char *dst, const char *src)
+int vfs_register_fs(const char *name, struct vfs_ops *ops)
 {
-    unsigned long index;
+    struct fs_type *type = (struct fs_type *)kmalloc(sizeof(struct fs_type));
+    if (!type) return 0;
 
-    if (dst == (char *)0 || src == (const char *)0 || src[0] == '\0') {
-        return 0;
-    }
+    type->name = name;
+    type->ops = ops;
+    type->next = fs_types;
+    fs_types = type;
 
-    for (index = 0UL; index + 1UL < FS_DYNAMIC_PATH_MAX && src[index] != '\0'; index++) {
-        dst[index] = src[index];
-    }
-
-    if (src[index] != '\0') {
-        return 0;
-    }
-
-    dst[index] = '\0';
+    KER_LOGF("vfs", "registered filesystem: %s", name);
     return 1;
 }
 
-static struct dynamic_ramfs_node *fs_find_dynamic_node(const char *path)
+int vfs_mount(const char *path, const char *fs_name, const char *device)
 {
-    unsigned long index;
-
-    for (index = 0UL; index < FS_DYNAMIC_FILES_MAX; index++) {
-        if (dynamic_ramfs_nodes[index].in_use == 0) {
-            continue;
-        }
-
-        if (fs_path_equals(dynamic_ramfs_nodes[index].path, path)) {
-            return &dynamic_ramfs_nodes[index];
-        }
+    struct fs_type *type = fs_types;
+    while (type) {
+        const char *t1 = type->name;
+        const char *t2 = fs_name;
+        while (*t1 && *t1 == *t2) { t1++; t2++; }
+        if (*t1 == *t2) break;
+        type = type->next;
     }
 
-    return (struct dynamic_ramfs_node *)0;
+    if (!type) return 0;
+
+    struct vfs_mount *mnt = (struct vfs_mount *)kmalloc(sizeof(struct vfs_mount));
+    if (!mnt) return 0;
+
+    mnt->path = path;
+    mnt->ops = type->ops;
+    mnt->data = (void *)0;
+    mnt->next = mounts;
+
+    if (!mnt->ops->mount(mnt, device)) {
+        kfree(mnt);
+        return 0;
+    }
+
+    mounts = mnt;
+    KER_LOGF("vfs", "mounted %s on %s", fs_name, path);
+    return 1;
 }
 
-static struct dynamic_ramfs_node *fs_find_free_dynamic_node(void)
+int vfs_lookup(const char *path, struct vnode **out)
 {
-    unsigned long index;
+    if (!path || path[0] != '/') return 0;
 
-    for (index = 0UL; index < FS_DYNAMIC_FILES_MAX; index++) {
-        if (dynamic_ramfs_nodes[index].in_use == 0) {
-            return &dynamic_ramfs_nodes[index];
+    struct vfs_mount *best_mnt = (struct vfs_mount *)0;
+    unsigned long max_len = 0;
+    struct vfs_mount *mnt = mounts;
+
+    while (mnt) {
+        unsigned long len = 0;
+        const char *p1 = path;
+        const char *p2 = mnt->path;
+        while (*p2 && *p1 == *p2) { p1++; p2++; len++; }
+        if (*p2 == '\0' && (len > max_len || best_mnt == (void *)0)) {
+            max_len = len;
+            best_mnt = mnt;
         }
+        mnt = mnt->next;
     }
 
-    return (struct dynamic_ramfs_node *)0;
-}
+    if (!best_mnt) return 0;
 
-void fs_init(void)
-{
-    unsigned long index;
-
-    for (index = 0UL; index < FS_DYNAMIC_FILES_MAX; index++) {
-        dynamic_ramfs_nodes[index].in_use = 0;
-        dynamic_ramfs_nodes[index].path[0] = '\0';
-        dynamic_ramfs_nodes[index].data = (unsigned char *)0;
-        dynamic_ramfs_nodes[index].size = 0UL;
-    }
+    return best_mnt->vnode_root->ops->lookup(best_mnt->vnode_root, path, out);
 }
 
 int fs_open(const char *path, struct file *file)
 {
-    struct dynamic_ramfs_node *dynamic_node;
-
-    if (path == (const char *)0 || file == (struct file *)0) {
-        return 0;
-    }
-
-    dynamic_node = fs_find_dynamic_node(path);
-    if (dynamic_node != (struct dynamic_ramfs_node *)0) {
-        file->name = dynamic_node->path;
-        file->data = dynamic_node->data;
-        file->size = dynamic_node->size;
-        file->offset = 0UL;
-        return 1;
-    }
-
-    if (fs_path_equals(path, "/bin/hello.elf")) {
-        file->name = "/bin/hello.elf";
-        file->data = _binary_build_user_builtin_hello_elf_start;
-        file->size = (unsigned long)(_binary_build_user_builtin_hello_elf_end -
-                                     _binary_build_user_builtin_hello_elf_start);
-        file->offset = 0UL;
-        return 1;
-    }
-
-    if (fs_path_equals(path, "/bin/fault.elf")) {
-        file->name = "/bin/fault.elf";
-        file->data = _binary_build_user_builtin_fault_elf_start;
-        file->size = (unsigned long)(_binary_build_user_builtin_fault_elf_end -
-                                     _binary_build_user_builtin_fault_elf_start);
-        file->offset = 0UL;
-        return 1;
-    }
-
-    if (fs_path_equals(path, "/bin/shared_client.elf")) {
-        file->name = "/bin/shared_client.elf";
-        file->data = _binary_build_user_external_shared_client_elf_start;
-        file->size = (unsigned long)(_binary_build_user_external_shared_client_elf_end -
-                                     _binary_build_user_external_shared_client_elf_start);
-        file->offset = 0UL;
-        return 1;
-    }
-
-    if (fs_path_equals(path, "/lib/libshared.so")) {
-        file->name = "/lib/libshared.so";
-        file->data = _binary_build_user_lib_libshared_so_start;
-        file->size = (unsigned long)(_binary_build_user_lib_libshared_so_end -
-                                     _binary_build_user_lib_libshared_so_start);
-        file->offset = 0UL;
-        return 1;
-    }
-
+    struct vnode *vn;
+    if (!vfs_lookup(path, &vn)) return 0;
+    file->name = path;
+    if (vn->ops->open(vn, file)) return 1;
     return 0;
 }
 
 unsigned long fs_read(struct file *file, void *dst, unsigned long len)
 {
-    unsigned char *out;
-    unsigned long remaining;
-    unsigned long count;
-    unsigned long index;
-
-    if (file == (struct file *)0 || dst == (void *)0 || len == 0UL) {
-        return 0UL;
-    }
-
-    if (file->offset >= file->size) {
-        return 0UL;
-    }
-
-    remaining = file->size - file->offset;
-    count = (len < remaining) ? len : remaining;
-    out = (unsigned char *)dst;
-    for (index = 0UL; index < count; index++) {
-        out[index] = file->data[file->offset + index];
-    }
-
-    file->offset += count;
-    return count;
+    if (!file || !file->vn) return 0;
+    return file->vn->ops->read(file->vn, file, dst, len);
 }
 
 void fs_close(struct file *file)
 {
-    if (file == (struct file *)0) {
-        return;
-    }
-
-    file->name = (const char *)0;
-    file->data = (const unsigned char *)0;
-    file->size = 0UL;
-    file->offset = 0UL;
+    if (!file || !file->vn) return;
+    file->vn->ops->close(file->vn, file);
+    kfree(file->vn);
+    file->vn = (struct vnode *)0;
 }
 
+#ifdef CONFIG_KERNEL_VIRTUAL
 int fs_register_file(const char *path, unsigned char *data, unsigned long size)
 {
-    struct dynamic_ramfs_node *node;
-
-    if (path == (const char *)0 || data == (unsigned char *)0 || size == 0UL) {
-        return 0;
-    }
-
-    node = fs_find_dynamic_node(path);
-    if (node == (struct dynamic_ramfs_node *)0) {
-        node = fs_find_free_dynamic_node();
-        if (node == (struct dynamic_ramfs_node *)0) {
-            return 0;
-        }
-
-        if (!fs_copy_path(node->path, path)) {
-            return 0;
-        }
-    } else if (node->data != (unsigned char *)0) {
-        kfree(node->data);
-    }
-
-    node->in_use = 1;
-    node->data = data;
-    node->size = size;
-    return 1;
+    return ramfs_register_file(path, data, size);
 }
 
 int fs_unregister_file(const char *path)
 {
-    struct dynamic_ramfs_node *node;
+    return ramfs_unregister_file(path);
+}
 
-    if (path == (const char *)0) {
-        return 0;
-    }
-
-    node = fs_find_dynamic_node(path);
-    if (node == (struct dynamic_ramfs_node *)0) {
-        return 0;
-    }
-
-    if (node->data != (unsigned char *)0) {
-        kfree(node->data);
-    }
-
-    node->in_use = 0;
-    node->path[0] = '\0';
-    node->data = (unsigned char *)0;
-    node->size = 0UL;
-    return 1;
+void fs_init(void)
+{
+    vfs_init();
+    ramfs_init();
+    vfs_mount("/", "ramfs", (void *)0);
 }
 #else
-void fs_init(void)
-{
-}
-
-int fs_open(const char *path, struct file *file)
-{
-    (void)path;
-    (void)file;
-    return 0;
-}
-
-unsigned long fs_read(struct file *file, void *dst, unsigned long len)
-{
-    (void)file;
-    (void)dst;
-    (void)len;
-    return 0UL;
-}
-
-void fs_close(struct file *file)
-{
-    (void)file;
-}
-
-int fs_register_file(const char *path, unsigned char *data, unsigned long size)
-{
-    (void)path;
-    (void)data;
-    (void)size;
-    return 0;
-}
-
-int fs_unregister_file(const char *path)
-{
-    (void)path;
-    return 0;
-}
+int fs_register_file(const char *path, unsigned char *data, unsigned long size) { return 0; }
+int fs_unregister_file(const char *path) { return 0; }
+void fs_init(void) {}
 #endif

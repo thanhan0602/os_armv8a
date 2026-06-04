@@ -1,8 +1,11 @@
 #include <kernel/boot.h>
 #include <kernel/debug_targets.h>
 #include <kernel/exception.h>
+#include <kernel/device_tree.h>
+#include <kernel/driver.h>
 #include <kernel/fs.h>
 #include <kernel/heap.h>
+#include <kernel/ipc.h>
 #include <kernel/loader.h>
 #include <kernel/log.h>
 #include <kernel/mmu.h>
@@ -52,13 +55,21 @@ static void kernel_start_stage10_demos(void)
  * Initialises logging, exceptions, the page allocator, and the MMU.
  * Returns to start.S so it can switch execution to the kernel VA.
  */
-void kernel_main_early(void)
+void kernel_main_early(unsigned long boot_fdt_pa)
 {
     boot_stage = 6;
 
     log_init();
     exception_init();
     page_allocator_init();
+    if (device_tree_init(boot_fdt_pa)) {
+        KER_LOGF("[boot] dtb pa=%lx size=%lu\n",
+                 device_tree_blob_pa(),
+                 device_tree_blob_size());
+    } else {
+        KER_INFO("[boot] no valid dtb supplied");
+    }
+    driver_system_init();
 
     /*
      * MMU bring-up programs MAIR_EL1, TCR_EL1, TTBR0_EL1, TTBR1_EL1,
@@ -86,13 +97,14 @@ void kernel_main(void)
 
     kernel_heap_init();
     fs_init();
+    ipc_init();
 
-    timer_init();
     sched_init();
 #if defined(CONFIG_KERNEL_VIRTUAL) && defined(CONFIG_RUN_OS_DEMOS)
     kernel_start_stage10_demos();
 #endif
     KER_INFO("kernel init complete");
+    driver_system_dump();
     shell_init();
 
     while (1) {

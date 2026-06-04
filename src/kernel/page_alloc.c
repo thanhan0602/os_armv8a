@@ -175,6 +175,9 @@ void page_allocator_init(void)
     managed_end = ram_end;
     reserved_bytes = managed_start - QEMU_VIRT_RAM_BASE;
 
+    KER_LOGF("[info] page_alloc init: image_end_raw=%lx image_end_aligned=%lx ram_end=%lx\n",
+             (unsigned long)__kernel_end, managed_start, managed_end);
+
     page_free_list_pa = 0UL;
     total_pages = 0UL;
     free_pages = 0UL;
@@ -200,6 +203,8 @@ void page_allocator_init(void)
         free_pages++;
     }
 
+    KER_LOGF("[info] page_alloc init: managed_start=%lx managed_end=%lx total_pages=%lu\n",
+             managed_start, managed_end, total_pages);
 }
 
 void *page_alloc(void)

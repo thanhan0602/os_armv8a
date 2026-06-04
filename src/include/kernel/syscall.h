@@ -11,6 +11,8 @@
 #define SYS_EXIT    93UL
 #define SYS_YIELD   124UL
 #define SYS_BRK     214UL
+#define SYS_IPC_SEND  451UL
+#define SYS_IPC_RECV  452UL
 
 /*
  * Dispatch a syscall from EL0.

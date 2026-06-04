@@ -32,7 +32,6 @@ static void timer_program_next_tick(void)
 
 void timer_init(void)
 {
-    gicv2_init();
     gicv2_enable_irq(TIMER_PPI);
 
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(timer_frequency));

@@ -67,6 +67,7 @@ static void exception_dump_registers(const struct exception_context *context)
 
     KER_LOGF("[fault] SP_EL1(ex-entry)=%lx\n",
              (unsigned long)context + EXCEPTION_CONTEXT_SIZE);
+    KER_LOGF("[fault] SP_EL0=%lx\n", context->sp_el0);
     KER_LOGF("[fault] FPCR=%lx FPSR=%lx\n", context->fpcr, context->fpsr);
 }
 

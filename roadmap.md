@@ -265,6 +265,20 @@ Current behavior:
 - Kernel still boots and logs correctly in quiet-boot mode
 - `RUN_OS_DEMOS=1` runtime verify still shows Stage 10 user/syscall/fault traces after the logger moved under the new spinlock
 
+Implemented (second increment — fixed IPC channels + blocking receive):
+- Added `src/include/kernel/ipc.h` and `src/kernel/ipc.c` with fixed global channels (`IPC_CHANNEL_MAX=8`) and one-message mailboxes (`IPC_MESSAGE_MAX=64`)
+- Added `ipc_send()` and `ipc_receive()`; `recv` blocks by marking the current task `TASK_STATE_BLOCKED`, and `send` wakes a waiting receiver when a message arrives
+- Scheduler now has `TASK_STATE_BLOCKED`, `sched_block_task()`, and `sched_wake_task()` so Stage 11 can suspend and resume tasks cleanly instead of spinning in the syscall layer
+- Added `ipc_detach_task()` so a killed/reaped task is removed from channel wait state before its task slot and process resources are freed
+- Added user-visible syscalls `SYS_IPC_SEND=451` and `SYS_IPC_RECV=452`, plus user wrappers `user_ipc_send()` / `user_ipc_recv()`
+- Added built-in user demos `/bin/ipc_recv.elf` and `/bin/ipc_send.elf` for shell-driven validation
+- While validating this increment, fixed a latent exception-frame bug by saving/restoring `SP_EL0` in addition to `ELR_EL1` and `SPSR_EL1`; this is required when a user task blocks inside a syscall and later resumes at EL0 with live stack locals
+
+Current behavior:
+- Loading `/bin/ipc_recv.elf` then `/bin/ipc_send.elf` from the shell delivers `hello from ipc_send\n` over channel `1`
+- The receiver sleeps inside `SYS_IPC_RECV` until the sender posts a message, then resumes and exits cleanly
+- Both IPC demo tasks now exit without the post-wakeup EL0 stack corruption that existed before `SP_EL0` was preserved across task switches
+
 ### Stage 12: Filesystem And Program Loading
 
 Status: in progress
@@ -326,9 +340,11 @@ Implemented (fifth increment — ASID support):
 3. ~~Stage 10 increment 6: user page tracking + unmap on exit.~~ ✅ Done.
 4. ~~Stage 10 increment 7: multi-page code mapping.~~ ✅ Done.
 5. ~~Stage 12 increment 2: define executable file format boundary clearly, starting with either a small flat-header format or a minimal ELF loader.~~ ✅ Done.
-6. Stage 12 increment 3: add a real init-style launch path so the kernel boots one named program from the filesystem instead of hardcoding demo pairs in `main.c`.
-7. Stage 13 increment 2: replace raw hex `receive` with a host-assisted upload path or a framed protocol so large external programs are less fragile over UART.
-8. User runtime increment 1: add a tiny libc surface for argv/env-style startup or reusable printing/string helpers beyond the current syscall wrappers.
+6. Stage 11 increment 3: add a real wait-queue abstraction or multi-waiter channel queue so IPC is no longer limited to one blocked receiver per channel.
+7. Stage 11 increment 4: decide whether the next IPC surface is pipe/stream semantics, request/reply, or `waitpid`-style lifecycle events for the future process manager.
+8. Stage 12 increment 3: add a real init-style launch path so the kernel boots one named program from the filesystem instead of hardcoding demo pairs in `main.c`.
+9. Stage 13 increment 2: replace raw hex `receive` with a host-assisted upload path or a framed protocol so large external programs are less fragile over UART.
+10. User runtime increment 1: add a tiny libc surface for argv/env-style startup or reusable printing/string helpers beyond the current syscall wrappers.
 
 ### Stage 13: Console Shell
 

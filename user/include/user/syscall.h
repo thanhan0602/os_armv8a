@@ -5,6 +5,10 @@
 #define USER_SYS_EXIT   93UL
 #define USER_SYS_YIELD  124UL
 #define USER_SYS_BRK    214UL
+#define USER_SYS_IPC_SEND  451UL
+#define USER_SYS_IPC_RECV  452UL
+
+#define USER_IPC_MESSAGE_MAX  64UL
 
 static inline long user_syscall0(unsigned long nr)
 {
@@ -71,6 +75,16 @@ static inline long user_exit(unsigned long code)
 static inline unsigned long user_brk(unsigned long new_break)
 {
     return (unsigned long)user_syscall1(USER_SYS_BRK, new_break);
+}
+
+static inline long user_ipc_send(unsigned long channel_id, const void *buf, unsigned long len)
+{
+    return user_syscall3(USER_SYS_IPC_SEND, channel_id, (unsigned long)buf, len);
+}
+
+static inline long user_ipc_recv(unsigned long channel_id, void *buf, unsigned long capacity)
+{
+    return user_syscall3(USER_SYS_IPC_RECV, channel_id, (unsigned long)buf, capacity);
 }
 
 static inline unsigned long user_strlen(const char *text)

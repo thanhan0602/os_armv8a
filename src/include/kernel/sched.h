@@ -29,7 +29,8 @@ struct task_context {
 
 #define TASK_STATE_RUNNING  0UL
 #define TASK_STATE_READY    1UL
-#define TASK_STATE_DEAD     2UL
+#define TASK_STATE_BLOCKED  2UL
+#define TASK_STATE_DEAD     3UL
 
 #define TASK_GUARD_PAGES    1UL
 #define TASK_STACK_PAGES    1UL
@@ -64,6 +65,8 @@ struct task *task_create_user(struct process *process,
 void schedule(void);
 void task_exit(void);
 struct task *sched_current(void);
+void sched_block_task(struct task *task);
+void sched_wake_task(struct task *task);
 void sched_dump_tasks(void);
 int sched_kill_task(unsigned long task_id);
 

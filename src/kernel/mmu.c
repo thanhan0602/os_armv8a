@@ -2,6 +2,7 @@
 
 #include <arch/arm/virt.h>
 #include <kernel/debug_targets.h>
+#include <kernel/mmu_debug.h>
 #include <kernel/heap.h>
 #include <kernel/log.h>
 #include <kernel/page_alloc.h>
@@ -95,10 +96,7 @@
 static unsigned long *l0_table;
 static unsigned long *l1_table;
 static unsigned long *l2_ram_table;
-static unsigned long mmu_table_page_addresses[MMU_DEBUG_MAX_TABLE_PAGES];
-static char mmu_table_page_names[MMU_DEBUG_MAX_TABLE_PAGES][MMU_DEBUG_MAX_TABLE_NAME_LEN];
-static unsigned long mmu_table_page_count;
-static unsigned long table_pages_used;
+/* mmu debug table-page inventory moved to src/kernel/mmu_debug.c */
 static int mmu_enabled;
 static unsigned long fine_map_chunks_used;
 
@@ -124,19 +122,7 @@ extern char __stack_guard[];
 extern char __stack_guard_end[];
 extern char __kernel_end[];
 
-struct mmu_debug_target {
-    const char *name;
-    unsigned long address;
-};
-
-static const struct mmu_debug_target mmu_boot_debug_targets[] = {
-    { "vector", MMU_DEBUG_VECTOR_PAGE },
-    { "sync", MMU_DEBUG_SYNC_PAGE },
-    { "mmu", MMU_DEBUG_MMU_PAGE },
-    { "bss", (unsigned long)__bss_start },
-    { "stack", (unsigned long)__stack_bottom },
-    { "block", MMU_DEBUG_BLOCK_PAGE },
-};
+/* mmu boot debug targets moved to src/kernel/mmu_debug.c */
 
 static unsigned long l0_index_for(unsigned long address)
 {
@@ -163,66 +149,7 @@ static unsigned long align_up(unsigned long value, unsigned long alignment)
     return (value + alignment - 1UL) & ~(alignment - 1UL);
 }
 
-static void mmu_debug_copy_name(char *destination, const char *source)
-{
-    unsigned long index;
-
-    for (index = 0UL; index < (MMU_DEBUG_MAX_TABLE_NAME_LEN - 1UL) && source[index] != '\0'; index++) {
-        destination[index] = source[index];
-    }
-    destination[index] = '\0';
-}
-
-static int mmu_debug_name_has_prefix(const char *name, const char *prefix)
-{
-    unsigned long index;
-
-    for (index = 0UL; prefix[index] != '\0'; index++) {
-        if (name[index] != prefix[index]) {
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-static void mmu_debug_record_table_page(unsigned long address, const char *name)
-{
-    if (mmu_table_page_count >= MMU_DEBUG_MAX_TABLE_PAGES) {
-        return;
-    }
-
-    mmu_table_page_addresses[mmu_table_page_count] = address;
-    mmu_debug_copy_name(mmu_table_page_names[mmu_table_page_count], name);
-    mmu_table_page_count++;
-}
-
-static void mmu_debug_set_chunk_name(char *destination, const char *prefix, unsigned long chunk_index)
-{
-    char digits[21];
-    unsigned long digit_count;
-    unsigned long value;
-    unsigned long index;
-    unsigned long output_index;
-
-    value = chunk_index;
-    digit_count = 0UL;
-    do {
-        digits[digit_count++] = (char)('0' + (value % 10UL));
-        value /= 10UL;
-    } while (value != 0UL && digit_count < sizeof(digits));
-
-    output_index = 0UL;
-    for (index = 0UL; prefix[index] != '\0' && output_index < (MMU_DEBUG_MAX_TABLE_NAME_LEN - 1UL); index++) {
-        destination[output_index++] = prefix[index];
-    }
-
-    while (digit_count > 0UL && output_index < (MMU_DEBUG_MAX_TABLE_NAME_LEN - 1UL)) {
-        destination[output_index++] = digits[--digit_count];
-    }
-
-    destination[output_index] = '\0';
-}
+/* mmu debug helpers moved to src/kernel/mmu_debug.c */
 
 static unsigned long *alloc_named_table_page(const char *name)
 {
@@ -231,44 +158,12 @@ static unsigned long *alloc_named_table_page(const char *name)
     table = (unsigned long *)page_alloc();
     if (table != (unsigned long *)0) {
         mmu_debug_record_table_page((unsigned long)table, name);
-        table_pages_used++;
     }
 
     return table;
 }
 
-static const char *mmu_region_name(unsigned long address)
-{
-    if (address >= (unsigned long)__text_start && address < (unsigned long)__text_end) {
-        return ".text";
-    }
-
-    if (address >= (unsigned long)__rodata_start && address < (unsigned long)__rodata_end) {
-        return ".rodata";
-    }
-
-    if (address >= (unsigned long)__data_start && address < (unsigned long)__data_end) {
-        return ".data";
-    }
-
-    if (address >= (unsigned long)__stack_guard && address < (unsigned long)__stack_guard_end) {
-        return "stack-guard";
-    }
-
-    if (address >= (unsigned long)__stack_bottom && address < (unsigned long)__stack_top) {
-        return "boot-stack";
-    }
-
-    if (address >= (unsigned long)__bss_start && address < (unsigned long)__bss_end) {
-        return ".bss";
-    }
-
-    if (address >= QEMU_VIRT_RAM_BASE && address < QEMU_VIRT_RAM_END) {
-        return "ram-other";
-    }
-
-    return "mmio-or-unmapped";
-}
+/* mmu_region_name moved to src/kernel/mmu_debug.c */
 
 /*
  * The fine-mapped kernel region is split by linker sections so we can keep
@@ -276,19 +171,21 @@ static const char *mmu_region_name(unsigned long address)
  */
 static unsigned long kernel_page_attrs(unsigned long address)
 {
+    unsigned long va = (unsigned long)pa_to_va(address);
+
     /* Guard page: intentionally unmapped to catch stack overflow. */
-    if (address >= (unsigned long)__stack_guard && address < (unsigned long)__stack_guard_end) {
+    if (va >= (unsigned long)__stack_guard && va < (unsigned long)__stack_guard_end) {
         return 0;
     }
 
-    if (address >= (unsigned long)__text_start && address < (unsigned long)__text_end) {
+    if (va >= (unsigned long)__text_start && va < (unsigned long)__text_end) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RO |
                MMU_SH_INNER_SHAREABLE |
                MMU_AF;
     }
 
-    if (address >= (unsigned long)__rodata_start && address < (unsigned long)__rodata_end) {
+    if (va >= (unsigned long)__rodata_start && va < (unsigned long)__rodata_end) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RO |
                MMU_SH_INNER_SHAREABLE |
@@ -297,7 +194,7 @@ static unsigned long kernel_page_attrs(unsigned long address)
                MMU_UXN;
     }
 
-    if (address >= (unsigned long)__data_start && address < (unsigned long)__data_end) {
+    if (va >= (unsigned long)__data_start && va < (unsigned long)__data_end) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RW |
                MMU_SH_INNER_SHAREABLE |
@@ -306,7 +203,7 @@ static unsigned long kernel_page_attrs(unsigned long address)
                MMU_UXN;
     }
 
-    if (address >= (unsigned long)__bss_start && address < (unsigned long)__bss_end) {
+    if (va >= (unsigned long)__bss_start && va < (unsigned long)__bss_end) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RW |
                MMU_SH_INNER_SHAREABLE |
@@ -315,7 +212,7 @@ static unsigned long kernel_page_attrs(unsigned long address)
                MMU_UXN;
     }
 
-    if (address >= (unsigned long)__stack_bottom && address < (unsigned long)__stack_top) {
+    if (va >= (unsigned long)__stack_bottom && va < (unsigned long)__stack_top) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RW |
                MMU_SH_INNER_SHAREABLE |
@@ -332,274 +229,8 @@ static unsigned long kernel_page_attrs(unsigned long address)
            MMU_UXN;
 }
 
-#if MMU_USE_4LEVEL && MMU_DEBUG_WALK_ENABLED
-static void mmu_debug_print_index(const char *level_name, unsigned long index)
-{
-    KER_LOGF("[info] %s index=%lu\n", level_name, index);
-}
-
-static void mmu_debug_print_entry(const char *level_name, unsigned long entry)
-{
-    KER_LOGF("[info] %s entry=%lx\n", level_name, entry);
-}
-
-static void mmu_debug_print_leaf_attrs(unsigned long address, unsigned long entry)
-{
-    const char *mem_kind;
-    const char *ap_kind;
-    const char *exec_kind;
-    const char *share_kind;
-    const char *af_kind;
-
-    if ((entry & MMU_ATTR_INDEX_MASK) == MMU_ATTR_DEVICE) {
-        mem_kind = "device";
-    } else if ((entry & MMU_ATTR_INDEX_MASK) == MMU_ATTR_NORMAL) {
-        mem_kind = "normal";
-    } else {
-        mem_kind = "unknown";
-    }
-
-    if ((entry & MMU_AP_RO) == MMU_AP_RO) {
-        ap_kind = "ro";
-    } else {
-        ap_kind = "rw";
-    }
-
-    if ((entry & MMU_PXN) != 0) {
-        exec_kind = "nx";
-    } else {
-        exec_kind = "x";
-    }
-
-    if ((entry & MMU_SH_INNER_SHAREABLE) == MMU_SH_INNER_SHAREABLE) {
-        share_kind = "inner";
-    } else {
-        share_kind = "non";
-    }
-
-    if ((entry & MMU_AF) != 0) {
-        af_kind = "1";
-    } else {
-        af_kind = "0";
-    }
-
-    KER_LOGF("[info] walk attrs: mem=%s ap=%s exec=%s sh=%s af=%s section=%s\n",
-             mem_kind,
-             ap_kind,
-             exec_kind,
-             share_kind,
-             af_kind,
-             mmu_region_name(address));
-}
-
-static void mmu_debug_print_desc_kind(const char *level_name, const char *kind)
-{
-    KER_LOGF("[info] %s type=%s\n", level_name, kind);
-}
-
-/*
- * Software walk helper for bring-up: it follows the page-table pointers we just
- * built in RAM and prints where translation stops. Descriptor addresses are always
- * physical. Before the MMU is enabled we dereference them directly; after, we
- * access them through the TTBR1 kernel VA.
- */
-static unsigned long *desc_pa_to_table(unsigned long pa)
-{
-    if (mmu_enabled) {
-        return (unsigned long *)pa_to_va(pa);
-    }
-
-    return (unsigned long *)pa;
-}
-
-static unsigned long *mmu_root_table_for_walk(void)
-{
-    if (l0_table == (unsigned long *)0) {
-        return (unsigned long *)0;
-    }
-
-    return desc_pa_to_table((unsigned long)l0_table);
-}
-
-static void mmu_debug_walk(unsigned long address)
-{
-    unsigned long l0_index;
-    unsigned long l1_index;
-    unsigned long l2_index;
-    unsigned long l3_index;
-    unsigned long l0_entry;
-    unsigned long l1_entry;
-    unsigned long l2_entry;
-    unsigned long l3_entry;
-    unsigned long *l0_walk_table;
-    unsigned long *l1_walk_table;
-    unsigned long *l2_walk_table;
-    unsigned long *l3_walk_table;
-    unsigned long pa;
-
-    KER_LOGF("[info] walk va=%lx\n", address);
-    KER_LOGF("[info] walk region=%s\n", mmu_region_name(address));
-
-    l0_walk_table = mmu_root_table_for_walk();
-    if (l0_walk_table == (unsigned long *)0) {
-        KER_INFO("walk unavailable: no active ttbr0 root");
-        return;
-    }
-
-    l0_index = l0_index_for(address);
-    l0_entry = l0_walk_table[l0_index];
-    mmu_debug_print_index("walk l0", l0_index);
-    mmu_debug_print_entry("walk l0", l0_entry);
-    if ((l0_entry & MMU_DESC_VALID) == 0) {
-        mmu_debug_print_desc_kind("walk l0", "invalid");
-        KER_INFO("walk stopped: invalid l0 entry");
-        return;
-    }
-    mmu_debug_print_desc_kind("walk l0", "table");
-
-    l1_walk_table = desc_pa_to_table(l0_entry & MMU_DESC_ADDR_MASK);
-    l1_index = l1_index_for(address);
-    l1_entry = l1_walk_table[l1_index];
-    mmu_debug_print_index("walk l1", l1_index);
-    mmu_debug_print_entry("walk l1", l1_entry);
-    if ((l1_entry & MMU_DESC_VALID) == 0) {
-        mmu_debug_print_desc_kind("walk l1", "invalid");
-        KER_INFO("walk stopped: invalid l1 entry");
-        return;
-    }
-
-    if ((l1_entry & MMU_DESC_TYPE_MASK) == MMU_DESC_BLOCK) {
-        mmu_debug_print_desc_kind("walk l1", "block");
-        mmu_debug_print_leaf_attrs(address, l1_entry);
-        pa = (l1_entry & MMU_L1_BLOCK_ADDR_MASK) | (address & (MMU_L1_BLOCK_SIZE - 1UL));
-        KER_LOGF("[info] walk pa from l1 block=%lx\n", pa);
-        return;
-    }
-    mmu_debug_print_desc_kind("walk l1", "table");
-
-    l2_walk_table = desc_pa_to_table(l1_entry & MMU_DESC_ADDR_MASK);
-    l2_index = l2_index_for(address);
-    l2_entry = l2_walk_table[l2_index];
-    mmu_debug_print_index("walk l2", l2_index);
-    mmu_debug_print_entry("walk l2", l2_entry);
-    if ((l2_entry & MMU_DESC_VALID) == 0) {
-        mmu_debug_print_desc_kind("walk l2", "invalid");
-        KER_INFO("walk stopped: invalid l2 entry");
-        return;
-    }
-
-    if ((l2_entry & MMU_DESC_TYPE_MASK) == MMU_DESC_BLOCK) {
-        mmu_debug_print_desc_kind("walk l2", "block");
-        mmu_debug_print_leaf_attrs(address, l2_entry);
-        pa = (l2_entry & MMU_L2_BLOCK_ADDR_MASK) | (address & (MMU_L2_BLOCK_SIZE - 1UL));
-        KER_LOGF("[info] walk pa from l2 block=%lx\n", pa);
-        return;
-    }
-    mmu_debug_print_desc_kind("walk l2", "table");
-
-    l3_walk_table = desc_pa_to_table(l2_entry & MMU_DESC_ADDR_MASK);
-    l3_index = l3_index_for(address);
-    l3_entry = l3_walk_table[l3_index];
-    mmu_debug_print_index("walk l3", l3_index);
-    mmu_debug_print_entry("walk l3", l3_entry);
-    if ((l3_entry & MMU_DESC_VALID) == 0) {
-        mmu_debug_print_desc_kind("walk l3", "invalid");
-        KER_INFO("walk stopped: invalid l3 entry");
-        return;
-    }
-
-    mmu_debug_print_desc_kind("walk l3", "page");
-    mmu_debug_print_leaf_attrs(address, l3_entry);
-    pa = (l3_entry & MMU_L3_PAGE_ADDR_MASK) | (address & (PAGE_SIZE - 1UL));
-    KER_LOGF("[info] walk pa from l3 page=%lx\n", pa);
-}
-
-static unsigned long mmu_probe_translate(unsigned long address)
-{
-    unsigned long par_el1;
-
-    __asm__ volatile(
-        "at s1e1r, %1\n"
-        "isb\n"
-        "mrs %0, par_el1\n"
-        : "=r"(par_el1)
-        : "r"(address)
-        : "memory");
-
-    return par_el1;
-}
-#endif
-
-void mmu_debug_walk_address(unsigned long address)
-{
-#if MMU_USE_4LEVEL && MMU_DEBUG_WALK_ENABLED
-    if (l0_table == (unsigned long *)0) {
-        KER_INFO("walk unavailable: mmu tables not initialized");
-        return;
-    }
-
-    mmu_debug_walk(address);
-#else
-    (void)address;
-    KER_INFO("walk unavailable: MMU debug walk disabled at build time");
-#endif
-}
-
-unsigned long mmu_debug_probe_address(unsigned long address)
-{
-#if MMU_USE_4LEVEL
-    return mmu_probe_translate(address);
-#else
-    (void)address;
-    return ~0UL;
-#endif
-}
-
-unsigned long mmu_debug_boot_target_count(void)
-{
-    return sizeof(mmu_boot_debug_targets) / sizeof(mmu_boot_debug_targets[0]);
-}
-
-const char *mmu_debug_boot_target_name(unsigned long index)
-{
-    if (index >= mmu_debug_boot_target_count()) {
-        return "mmu-boot-target-invalid";
-    }
-
-    return mmu_boot_debug_targets[index].name;
-}
-
-unsigned long mmu_debug_boot_target_address(unsigned long index)
-{
-    if (index >= mmu_debug_boot_target_count()) {
-        return 0UL;
-    }
-
-    return mmu_boot_debug_targets[index].address;
-}
-
-unsigned long mmu_debug_table_page_count(void)
-{
-    return mmu_table_page_count;
-}
-
-unsigned long mmu_debug_table_page_address(unsigned long index)
-{
-    if (index >= mmu_table_page_count) {
-        return 0UL;
-    }
-
-    return mmu_table_page_addresses[index];
-}
-
-const char *mmu_debug_table_page_name(unsigned long index)
-{
-    if (index >= mmu_table_page_count) {
-        return "mmu-table-invalid";
-    }
-
-    return mmu_table_page_names[index];
-}
+/* MMU debug print helpers moved to src/kernel/mmu_debug.c */
+/* mmu_debug_* helpers moved to src/kernel/mmu_debug.c */
 
 static int build_identity_map(void)
 {
@@ -651,7 +282,7 @@ static int build_identity_map(void)
      */
     l1_table[l1_index_for(QEMU_VIRT_RAM_BASE)] = ((unsigned long)l2_ram_table) | MMU_DESC_TABLE;
 
-    kernel_map_end = align_up((unsigned long)__kernel_end, MMU_L2_BLOCK_SIZE);
+    kernel_map_end = align_up((unsigned long)va_to_pa(__kernel_end), MMU_L2_BLOCK_SIZE);
     minimum_map_end = QEMU_VIRT_RAM_BASE + (MMU_KERNEL_FINE_MAP_MIN_CHUNKS * MMU_L2_BLOCK_SIZE);
     fine_map_end = kernel_map_end;
     if (fine_map_end < minimum_map_end) {
@@ -673,8 +304,7 @@ static int build_identity_map(void)
         unsigned long chunk_index;
 
         chunk_index = (chunk_base - QEMU_VIRT_RAM_BASE) / MMU_L2_BLOCK_SIZE;
-        mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], "l3-chunk-", chunk_index);
-        l3_table = alloc_named_table_page(mmu_table_page_names[mmu_table_page_count]);
+        l3_table = mmu_debug_alloc_named_table_page_chunk("l3-chunk-", chunk_index);
         if (l3_table == (unsigned long *)0) {
             KER_INFO("mmu init failed: no free pages for l3 table");
             return 0;
@@ -742,7 +372,7 @@ static int build_kernel_map(void)
 
     l1_table_ttbr1[l1_index_for(QEMU_VIRT_RAM_BASE)] = ((unsigned long)l2_ram_table_ttbr1) | MMU_DESC_TABLE;
 
-    kernel_map_end = align_up((unsigned long)__kernel_end, MMU_L2_BLOCK_SIZE);
+    kernel_map_end = align_up((unsigned long)va_to_pa(__kernel_end), MMU_L2_BLOCK_SIZE);
     minimum_map_end = QEMU_VIRT_RAM_BASE + (MMU_KERNEL_FINE_MAP_MIN_CHUNKS * MMU_L2_BLOCK_SIZE);
     fine_map_end = kernel_map_end;
     if (fine_map_end < minimum_map_end) {
@@ -754,8 +384,7 @@ static int build_kernel_map(void)
         unsigned long chunk_index;
 
         chunk_index = (chunk_base - QEMU_VIRT_RAM_BASE) / MMU_L2_BLOCK_SIZE;
-        mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], "t1-l3-chunk-", chunk_index);
-        l3_table = alloc_named_table_page(mmu_table_page_names[mmu_table_page_count]);
+        l3_table = mmu_debug_alloc_named_table_page_chunk("t1-l3-chunk-", chunk_index);
         if (l3_table == (unsigned long *)0) {
             KER_INFO("mmu init failed: no free pages for t1 l3 table");
             return 0;
@@ -799,7 +428,7 @@ void mmu_init(void)
         return;
     }
 
-    mmu_table_page_count = 0UL;
+    mmu_debug_reset();
 
     l0_table = alloc_named_table_page("l0-root");
     l1_table = alloc_named_table_page("l1-root");
@@ -931,17 +560,16 @@ int mmu_is_enabled(void)
     return mmu_enabled;
 }
 
-unsigned long mmu_table_pages_used(void)
+/* mmu_table_pages_used implemented in src/kernel/mmu_debug.c */
+unsigned long *mmu_debug_ttbr0_root(void)
 {
-    return table_pages_used;
+    return l0_table;
 }
 
 #ifdef CONFIG_KERNEL_VIRTUAL
 void mmu_install_empty_ttbr0_root(void)
 {
     unsigned long *new_root;
-    unsigned long read_index;
-    unsigned long write_index;
 
     if (!mmu_enabled) {
         return;
@@ -972,27 +600,7 @@ void mmu_install_empty_ttbr0_root(void)
     l1_table = (unsigned long *)0;
     l2_ram_table = (unsigned long *)0;
 
-    write_index = 0UL;
-    for (read_index = 0UL; read_index < mmu_table_page_count; read_index++) {
-        const char *name;
-
-        name = mmu_table_page_names[read_index];
-        if (mmu_debug_name_has_prefix(name, "t1-")) {
-            if (write_index != read_index) {
-                mmu_table_page_addresses[write_index] = mmu_table_page_addresses[read_index];
-                mmu_debug_copy_name(mmu_table_page_names[write_index], name);
-            }
-            write_index++;
-            continue;
-        }
-
-        page_free((void *)mmu_table_page_addresses[read_index]);
-        table_pages_used--;
-    }
-
-    mmu_table_page_count = write_index;
-    mmu_debug_record_table_page((unsigned long)new_root, "t0-empty-root");
-    table_pages_used++;
+    mmu_debug_compact_for_ttbr0_install((unsigned long)new_root);
 
 }
 

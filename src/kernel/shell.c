@@ -262,6 +262,9 @@ static void shell_finish_upload(int success)
     shell_reset_upload_state();
     if (success) {
         KER_LOGF("[shell] received %s size=%lu\n", path, size);
+        if (buffer != (unsigned char *)0) {
+            kfree(buffer);
+        }
     } else if (buffer != (unsigned char *)0) {
         kfree(buffer);
         log_write("[shell] receive aborted\n");

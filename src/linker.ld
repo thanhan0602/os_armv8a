@@ -32,21 +32,14 @@ PHDRS
 SECTIONS
 {
     /*
-     * VMA stays at the physical load address so that initialised pointer
-     * data (.rodata struct arrays with const char* members, function
-     * pointer tables, etc.) contain PAs that can be safely dereferenced
-     * before the MMU is turned on.
-     *
-     * The VA trampoline in start.S computes the high kernel VA at
-     * runtime: VA = PA + KERNEL_VA_OFFSET.  Once the full kernel virtual
-     * layout is mature, a VMA=VA linker split (with AT() for LMA) can
-     * replace this scheme; that requires moving page-table setup into
-     * assembly so the MMU is active before any C pointer-in-data access.
+     * VMA is now at the high kernel virtual address.
+     * LMAs are kept at the physical load address using AT() so QEMU
+     * can load the binary correctly.
      */
-    . = KERNEL_LMA_BASE;
+    . = KERNEL_VMA_BASE;
     __kernel_start = .;
 
-    .text : ALIGN(KERNEL_PAGE_SIZE) {
+    .text : AT(ADDR(.text) - KERNEL_VA_OFFSET) ALIGN(KERNEL_PAGE_SIZE) {
         __text_start = .;
         KEEP(*(.text.boot))   /* entry point */
         . = ALIGN(2048);
@@ -55,19 +48,19 @@ SECTIONS
         __text_end = .;
     } :text
 
-    .rodata : ALIGN(KERNEL_PAGE_SIZE) {
+    .rodata : AT(ADDR(.rodata) - KERNEL_VA_OFFSET) ALIGN(KERNEL_PAGE_SIZE) {
         __rodata_start = .;
         *(.rodata*)
         __rodata_end = .;
     } :text
 
-    .data : ALIGN(KERNEL_PAGE_SIZE) {
+    .data : AT(ADDR(.data) - KERNEL_VA_OFFSET) ALIGN(KERNEL_PAGE_SIZE) {
         __data_start = .;
         *(.data*)
         __data_end = .;
     } :data
 
-    .bss (NOLOAD) : ALIGN(KERNEL_PAGE_SIZE) {
+    .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_VA_OFFSET) ALIGN(KERNEL_PAGE_SIZE) {
         __bss_start = .;
         *(.bss*)
         *(COMMON)
@@ -75,13 +68,13 @@ SECTIONS
         __bss_end = .;
     } :data
 
-    .stack_guard (NOLOAD) : ALIGN(KERNEL_PAGE_SIZE) {
+    .stack_guard (NOLOAD) : AT(ADDR(.stack_guard) - KERNEL_VA_OFFSET) ALIGN(KERNEL_PAGE_SIZE) {
         __stack_guard = .;
         . += KERNEL_PAGE_SIZE;
         __stack_guard_end = .;
     } :data
 
-    .boot_stack (NOLOAD) : ALIGN(KERNEL_PAGE_SIZE) {
+    .boot_stack (NOLOAD) : AT(ADDR(.boot_stack) - KERNEL_VA_OFFSET) ALIGN(KERNEL_PAGE_SIZE) {
         __stack_bottom = .;
         . += BOOT_STACK_SIZE;
         __stack_top = .;

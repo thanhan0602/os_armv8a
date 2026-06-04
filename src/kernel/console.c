@@ -1,10 +1,13 @@
 #include <kernel/console.h>
 
 #include <drivers/uart/pl011.h>
+#include <kernel/driver.h>
 
 void console_init(void)
 {
-    pl011_init();
+    if (!driver_uart_is_ready()) {
+        pl011_init();
+    }
 }
 
 void console_putc(char ch)

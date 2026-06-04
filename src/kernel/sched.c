@@ -1,6 +1,7 @@
 #include <kernel/sched.h>
 
 #include <kernel/log.h>
+#include <kernel/ipc.h>
 #include <kernel/mmu.h>
 #include <kernel/page_alloc.h>
 #include <kernel/process.h>
@@ -20,6 +21,9 @@ static const char *sched_state_name(unsigned long state)
     }
     if (state == TASK_STATE_READY) {
         return "ready";
+    }
+    if (state == TASK_STATE_BLOCKED) {
+        return "blocked";
     }
     if (state == TASK_STATE_DEAD) {
         return "dead";
@@ -233,6 +237,8 @@ static void sched_reap_dead(void)
         if (t->state == TASK_STATE_DEAD) {
             prev->next = t->next;
 
+            ipc_detach_task(t);
+
             if (t->stack_base != (void *)0) {
                 page_free_contiguous(
                     (void *)va_to_pa(t->stack_base),
@@ -308,6 +314,24 @@ struct task *sched_current(void)
     return current;
 }
 
+void sched_block_task(struct task *task)
+{
+    if (task == (struct task *)0 || task->id == 0UL || task->state == TASK_STATE_DEAD) {
+        return;
+    }
+
+    task->state = TASK_STATE_BLOCKED;
+}
+
+void sched_wake_task(struct task *task)
+{
+    if (task == (struct task *)0 || task->state != TASK_STATE_BLOCKED) {
+        return;
+    }
+
+    task->state = TASK_STATE_READY;
+}
+
 void sched_dump_tasks(void)
 {
     unsigned long index;
@@ -351,6 +375,7 @@ int sched_kill_task(unsigned long task_id)
             return 0;
         }
 
+        ipc_detach_task(task);
         task->state = TASK_STATE_DEAD;
         return 1;
     }
