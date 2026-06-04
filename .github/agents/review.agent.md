@@ -1,5 +1,5 @@
 ---
-name: "Code Review"
+name: "Review"
 description: "Use when reviewing code for bugs, regressions, risky assumptions, missing tests, or design issues without making edits. Keywords: review, code review, bug risk, regression, audit, inspect changes, review patch."
 tools: [read, search, execute, todo]
 argument-hint: "Describe the code, file, change, or behavior that should be reviewed."

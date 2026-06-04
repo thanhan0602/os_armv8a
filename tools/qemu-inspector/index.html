@@ -23,6 +23,11 @@
   #status-dot { width:10px; height:10px; border-radius:50%; background:var(--text-dim); flex-shrink:0; }
   #status-dot.connected    { background:var(--green); }
   #status-dot.disconnected { background:var(--red); }
+  #status-dot.connecting   { background:var(--yellow); animation:pulse 1.2s ease-in-out infinite; }
+  #gdb-dot { width:8px; height:8px; border-radius:50%; background:var(--text-dim); flex-shrink:0; }
+  #gdb-dot.connected    { background:var(--green); }
+  #gdb-dot.disconnected { background:var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
   #status-text { color:var(--text-dim); font-size:12px; }
   button { background:var(--surface2); border:1px solid var(--border); color:var(--text);
     padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; font-family:inherit; transition:background .15s; }
@@ -39,7 +44,13 @@
   .card { background:var(--surface); border:1px solid var(--border); border-radius:6px; overflow:hidden; }
   .card-header { background:var(--surface2); border-bottom:1px solid var(--border);
     padding:7px 12px; font-size:11px; font-weight:bold; text-transform:uppercase;
-    letter-spacing:.06em; color:var(--text-dim); }
+    letter-spacing:.06em; color:var(--text-dim);
+    cursor:pointer; user-select:none; display:flex; align-items:center; gap:6px; }
+  .card-header .card-chevron { font-size:9px; color:var(--text-dim); transition:transform .15s; flex-shrink:0; }
+  .card-header.collapsed .card-chevron { transform:rotate(-90deg); }
+  .card-header.collapsed { border-bottom:none; }
+  .card-collapsible { transition:none; }
+  .card-collapsible.hidden { display:none; }
   .card-body { padding:12px; }
 
   /* ── VA bit-field strip ─────────────────────────────────────────── */
@@ -203,11 +214,16 @@
   <h1>ARMv8-A Page Inspector</h1>
   <div id="status-dot"></div>
   <span id="status-text">checking…</span>
+  <div id="gdb-dot" title="GDB RSP"></div>
+  <span id="gdb-text" style="font-size:11px;color:var(--text-dim)">gdb…</span>
   <button id="btn-pause">⏸ Pause</button>
   <button id="btn-continue">▶ Continue</button>
   <div style="flex:1"></div>
   <button id="btn-sidebar" title="Toggle sidebar">◀ sidebar</button>
   <input id="walk-input" type="text" placeholder="VA e.g. 0xffff000040080000">
+  <select id="walk-task-sel" title="Optional: walk in context of a user task's TTBR0">
+    <option value="">kernel (TTBR1)</option>
+  </select>
   <button id="btn-walk">Walk VA</button>
 </div>
 
@@ -233,37 +249,96 @@
 
   <div id="right">
     <div class="card">
-      <div class="card-header">
-        Memory <button id="btn-snapshot" style="float:right;padding:1px 7px;font-size:10px;margin-top:-1px">⟳</button>
+      <div class="card-header" data-card="tasks">
+        <span class="card-chevron">▼</span>
+        <span style="flex:1">Tasks</span>
+        <button id="btn-tasks" style="padding:1px 7px;font-size:10px" onclick="event.stopPropagation()">⟳</button>
       </div>
-      <div class="card-body">
-        <div id="summary-bars">
-          <div class="sbar"><span class="sbar-num total"    id="s-total">–</span><span class="sbar-label">total</span></div>
-          <div class="sbar"><span class="sbar-num used"     id="s-used">–</span><span class="sbar-label">used</span></div>
-          <div class="sbar"><span class="sbar-num free"     id="s-free">–</span><span class="sbar-label">free</span></div>
-          <div class="sbar"><span class="sbar-num reserved" id="s-reserved">–</span><span class="sbar-label">kernel</span></div>
+      <div class="card-collapsible">
+        <div class="card-body" id="tasks-list" style="font-size:11px"><span style="color:var(--text-dim)">Loading…</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header" data-card="gdb">
+        <span class="card-chevron">▼</span>
+        <span style="flex:1">GDB Breakpoint</span>
+      </div>
+      <div class="card-collapsible">
+        <div class="card-body" style="font-size:11px">
+          <div style="margin-bottom:6px;color:var(--text-dim);line-height:1.6">
+            Set a breakpoint at a symbol or VA, continue, then snapshot tasks when it hits.
+          </div>
+          <input id="gdb-bp-input" type="text" placeholder="symbol or 0xVA e.g. sched_reap_dead"
+                 style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 6px;font-family:monospace;font-size:11px;margin-bottom:6px">
+          <div style="display:flex;gap:6px;margin-bottom:8px">
+            <button id="btn-gdb-break-snapshot" style="flex:1">⏭ Break &amp; Snapshot</button>
+            <button id="btn-gdb-interrupt" title="Send CTRL-C to pause target">⏸ Interrupt</button>
+          </div>
+          <div id="gdb-result" style="font-size:10px;line-height:1.7;color:var(--text-dim)">
+            Result will appear here.
+          </div>
         </div>
-        <div id="ram-info" style="color:var(--text-dim);font-size:10px;margin-top:8px"></div>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-header">Kernel Symbols</div>
-      <div class="card-body" id="sym-list"><span style="color:var(--text-dim)">Loading…</span></div>
+      <div class="card-header" data-card="page-owners">
+        <span class="card-chevron">▼</span>
+        <span style="flex:1">Page Owners</span>
+        <button id="btn-page-owners" style="padding:1px 7px;font-size:10px" title="Refresh (target must be running, not GDB-halted)" onclick="event.stopPropagation()">⟳</button>
+      </div>
+      <div class="card-collapsible">
+        <div id="page-owners-list" style="padding:8px;font-size:10px;color:var(--text-dim)">Press ⟳ or use Break &amp; Snapshot to populate.</div>
+      </div>
     </div>
 
     <div class="card">
-      <div class="card-header">MAIR_EL1  —  AttrIndx</div>
-      <div class="card-body" style="font-size:11px;line-height:1.9">
-        <div><span style="color:var(--accent)">0</span>  Device-nGnRnE</div>
-        <div><span style="color:var(--accent)">1</span>  Normal Non-Cacheable</div>
-        <div><span style="color:var(--accent)">2</span>  Normal Write-Back WA</div>
-        <div><span style="color:var(--accent)">3</span>  Normal Write-Through</div>
-        <div><span style="color:var(--accent)">4</span>  Device-nGnRE</div>
-        <div style="color:var(--text-dim);font-size:10px;margin-top:6px;line-height:1.7">
-          SH[9:8]: 0=Non-sh  2=Outer  3=Inner<br>
-          AP[7:6]: 00=EL1-RW  10=EL1-RO<br>
-          UXN=1→EL0 nx  ·  PXN=1→EL1 nx
+      <div class="card-header" data-card="memory">
+        <span class="card-chevron">▼</span>
+        <span style="flex:1">Memory</span>
+        <button id="btn-snapshot" style="padding:1px 7px;font-size:10px" onclick="event.stopPropagation()">⟳</button>
+      </div>
+      <div class="card-collapsible">
+        <div class="card-body">
+          <div id="summary-bars">
+            <div class="sbar"><span class="sbar-num total"    id="s-total">–</span><span class="sbar-label">total</span></div>
+            <div class="sbar"><span class="sbar-num used"     id="s-used">–</span><span class="sbar-label">used</span></div>
+            <div class="sbar"><span class="sbar-num free"     id="s-free">–</span><span class="sbar-label">free</span></div>
+            <div class="sbar"><span class="sbar-num reserved" id="s-reserved">–</span><span class="sbar-label">kernel</span></div>
+          </div>
+          <div id="ram-info" style="color:var(--text-dim);font-size:10px;margin-top:8px"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header" data-card="symbols">
+        <span class="card-chevron">▼</span>
+        <span style="flex:1">Kernel Symbols</span>
+      </div>
+      <div class="card-collapsible">
+        <div class="card-body" id="sym-list"><span style="color:var(--text-dim)">Loading…</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header" data-card="mair">
+        <span class="card-chevron">▼</span>
+        <span style="flex:1">MAIR_EL1  —  AttrIndx</span>
+      </div>
+      <div class="card-collapsible">
+        <div class="card-body" style="font-size:11px;line-height:1.9">
+          <div><span style="color:var(--accent)">0</span>  Device-nGnRnE</div>
+          <div><span style="color:var(--accent)">1</span>  Normal Non-Cacheable</div>
+          <div><span style="color:var(--accent)">2</span>  Normal Write-Back WA</div>
+          <div><span style="color:var(--accent)">3</span>  Normal Write-Through</div>
+          <div><span style="color:var(--accent)">4</span>  Device-nGnRE</div>
+          <div style="color:var(--text-dim);font-size:10px;margin-top:6px;line-height:1.7">
+            SH[9:8]: 0=Non-sh  2=Outer  3=Inner<br>
+            AP[7:6]: 00=EL1-RW  10=EL1-RO<br>
+            UXN=1→EL0 nx  ·  PXN=1→EL1 nx
+          </div>
         </div>
       </div>
     </div>
@@ -291,6 +366,7 @@ function showCardDetail(el, idx) {
 function toast(m) { const e=document.getElementById('toast'); e.textContent=m; e.style.display='block'; clearTimeout(e._t); e._t=setTimeout(()=>{e.style.display='none';},4000); }
 async function apiGet(p)  { const r=await fetch(API+p); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 async function apiPost(p,b){ const r=await fetch(API+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+async function apiPostQuery(p,q){ const r=await fetch(API+p+(q ? `?${q}` : ''),{method:'POST'}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function bh(v)  { return '0x'+v.toString(16).toUpperCase().padStart(16,'0'); }
 
@@ -301,6 +377,14 @@ async function refreshStatus() {
     if (s.qemu==='connected') { dot.className='connected'; document.getElementById('status-text').textContent=`QEMU ${s.vm}  ·  ${s.symbols} symbols`; }
     else { dot.className='disconnected'; document.getElementById('status-text').textContent=s.error||'disconnected'; }
   } catch(e) { document.getElementById('status-dot').className='disconnected'; document.getElementById('status-text').textContent='server unreachable'; }
+  // Also refresh GDB status
+  try {
+    const g = await apiGet('/api/gdb/status');
+    const gdot = document.getElementById('gdb-dot');
+    const gtxt = document.getElementById('gdb-text');
+    if (g.gdb==='connected') { gdot.className='connected'; gtxt.textContent='gdb'; }
+    else { gdot.className='disconnected'; gtxt.textContent='gdb'; }
+  } catch(e) { /* ignore */ }
 }
 async function takeSnapshot() {
   try {
@@ -312,6 +396,35 @@ async function takeSnapshot() {
     document.getElementById('ram-info').textContent   = `Base: ${d.ram_base}  ·  ${(d.page_size/1024).toFixed(0)} KiB pages`;
   } catch(e) { toast('Snapshot failed: '+e.message); }
 }
+// ── page owners ──────────────────────────────────────────────────────────────
+const _TASK_PALETTE = ['var(--accent)','var(--green)','var(--teal)','var(--orange)','var(--pink)'];
+function renderPageOwners(owners) {
+  const el = document.getElementById('page-owners-list');
+  if (!owners || !owners.length) { el.innerHTML='<span style="color:var(--text-dim)">No user pages found.</span>'; return; }
+  const taskNames = [...new Set(owners.map(o=>o.task_name))];
+  const tc = Object.fromEntries(taskNames.map((n,i)=>[n,_TASK_PALETTE[i%_TASK_PALETTE.length]]));
+  let html='<table style="width:100%;border-collapse:collapse">';
+  html+='<tr style="color:var(--text-dim)"><th style="text-align:left">PA</th><th style="text-align:left">VA</th><th style="text-align:left">Task</th><th>AP</th><th>X</th><th style="text-align:left">Size</th></tr>';
+  for (const o of owners) {
+    const c =tc[o.task_name]||'var(--text)';
+    const ac=o.ap==='ro'?'var(--teal)':'var(--orange)';
+    const xc=o.exec==='x'?'var(--green)':'var(--text-dim)';
+    const sizeLabel = o.kind==='block' ? (o.size==='0x40000000' ? '1 GiB' : o.size==='0x200000' ? '2 MiB' : esc(o.size||'?')) : '4 KiB';
+    const sc = o.kind==='block' ? 'var(--yellow)' : 'var(--text-dim)';
+    html+=`<tr><td style="font-family:monospace;font-size:9px">${esc(o.pa)}</td><td style="font-family:monospace;font-size:9px">${esc(o.va)}</td><td style="color:${c}">${esc(o.task_name)}</td><td style="color:${ac}">${esc(o.ap)}</td><td style="color:${xc}">${esc(o.exec)}</td><td style="color:${sc};font-size:9px">${sizeLabel}</td></tr>`;
+  }
+  html+='</table>';
+  el.innerHTML=html;
+}
+async function loadPageOwners() {
+  document.getElementById('page-owners-list').innerHTML='<span style="color:var(--text-dim)">Loading…</span>';
+  try {
+    const r=await apiGet('/api/page_owners');
+    if (r.error){document.getElementById('page-owners-list').innerHTML=`<span style="color:var(--red)">${esc(r.error)}</span>`;return;}
+    renderPageOwners(r.owners);
+  } catch(e){document.getElementById('page-owners-list').innerHTML=`<span style="color:var(--red)">${esc(e.message)}</span>`;}
+}
+
 async function loadSymbols() {
   try {
     const s=await apiGet('/api/symbols'); const el=document.getElementById('sym-list');
@@ -393,16 +506,54 @@ function bitStripHtml(fields, descHex) {
   return `<div style="padding:6px 6px 2px"><div style="font-size:9px;color:var(--text-dim);margin-bottom:3px;font-family:monospace">${esc(descHex)}</div><div class="reg-strip">${cells}</div></div>`;
 }
 
+// ── tasks ────────────────────────────────────────────────────────────────────
+async function loadTasks() {
+  const tlist = document.getElementById('tasks-list');
+  const sel = document.getElementById('walk-task-sel');
+  tlist.innerHTML = '<span style="color:var(--text-dim)">Loading…</span>';
+  try {
+    const r = await apiGet('/api/tasks');
+    sel.innerHTML = '<option value="">kernel (TTBR1)</option>';
+    const STATE_COLOR = {running:'var(--green)',ready:'var(--accent)',dead:'var(--text-dim)'};
+    let html = '<table style="width:100%;border-collapse:collapse">';
+    html += '<tr style="color:var(--text-dim);font-size:10px"><th style="text-align:left">id</th><th style="text-align:left">name</th><th style="text-align:left">state</th><th style="text-align:left">TTBR0 root</th></tr>';
+    for (const t of r.tasks) {
+      const sc = STATE_COLOR[t.state] || 'var(--text-dim)';
+      const root = t.ttbr0_root_pa ? `<span style="font-family:monospace;font-size:9px">${esc(t.ttbr0_root_pa)}</span>` : '—';
+      html += `<tr><td>${t.id}</td><td>${esc(t.name)}</td><td style="color:${sc}">${esc(t.state)}</td><td>${root}</td></tr>`;
+      if (t.ttbr0_root_pa) {
+        const opt = document.createElement('option');
+        opt.value = String(t.idx);
+        opt.textContent = `[${t.idx}] ${t.name} (${t.state})`;
+        opt.dataset.rootPa = t.ttbr0_root_pa;
+        sel.appendChild(opt);
+      }
+    }
+    html += '</table>';
+    tlist.innerHTML = html;
+  } catch(e) { tlist.innerHTML = `<span style="color:var(--red)">Failed: ${esc(e.message)}</span>`; }
+}
+
 // ── walk ────────────────────────────────────────────────────────────────────
 async function walkVA() {
   _cardData = [];
   const vaStr = document.getElementById('walk-input').value.trim();
   if (!vaStr) return;
+  const sel = document.getElementById('walk-task-sel');
+  const taskIdxStr = sel.value;
+  const rootPa = sel.selectedOptions.length ? sel.selectedOptions[0].dataset.rootPa : '';
   const el  = document.getElementById('walk-result');
   const tit = document.getElementById('walk-va-title');
   el.innerHTML='<div class="walk-ph">Walking…</div>'; tit.textContent=vaStr;
   try {
-    const r = await apiPost('/api/walk', {va:vaStr});
+    let r;
+    if (rootPa) {
+      r = await apiPost('/api/walk', {va:vaStr, root_pa: rootPa});
+    } else if (taskIdxStr !== '') {
+      r = await apiPost('/api/walk_task', {va:vaStr, task_idx: parseInt(taskIdxStr, 10)});
+    } else {
+      r = await apiPost('/api/walk', {va:vaStr});
+    }
     if (r.error){ el.innerHTML=`<div style="color:var(--red);padding:12px">Error: ${esc(r.error)}</div>`; return; }
 
     const va   = BigInt(r.va);
@@ -524,12 +675,101 @@ document.getElementById('btn-sidebar').addEventListener('click',()=>{
   document.getElementById('btn-sidebar').textContent=r.classList.contains('collapsed')?'\u25ba sidebar':'\u25c4 sidebar';
 });
 document.getElementById('btn-snapshot').addEventListener('click', takeSnapshot);
+document.getElementById('btn-tasks').addEventListener('click', loadTasks);
+document.getElementById('btn-page-owners').addEventListener('click', loadPageOwners);
 document.getElementById('btn-pause').addEventListener('click', async()=>{ try{await apiPost('/api/pause');toast('QEMU paused');}catch(e){toast('Pause: '+e.message);} });
 document.getElementById('btn-continue').addEventListener('click', async()=>{ try{await apiPost('/api/continue');toast('QEMU resumed');}catch(e){toast('Continue: '+e.message);} });
 document.getElementById('btn-walk').addEventListener('click', walkVA);
 document.getElementById('walk-input').addEventListener('keydown', e=>{ if(e.key==='Enter') walkVA(); });
 
-refreshStatus(); loadSymbols(); takeSnapshot();
+// ── GDB controls ─────────────────────────────────────────────────────────────
+document.getElementById('btn-gdb-interrupt').addEventListener('click', async () => {
+  const res = document.getElementById('gdb-result');
+  res.innerHTML = '<span style="color:var(--yellow)">Interrupting…</span>';
+  try {
+    const r = await apiPost('/api/gdb/interrupt');
+    res.innerHTML = `<span style="color:var(--green)">Stopped. raw: ${esc(r.raw)}</span>`;
+    loadTasks();
+  } catch(e) { res.innerHTML = `<span style="color:var(--red)">${esc(e.message)}</span>`; }
+});
+
+document.getElementById('btn-gdb-break-snapshot').addEventListener('click', async () => {
+  const addr = document.getElementById('gdb-bp-input').value.trim();
+  if (!addr) { toast('Enter a symbol name or address'); return; }
+  const res = document.getElementById('gdb-result');
+  res.innerHTML = `<span style="color:var(--yellow)">Setting breakpoint at ${esc(addr)}, continuing…</span>`;
+  try {
+    const r = await apiPostQuery('/api/gdb/break_and_snapshot', new URLSearchParams({addr, timeout: '15'}).toString());
+    if (r.error) {
+      res.innerHTML = `<span style="color:var(--red)">Error: ${esc(r.error)}</span>`;
+      return;
+    }
+    // Refresh tasks panel
+    if (r.tasks) {
+      const sel = document.getElementById('walk-task-sel');
+      const tlist = document.getElementById('tasks-list');
+      const STATE_COLOR = {running:'var(--green)',ready:'var(--accent)',dead:'var(--text-dim)'};
+      sel.innerHTML = '<option value="">kernel (TTBR1)</option>';
+      let html = '<table style="width:100%;border-collapse:collapse">';
+      html += '<tr style="color:var(--text-dim);font-size:10px"><th style="text-align:left">id</th><th style="text-align:left">name</th><th style="text-align:left">state</th><th style="text-align:left">TTBR0 root</th></tr>';
+      for (const t of r.tasks) {
+        const sc = STATE_COLOR[t.state] || 'var(--text-dim)';
+        const root = t.ttbr0_root_pa ? `<span style="font-family:monospace;font-size:9px">${esc(t.ttbr0_root_pa)}</span>` : '—';
+        html += `<tr><td>${t.id}</td><td>${esc(t.name)}</td><td style="color:${sc}">${esc(t.state)}</td><td>${root}</td></tr>`;
+        if (t.ttbr0_root_pa) {
+          const opt = document.createElement('option');
+          opt.value = String(t.idx);
+          opt.textContent = `[${t.idx}] ${t.name} (${t.state})`;
+          opt.dataset.rootPa = t.ttbr0_root_pa;
+          sel.appendChild(opt);
+        }
+      }
+      html += '</table>';
+      tlist.innerHTML = html;
+    }
+    res.innerHTML = `<span style="color:var(--green)">Hit at ${esc(r.stopped_at)}  ·  ${esc(r.stop_reply)}</span>`;
+    toast(`Breakpoint hit at ${r.stopped_at}`);
+    if (r.page_owners) renderPageOwners(r.page_owners);
+  } catch(e) { res.innerHTML = `<span style="color:var(--red)">${esc(e.message)}</span>`; }
+});
+
+// ── collapsible cards ─────────────────────────────────────────────────────────
+// Default-collapsed cards (start hidden on first load)
+const _COLLAPSED_DEFAULT = new Set(['gdb', 'memory', 'symbols', 'mair']);
+function _initCards() {
+  document.querySelectorAll('.card-header[data-card]').forEach(header => {
+    const key = 'card-collapsed:' + header.dataset.card;
+    const body = header.nextElementSibling;
+    // Read saved state; fall back to default
+    const stored = localStorage.getItem(key);
+    const collapsed = stored !== null ? stored === '1' : _COLLAPSED_DEFAULT.has(header.dataset.card);
+    if (collapsed) { header.classList.add('collapsed'); body.classList.add('hidden'); }
+    header.addEventListener('click', () => {
+      const isNowCollapsed = header.classList.toggle('collapsed');
+      body.classList.toggle('hidden', isNowCollapsed);
+      localStorage.setItem(key, isNowCollapsed ? '1' : '0');
+    });
+  });
+}
+_initCards();
+
+refreshStatus(); loadSymbols(); takeSnapshot(); loadTasks();
+
+// Auto-poll: update status every 5 s; auto-reload when QEMU (re)connects
+let _prevConnected = false;
+setInterval(async () => {
+  const dot = document.getElementById('status-dot');
+  if (!_prevConnected) dot.className = 'connecting';
+  const dotBefore = dot.className;
+  await refreshStatus();
+  const nowConnected = document.getElementById('status-dot').className === 'connected';
+  if (!_prevConnected && nowConnected) {
+    loadSymbols();
+    takeSnapshot();
+    loadTasks();
+  }
+  _prevConnected = nowConnected;
+}, 5000);
 </script>
 </body>
 </html>

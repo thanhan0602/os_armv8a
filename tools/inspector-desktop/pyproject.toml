@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "os-armv8a-inspector-desktop"
+version = "0.1.0"
+description = "Desktop app for remotely controlling and inspecting os_armv8a QEMU sessions"
+requires-python = ">=3.10"
+dependencies = [
+  "paramiko>=3.5,<4.0",
+]
+
+[project.scripts]
+os-armv8a-inspector-desktop = "os_armv8a_inspector_desktop.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

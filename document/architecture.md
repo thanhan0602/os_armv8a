@@ -523,6 +523,32 @@ Sample đã được verify runtime:
 
 Hiện tại đây mới là shared-library support ở mức loader và relocation. Mỗi process vẫn map một bản private của library; chưa có cơ chế chia sẻ page text/data giữa các process, chưa có object cache dùng chung, và chưa có ABI/version resolver.
 
+### IPC channels
+
+Stage 11 hiện đã có increment IPC đầu tiên ở mức kernel primitive:
+
+- fixed global channels với id `0..7`
+- mailbox một-message, kích thước tối đa `64` bytes
+- `SYS_IPC_SEND=451` và `SYS_IPC_RECV=452`
+- `recv` là blocking: task chuyển sang `TASK_STATE_BLOCKED` và chỉ được wake khi sender ghi message vào channel tương ứng
+
+Thiết kế này cố tình hẹp: mục tiêu hiện tại là chứng minh kernel có thể sleep/wake user task bên trong syscall path một cách đúng đắn, không spin polling ở EL0.
+
+Luồng runtime hiện tại:
+
+1. receiver gọi `SYS_IPC_RECV`
+2. nếu mailbox rỗng, kernel đăng ký task đó là waiter của channel và đổi state sang `BLOCKED`
+3. scheduler chuyển CPU sang task khác
+4. sender gọi `SYS_IPC_SEND`, kernel copy bytes vào mailbox và wake waiter nếu có
+5. receiver được schedule lại, `SYS_IPC_RECV` hoàn tất, rồi copy message về user buffer
+
+Validation cho slice này dùng hai app built-in:
+
+- `/bin/ipc_recv.elf`
+- `/bin/ipc_send.elf`
+
+Khi chạy `ipc_recv` trước rồi `ipc_send` sau, receiver block đúng, sender wake đúng, message được deliver đúng, và cả hai task exit sạch.
+
 ---
 
 ## 13. Debug target framework
@@ -624,6 +650,10 @@ Công cụ hữu ích nhất: QEMU trace với `-d int,mmu,guest_errors`. `AT S1
 - shared object và app có `DT_NEEDED` phải giữ nguyên metadata động cần thiết; vì vậy build hiện strip bằng `--strip-debug`, không dùng `--strip-all`
 - AArch64 `ld` cần được force `-Wl,-z,max-page-size=0x1000` để tránh PT_LOAD đầu tiên bị đẩy tới offset `0x10000` và làm file phình vô ích
 
+### Blocking syscall path phải preserve cả `SP_EL0`
+
+`ELR_EL1` và `SPSR_EL1` chỉ giải quyết nửa bài toán return-to-user. Khi user task có thể bị schedule-out ngay bên trong syscall handler, `SP_EL0` cũng phải được save/restore qua exception frame. Nếu không, task có thể quay lại đúng EL0 PC nhưng với stack pointer user cũ hoặc sai task, dẫn tới fault trên local stack accesses ngay sau khi syscall return.
+
 ---
 
 ## 16. Trạng thái các stage
@@ -640,7 +670,7 @@ Công cụ hữu ích nhất: QEMU trace với `-d int,mmu,guest_errors`. `AT S1
 | 8 | Scheduler and kernel threads | ✅ Hoàn thành |
 | 9 | EL0 and syscalls | ✅ Hoàn thành |
 | 10 | Processes and address spaces | 🔄 Đang tiến hành (increments 1-8 đã chạy ổn) |
-| 11 | IPC and synchronization | 🔄 Đang tiến hành (spinlock increment đã có) |
+| 11 | IPC and synchronization | 🔄 Đang tiến hành (spinlock + fixed IPC channels đã có) |
 | 12 | Filesystem and program loading | ✅ Hoàn thành |
 | 13 | Console shell | ✅ Hoàn thành |
 
