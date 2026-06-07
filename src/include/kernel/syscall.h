@@ -11,6 +11,9 @@
 #define SYS_EXIT    93UL
 #define SYS_YIELD   124UL
 #define SYS_BRK     214UL
+#define SYS_MUNMAP  215UL
+#define SYS_FORK    220UL
+#define SYS_WAIT4   260UL
 #define SYS_IPC_SEND  451UL
 #define SYS_IPC_RECV  452UL
 

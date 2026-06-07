@@ -18,6 +18,11 @@ void *page_alloc_contiguous(unsigned long page_count);
 void page_free(void *page);
 void page_free_contiguous(void *page, unsigned long page_count);
 
+/* Reference counting for shared pages (required for CoW) */
+void page_ref_inc(unsigned long pa);
+int  page_ref_dec(unsigned long pa); /* Returns 1 if page was freed */
+unsigned int page_ref_get(unsigned long pa);
+
 /* High-level allocator counters used by boot logs and self-checks. */
 unsigned long page_allocator_total_pages(void);
 unsigned long page_allocator_free_pages(void);

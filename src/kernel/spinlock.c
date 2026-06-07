@@ -1,4 +1,5 @@
 #include <kernel/spinlock.h>
+#include <arch/arm/cpu.h>
 
 static int spin_try_lock(struct spinlock *lock)
 {
@@ -30,17 +31,17 @@ void spinlock_init(struct spinlock *lock)
 
 void cpu_relax(void)
 {
-    __asm__ volatile("yield" ::: "memory");
+    cpu_yield();
 }
 
 void cpu_wait(void)
 {
-    __asm__ volatile("wfe" ::: "memory");
+    cpu_wfe();
 }
 
 void cpu_wake(void)
 {
-    __asm__ volatile("sev" ::: "memory");
+    cpu_sev();
 }
 
 void spin_lock(struct spinlock *lock)
@@ -69,15 +70,7 @@ void spin_unlock(struct spinlock *lock)
 
 unsigned long spin_lock_irqsave(struct spinlock *lock)
 {
-    unsigned long flags;
-
-    __asm__ volatile(
-        "mrs %0, daif\n"
-        "msr daifset, #2\n"
-        : "=r"(flags)
-        :
-        : "memory");
-
+    unsigned long flags = arch_local_irq_save();
     spin_lock(lock);
     return flags;
 }
@@ -85,5 +78,5 @@ unsigned long spin_lock_irqsave(struct spinlock *lock)
 void spin_unlock_irqrestore(struct spinlock *lock, unsigned long flags)
 {
     spin_unlock(lock);
-    __asm__ volatile("msr daif, %0" : : "r"(flags) : "memory");
+    arch_local_irq_restore(flags);
 }

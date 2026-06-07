@@ -1,7 +1,10 @@
 #include <kernel/exception.h>
 
 #include <drivers/interrupt/gicv2.h>
+#include <arch/arm/cpu.h>
+#include <arch/arm/sysregs.h>
 #include <kernel/log.h>
+#include <kernel/mmu.h>
 #include <kernel/sched.h>
 #include <kernel/syscall.h>
 #include <kernel/timer.h>
@@ -84,11 +87,11 @@ void exception_init(void)
     __asm__ volatile(
         "adrp %0, exception_vector_table\n"
         "add  %0, %0, :lo12:exception_vector_table\n"
-        "msr vbar_el1, %0\n"
-        "isb\n"
         : "=r"(vbar)
         :
         : "memory");
+
+    arch_set_vbar_el1(vbar);
 }
 
 static void exception_dump(unsigned long vector_id,
@@ -158,6 +161,10 @@ int exception_handle_sync(unsigned long vector_id,
      * and calls schedule(), so it does not return.
      */
     if (ec == ESR_EC_DABT_LOW || ec == ESR_EC_IABT_LOW) {
+        if (mmu_handle_page_fault(far_el1, esr_el1)) {
+            return 1;
+        }
+
         unsigned long fsc       = esr_el1 & ESR_ISS_FSC_MASK;
         unsigned long fsc_type  = fsc & ESR_ISS_FSC_TYPE_MASK;
         unsigned long fsc_level = fsc & ESR_ISS_FSC_LEVEL_MASK;
@@ -189,7 +196,7 @@ int exception_handle_sync(unsigned long vector_id,
         KER_INFO("[fault] killing user task");
         task_exit();
         while (1) {
-            __asm__ volatile("wfe");
+            cpu_wfe();
         }
     }
 
@@ -203,7 +210,7 @@ int exception_handle_sync(unsigned long vector_id,
     }
 
     while (1) {
-        __asm__ volatile("wfe");
+        cpu_wfe();
     }
 
     return 0;
@@ -241,5 +248,5 @@ void exception_handle_irq(unsigned long vector_id,
 
 void exception_trigger_test(void)
 {
-    __asm__ volatile("brk #0");
+    cpu_brk(0);
 }

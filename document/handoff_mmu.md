@@ -5,8 +5,9 @@
 
 ## Trạng thái hiện tại
 - Đã hoàn thành: TTBR0/TTBR1 split, ASID, user page isolation, permission fault, translation fault, heap grow/shrink qua brk, PA→VA migration.
-- Đã verify: multi-process isolation, fault classification, ASID tagging, user heap, page free-list giữ PA.
-- Known issues: chưa có page sharing, chưa có copy-on-write, chưa có object cache.
+- Đã hoàn thành (Advanced): ASID tagging (8-bit), Copy-on-Write (CoW) với reference counting trên physical pages, Lazy Loading (cho stack/heap), SYS_FORK, SYS_WAIT4, SYS_MUNMAP.
+- Đã verify: test_cow.elf (CoW success), fork/wait4 logic, lazy page fault handler.
+- Known issues: chưa có object cache (slab/slub).
 
 ## File chính
 - src/kernel/mmu.c
@@ -19,8 +20,8 @@
 ## Invariant/Assumption
 - TTBR1 luôn giữ kernel VA, TTBR0 dùng cho user.
 - ASID=0 reserved cho kernel/empty root.
-- Không dereference pointer lưu trong .rodata sau khi TTBR0 bị tắt.
-- Free-list allocator chỉ lưu PA, không VA.
+- Physical pages được ref-counted (`page_alloc.c`) để hỗ trợ CoW.
+- L3 descriptors của shared CoW pages được đặt `AP=RO` và `nG=1`.
 
 ## Lệnh verify nhanh
 - make clean all RUN_OS_DEMOS=1
@@ -33,7 +34,8 @@
 - Khi free page, chỉ lưu PA, không lưu VA.
 
 ## Next steps
-- Thêm page sharing, object cache, copy-on-write.
+- Thêm object cache (slab/slub).
+- Hỗ trợ Shared Memory (SYS_SHM).
 - Refactor page table walk cho dễ debug.
 
 ---

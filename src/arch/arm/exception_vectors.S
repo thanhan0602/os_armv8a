@@ -170,6 +170,11 @@ exception_sync_entry:
     restore_context
     eret
 
+.global fork_child_exit
+fork_child_exit:
+    restore_context
+    eret
+
 1:
     wfe
     b 1b

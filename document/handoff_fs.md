@@ -7,6 +7,7 @@
 ## Trạng thái hiện tại
 - **VFS Layer**: Đã tách biệt thành công layer trung gian tại [src/kernel/fs.c](src/kernel/fs.c). Hỗ trợ đăng ký loại FS (`vfs_register_fs`) và gắn (`vfs_mount`).
 - **RamFS Provider**: Logic filesystem RAM gốc được chuyển sang [src/kernel/ramfs.c](src/kernel/ramfs.c) và implement các interface `vfs_ops` / `vnode_ops`.
+- **Decoupling (Stage 13)**: `ramfs.c` không còn phụ thuộc cứng vào danh sách user apps. Dùng linker section `.ramfs_builtins` và autogeneration qua `Makefile`.
 - **Path Resolution**: Hỗ trợ lookup path dựa trên mount point (longest prefix match).
 - **Runtime Ops Fix**: Khắc phục vấn đề absolute pointers trong static structs bằng cách gán địa chỉ hàm tại runtime trong `ramfs_init()` (với `pa_to_va` nếu cần, nhưng gán trực tiếp trong runtime C works vì PC-relative addressing).
 - Đã verify: `read`, `load` hoạt động bình thường qua VFS -> RamFS path.

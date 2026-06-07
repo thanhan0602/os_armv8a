@@ -34,7 +34,13 @@ static unsigned long managed_start;
 static unsigned long managed_end;
 static unsigned long invalid_free_count;
 static unsigned long double_free_count;
-static unsigned char page_state[QEMU_VIRT_MAX_PAGES];
+
+struct page {
+    unsigned char state;
+    unsigned short ref_count;
+};
+
+static struct page pages[QEMU_VIRT_MAX_PAGES];
 
 /* Align the managed region to whole pages so allocator clients never see partial pages. */
 static unsigned long align_up(unsigned long value, unsigned long alignment)
@@ -145,7 +151,7 @@ static void page_allocator_rebuild_free_list(void)
 
     page_free_list_pa = 0UL;
     for (page_addr = managed_end - PAGE_SIZE; page_addr >= managed_start; page_addr -= PAGE_SIZE) {
-        if (page_state[page_index_from_address(page_addr)] == PAGE_STATE_FREE) {
+        if (pages[page_index_from_address(page_addr)].state == PAGE_STATE_FREE) {
             struct page_node *page;
 
             page = (struct page_node *)page_pa_to_ptr(page_addr);
@@ -182,7 +188,8 @@ void page_allocator_init(void)
     double_free_count = 0UL;
 
     for (page_index = 0UL; page_index < QEMU_VIRT_MAX_PAGES; page_index++) {
-        page_state[page_index] = PAGE_STATE_UNUSED;
+        pages[page_index].state = PAGE_STATE_UNUSED;
+        pages[page_index].ref_count = 0U;
     }
 
     /*
@@ -195,7 +202,7 @@ void page_allocator_init(void)
         page = (struct page_node *)page_pa_to_ptr(page_addr);
         page->next = (struct page_node *)page_free_list_pa;
         page_free_list_pa = page_addr;
-        page_state[page_index_from_address(page_addr)] = PAGE_STATE_FREE;
+        pages[page_index_from_address(page_addr)].state = PAGE_STATE_FREE;
         total_pages++;
         free_pages++;
     }
@@ -217,7 +224,9 @@ void *page_alloc(void)
 
     page = (struct page_node *)page_pa_to_ptr(page_pa);
     page_free_list_pa = page_ptr_to_pa(page->next);
-    page_state[page_index_from_address(page_pa)] = PAGE_STATE_ALLOCATED;
+    unsigned long idx = page_index_from_address(page_pa);
+    pages[idx].state = PAGE_STATE_ALLOCATED;
+    pages[idx].ref_count = 1U;
     free_pages--;
     zero_page(page_pa);
     return (void *)page_pa;
@@ -238,7 +247,8 @@ void *page_alloc_contiguous(unsigned long page_count)
     run_length = 0UL;
 
     for (page_addr = managed_start; page_addr < managed_end; page_addr += PAGE_SIZE) {
-        if (page_state[page_index_from_address(page_addr)] == PAGE_STATE_FREE) {
+        unsigned long idx = page_index_from_address(page_addr);
+        if (pages[idx].state == PAGE_STATE_FREE) {
             if (run_length == 0UL) {
                 run_start = page_addr;
             }
@@ -247,9 +257,12 @@ void *page_alloc_contiguous(unsigned long page_count)
             if (run_length == page_count) {
                 for (offset = 0UL; offset < page_count; offset++) {
                     unsigned long alloc_addr;
+                    unsigned long alloc_idx;
 
                     alloc_addr = run_start + (offset * PAGE_SIZE);
-                    page_state[page_index_from_address(alloc_addr)] = PAGE_STATE_ALLOCATED;
+                    alloc_idx = page_index_from_address(alloc_addr);
+                    pages[alloc_idx].state = PAGE_STATE_ALLOCATED;
+                    pages[alloc_idx].ref_count = 1U;
                     zero_page(alloc_addr);
                 }
 
@@ -269,6 +282,7 @@ void page_free(void *page)
 {
     struct page_node *node;
     unsigned long page_addr;
+    unsigned int idx;
 
     /* Reject anything that is not a managed, page-aligned allocation. */
     if (page == (void *)0) {
@@ -288,18 +302,61 @@ void page_free(void *page)
         return;
     }
 
-    if (page_state[page_index_from_address(page_addr)] != PAGE_STATE_ALLOCATED) {
+    idx = page_index_from_address(page_addr);
+    if (pages[idx].state != PAGE_STATE_ALLOCATED) {
         double_free_count++;
         page_allocator_warn("ignoring duplicate or invalid page free", page_addr);
         return;
     }
 
+    /* Reference counting check: if this page is shared, just decrement. */
+    if (pages[idx].ref_count > 1U) {
+        pages[idx].ref_count--;
+        return;
+    }
+
     /* Return the page to the free-list head and restore its metadata to FREE. */
+    pages[idx].ref_count = 0U;
     node = (struct page_node *)page_pa_to_ptr(page_addr);
     node->next = (struct page_node *)page_free_list_pa;
     page_free_list_pa = page_addr;
-    page_state[page_index_from_address(page_addr)] = PAGE_STATE_FREE;
+    pages[idx].state = PAGE_STATE_FREE;
     free_pages++;
+}
+
+void page_ref_inc(unsigned long pa)
+{
+    unsigned int idx = page_index_from_address(pa);
+    if (pa >= managed_start && pa < managed_end) {
+        pages[idx].ref_count++;
+    }
+}
+
+int page_ref_dec(unsigned long pa)
+{
+    unsigned int idx = page_index_from_address(pa);
+    if (pa < managed_start || pa >= managed_end) return 0;
+
+    if (pages[idx].ref_count > 0U) {
+        pages[idx].ref_count--;
+        if (pages[idx].ref_count == 0U) {
+            /* We need to actually free it, but page_free takes void* */
+            /* To avoid recursion or code duplication, we call page_free. */
+            /* But page_free also decrements. So we must be careful. */
+            /* Actually, if we set it to 1 and call page_free, it works. */
+            pages[idx].ref_count = 1U;
+            page_free((void *)pa);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+unsigned int page_ref_get(unsigned long pa)
+{
+    unsigned int idx = page_index_from_address(pa);
+    if (pa < managed_start || pa >= managed_end) return 0;
+    return (unsigned int)pages[idx].ref_count;
 }
 
 void page_free_contiguous(void *page, unsigned long page_count)
@@ -328,7 +385,7 @@ void page_free_contiguous(void *page, unsigned long page_count)
         unsigned long free_addr;
 
         free_addr = page_addr + (offset * PAGE_SIZE);
-        if (page_state[page_index_from_address(free_addr)] != PAGE_STATE_ALLOCATED) {
+        if (pages[page_index_from_address(free_addr)].state != PAGE_STATE_ALLOCATED) {
             double_free_count++;
             page_allocator_warn("ignoring duplicate or invalid contiguous page free", free_addr);
             return;
@@ -339,7 +396,7 @@ void page_free_contiguous(void *page, unsigned long page_count)
         unsigned long free_addr;
 
         free_addr = page_addr + (offset * PAGE_SIZE);
-        page_state[page_index_from_address(free_addr)] = PAGE_STATE_FREE;
+        pages[page_index_from_address(free_addr)].state = PAGE_STATE_FREE;
     }
 
     free_pages += page_count;
@@ -381,7 +438,7 @@ const char *page_allocator_page_state_name(unsigned long address)
         return "out-of-range";
     }
 
-    return page_state_name_from_value(page_state[page_index_from_address(address)]);
+    return page_state_name_from_value(pages[page_index_from_address(address)].state);
 }
 
 void page_allocator_log_page_state(unsigned long address)
@@ -431,7 +488,7 @@ unsigned long page_allocator_check_consistency(void)
     for (page_addr = managed_start; page_addr < managed_end; page_addr += PAGE_SIZE) {
         unsigned char state;
 
-        state = page_state[page_index_from_address(page_addr)];
+        state = pages[page_index_from_address(page_addr)].state;
         if (state == PAGE_STATE_FREE) {
             state_free_pages++;
         } else if (state == PAGE_STATE_ALLOCATED) {
@@ -471,7 +528,7 @@ void page_allocator_log_consistency(void)
     for (page_addr = managed_start; page_addr < managed_end; page_addr += PAGE_SIZE) {
         unsigned char state;
 
-        state = page_state[page_index_from_address(page_addr)];
+        state = pages[page_index_from_address(page_addr)].state;
         if (state == PAGE_STATE_FREE) {
             state_free_pages++;
         } else if (state == PAGE_STATE_ALLOCATED) {

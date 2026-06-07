@@ -3,9 +3,18 @@
 
 #include <kernel/vfs.h>
 
-void ramfs_init(void);
+struct ramfs_builtin_file {
+    const char *path;
+    unsigned char *start;
+    unsigned char *end;
+};
 
-/* To support the existing shell commands for now */
+#define REGISTER_RAMFS_BUILTIN(name, path, start, end) \
+    static const struct ramfs_builtin_file __builtin_##name \
+    __attribute__((used, section(".ramfs_builtins"))) = { path, start, end }
+
+void ramfs_init(void);
+void ramfs_add_builtin(const char *path, unsigned char *start, unsigned char *end);
 int ramfs_register_file(const char *path, unsigned char *data, unsigned long size);
 int ramfs_unregister_file(const char *path);
 

@@ -1,10 +1,13 @@
 #include <kernel/process.h>
 
+#include <kernel/exception.h>
 #include <kernel/fs.h>
 #include <kernel/heap.h>
 #include <kernel/log.h>
 #include <kernel/mmu.h>
 #include <kernel/page_alloc.h>
+#include <kernel/sched.h>
+#include <arch/arm/cpu.h>
 
 #ifdef CONFIG_KERNEL_VIRTUAL
 #define ELF_MAGIC 0x464c457fUL
@@ -139,6 +142,12 @@ static int process_map_elf_segment(struct process *process,
                                    unsigned long image_size,
                                    const struct elf64_phdr *phdr,
                                    unsigned long load_bias);
+
+static int process_add_region(struct process *process, 
+                              unsigned long start, unsigned long end,
+                              enum vm_type type, unsigned long flags,
+                              const unsigned char *image, unsigned long offset,
+                              unsigned long filesz);
 
 static unsigned long process_align_up(unsigned long value, unsigned long alignment)
 {
@@ -473,7 +482,13 @@ static int process_write_user_u64(struct process *process,
     }
 
     if (!mmu_user_page_pa(process->mm, page_va, &page_pa)) {
-        return 0;
+        /* ESR_EL1 value 0x90000004 corresponds to a translation fault from EL0 (Data Abort) */
+        if (!mmu_handle_process_page_fault(process, page_va, 0x90000004UL)) {
+            return 0;
+        }
+        if (!mmu_user_page_pa(process->mm, page_va, &page_pa)) {
+            return 0;
+        }
     }
 
     page_ptr = (unsigned char *)pa_to_va((void *)page_pa) + page_offset;
@@ -1035,6 +1050,27 @@ static int process_load_needed_objects(struct process_elf_load_state *state)
     return 1;
 }
 
+static int process_add_region(struct process *process, 
+                              unsigned long start, unsigned long end,
+                              enum vm_type type, unsigned long flags,
+                              const unsigned char *image, unsigned long offset,
+                              unsigned long filesz)
+{
+    if (process->region_count >= PROCESS_VM_REGIONS_MAX) {
+        return 0;
+    }
+
+    struct vm_region *region = &process->regions[process->region_count++];
+    region->start = start;
+    region->end = end;
+    region->type = type;
+    region->flags = flags;
+    region->elf_image = image;
+    region->elf_offset = offset;
+    region->file_size = filesz;
+    return 1;
+}
+
 static int process_map_elf_segment(struct process *process,
                                    const unsigned char *image,
                                    unsigned long image_size,
@@ -1043,10 +1079,7 @@ static int process_map_elf_segment(struct process *process,
 {
     unsigned long segment_start;
     unsigned long segment_end;
-    unsigned long page_start;
-    unsigned long page_end;
-    unsigned long page_flags;
-    unsigned long page_va;
+    unsigned long flags;
 
     if (phdr->p_type != ELF_PT_LOAD || phdr->p_memsz == 0UL) {
         return 1;
@@ -1066,56 +1099,17 @@ static int process_map_elf_segment(struct process *process,
         return 0;
     }
 
-    page_start = segment_start & ~(PAGE_SIZE - 1UL);
-    page_end = process_align_up(segment_end, PAGE_SIZE);
-    page_flags = process_elf_page_flags(phdr->p_flags);
+    flags = process_elf_page_flags(phdr->p_flags);
 
-    for (page_va = page_start; page_va < page_end; page_va += PAGE_SIZE) {
-        unsigned long page_pa;
-        unsigned long copy_start;
-        unsigned long copy_end;
-        unsigned long copy_count;
-
-        page_pa = (unsigned long)page_alloc();
-        if (page_pa == 0UL) {
-            return 0;
-        }
-
-        copy_start = page_va;
-        if (copy_start < segment_start) {
-            copy_start = segment_start;
-        }
-
-        copy_end = page_va + PAGE_SIZE;
-        if (copy_end > (segment_start + phdr->p_filesz)) {
-            copy_end = segment_start + phdr->p_filesz;
-        }
-
-        copy_count = 0UL;
-        if (copy_end > copy_start) {
-            copy_count = copy_end - copy_start;
-            process_copy_image_page_region(
-                page_pa,
-                copy_start - page_va,
-                image + phdr->p_offset + (copy_start - segment_start),
-                copy_count);
-        }
-
-        if (!process_map_page(process, page_va, page_pa, page_flags)) {
-            page_free((void *)page_pa);
-            return 0;
-        }
-    }
-
-    return 1;
+    return process_add_region(process, segment_start, segment_end,
+                             VM_TYPE_ELF, flags,
+                             image, phdr->p_offset, phdr->p_filesz);
 }
 
 static struct process *process_create_flat_binary(const unsigned char *code, unsigned long code_size)
 {
     struct process *process;
     unsigned long code_pages;
-    unsigned long page_index;
-    void *stack_page;
 
     if (code == (const unsigned char *)0 || code_size == 0UL) {
         return (struct process *)0;
@@ -1144,53 +1138,33 @@ static struct process *process_create_flat_binary(const unsigned char *code, uns
     process->brk = USER_HEAP_BASE;
     process->heap_limit = USER_HEAP_LIMIT;
     process->heap_mapped_end = USER_HEAP_BASE;
+    process->region_count = 0U;
 
-    for (page_index = 0UL; page_index < code_pages; page_index++) {
-        unsigned long page_pa;
-        unsigned long page_copy_len;
-        unsigned long page_va;
+    /* Register Code region */
+    process_add_region(process, USER_CODE_BASE, USER_CODE_BASE + (code_pages * PAGE_SIZE),
+                      VM_TYPE_ELF,
+                      MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
+                      MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RO |
+                      MMU_USER_PAGE_PXN,
+                      code, 0, code_size);
 
-        page_pa = (unsigned long)page_alloc();
-        if (page_pa == 0UL) {
-            process_destroy(process);
-            return (struct process *)0;
-        }
+    /* Register Stack region */
+    process_add_region(process, USER_STACK_TOP - 0x100000, USER_STACK_TOP,
+                      VM_TYPE_ANON,
+                      MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
+                      MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
+                      MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN,
+                      (unsigned char *)0, 0, 0);
 
-        page_copy_len = code_size - (page_index * PAGE_SIZE);
-        if (page_copy_len > PAGE_SIZE) {
-            page_copy_len = PAGE_SIZE;
-        }
+    /* Register Heap region */
+    process_add_region(process, USER_HEAP_BASE, USER_HEAP_LIMIT,
+                      VM_TYPE_ANON,
+                      MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
+                      MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
+                      MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN,
+                      (unsigned char *)0, 0, 0);
 
-        process_copy_image_page(page_pa,
-                                code + (page_index * PAGE_SIZE),
-                                page_copy_len);
-        page_va = USER_CODE_BASE + (page_index * PAGE_SIZE);
-        if (!process_map_page(process, page_va, page_pa,
-                              MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
-                              MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RO |
-                              MMU_USER_PAGE_PXN)) {
-            page_free((void *)page_pa);
-            process_destroy(process);
-            return (struct process *)0;
-        }
-    }
-
-    __asm__ volatile("dsb ish\n ic iallu\n dsb nsh\n isb\n" ::: "memory");
-
-    stack_page = page_alloc();
-    if (stack_page == (void *)0) {
-        process_destroy(process);
-        return (struct process *)0;
-    }
-
-    if (!process_map_page(process, USER_STACK_TOP - PAGE_SIZE, (unsigned long)stack_page,
-                          MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
-                          MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
-                          MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN)) {
-        page_free(stack_page);
-        process_destroy(process);
-        return (struct process *)0;
-    }
+    cpu_invalidate_icache_all();
 
     return process;
 }
@@ -1210,7 +1184,6 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
     struct process_elf_load_state load_state;
     unsigned long index;
     unsigned long heap_start;
-    void *stack_page;
 
     if (!process_is_elf_image(image, image_size)) {
         return (struct process *)0;
@@ -1241,6 +1214,7 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
     process->brk = 0UL;
     process->heap_limit = USER_HEAP_LIMIT;
     process->heap_mapped_end = 0UL;
+    process->region_count = 0U;
 
     if (!process_register_loaded_object(&load_state, "<main>", (unsigned char *)0, image, image_size, 1)) {
         process_destroy(process);
@@ -1272,23 +1246,24 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
     process->heap_limit = USER_HEAP_LIMIT;
     process->heap_mapped_end = heap_start;
 
-    __asm__ volatile("dsb ish\n ic iallu\n dsb nsh\n isb\n" ::: "memory");
+    /* Register regions for Lazy Loading */
+    /* Stack region: 1MB below USER_STACK_TOP */
+    process_add_region(process, USER_STACK_TOP - 0x100000, USER_STACK_TOP,
+                      VM_TYPE_ANON,
+                      MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
+                      MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
+                      MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN,
+                      (unsigned char *)0, 0, 0);
 
-    stack_page = page_alloc();
-    if (stack_page == (void *)0) {
-        process_destroy(process);
-        return (struct process *)0;
-    }
+    /* Heap region: from heap_start to USER_HEAP_LIMIT */
+    process_add_region(process, heap_start, USER_HEAP_LIMIT,
+                      VM_TYPE_ANON,
+                      MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
+                      MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
+                      MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN,
+                      (unsigned char *)0, 0, 0);
 
-    if (!process_map_page(process, USER_STACK_TOP - PAGE_SIZE, (unsigned long)stack_page,
-                          MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
-                          MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
-                          MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN)) {
-        page_free(stack_page);
-        process_release_loaded_images(&load_state);
-        process_destroy(process);
-        return (struct process *)0;
-    }
+    cpu_invalidate_icache_all();
 
     process_release_loaded_images(&load_state);
 
@@ -1321,14 +1296,7 @@ void process_destroy(struct process *process)
 
 unsigned long process_brk(struct process *process, unsigned long new_break)
 {
-    unsigned long desired_end;
-    unsigned long old_break;
-    unsigned long old_mapped_end;
-    unsigned long new_mapped_end;
-    unsigned long new_pages[PROCESS_BRK_ROLLBACK_MAX_PAGES];
-    unsigned long mapped_count;
-
-    if (process == (struct process *)0 || process->mm == (struct mm_context *)0) {
+    if (process == (struct process *)0) {
         return 0UL;
     }
 
@@ -1340,74 +1308,69 @@ unsigned long process_brk(struct process *process, unsigned long new_break)
         return process->brk;
     }
 
-    new_mapped_end = process_align_up(new_break, PAGE_SIZE);
-    if (new_break <= process->brk) {
-        while (process->heap_mapped_end > new_mapped_end) {
-            unsigned long unmap_va;
-            unsigned long page_pa;
-
-            unmap_va = process->heap_mapped_end - PAGE_SIZE;
-            if (!mmu_user_page_pa(process->mm, unmap_va, &page_pa)) {
-                break;
-            }
-
-            if (!mmu_unmap_user_page(process->mm, unmap_va)) {
-                break;
-            }
-
-            mmu_context_remove_page(process->mm, page_pa);
-            page_free((void *)page_pa);
-            process->heap_mapped_end = unmap_va;
-        }
-
-        process->brk = new_break;
-        return process->brk;
-    }
-
-    old_break = process->brk;
-    old_mapped_end = process->heap_mapped_end;
-    desired_end = new_mapped_end;
-    mapped_count = 0UL;
-    while (process->heap_mapped_end < desired_end) {
-        void *page;
-
-        page = page_alloc();
-        if (page == (void *)0) {
-            break;
-        }
-
-        if (!process_map_page(process, process->heap_mapped_end, (unsigned long)page,
-                              MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF |
-                              MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
-                              MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN)) {
-            page_free(page);
-            break;
-        }
-
-        new_pages[mapped_count++] = (unsigned long)page;
-        process->heap_mapped_end += PAGE_SIZE;
-    }
-
-    if (process->heap_mapped_end < desired_end) {
-        while (mapped_count > 0UL) {
-            unsigned long rollback_va;
-            unsigned long rollback_pa;
-
-            mapped_count--;
-            rollback_pa = new_pages[mapped_count];
-            rollback_va = old_mapped_end + (mapped_count * PAGE_SIZE);
-            mmu_unmap_user_page(process->mm, rollback_va);
-            mmu_context_remove_page(process->mm, rollback_pa);
-            page_free((void *)rollback_pa);
-        }
-
-        process->heap_mapped_end = old_mapped_end;
-        process->brk = old_break;
-        return process->brk;
-    }
-
     process->brk = new_break;
     return process->brk;
+}
+
+unsigned long process_fork(struct exception_context *ctx)
+{
+    struct task *parent_task = sched_current();
+    if (!parent_task) return (unsigned long)-1;
+
+    /* 1. Allocate process structure for child */
+    struct process *child_proc = (struct process *)kmalloc(sizeof(struct process));
+    if (!child_proc) return (unsigned long)-1;
+
+    /* 2. Copy process state */
+    child_proc->entry_va = parent_task->process->entry_va;
+    child_proc->stack_top = parent_task->process->stack_top;
+    child_proc->heap_start = parent_task->process->heap_start;
+    child_proc->brk = parent_task->process->brk;
+    child_proc->heap_limit = parent_task->process->heap_limit;
+    child_proc->heap_mapped_end = parent_task->process->heap_mapped_end;
+    child_proc->region_count = parent_task->process->region_count;
+    for (unsigned int i = 0; i < parent_task->process->region_count; i++) {
+        child_proc->regions[i] = parent_task->process->regions[i];
+    }
+
+    /* 3. Clone MMU context (CoW happens here internally) */
+    child_proc->mm = mmu_context_clone(parent_task->mm);
+    if (!child_proc->mm) {
+        kfree(child_proc);
+        return (unsigned long)-1;
+    }
+
+    /* 4. Create new task (allocates slot and kernel stack) */
+    struct task *child_task = task_create_user(child_proc, parent_task->name);
+    if (child_task) {
+        child_task->parent_id = parent_task->id;
+    }
+
+    /* 5. Copy kernel stack content to clone the exception context and call stack */
+    /* Find the offset of the exception context from the parent's stack base */
+    unsigned long stack_offset = (unsigned long)ctx - (unsigned long)parent_task->stack_base;
+    
+    /* Copy the entire kernel stack */
+    unsigned char *src_stack = (unsigned char *)parent_task->stack_base;
+    unsigned char *dst_stack = (unsigned char *)child_task->stack_base;
+    for (unsigned long i = 0; i < child_task->stack_size; i++) {
+        dst_stack[i] = src_stack[i];
+    }
+
+    /* 6. Adjust child's kernel SP and return address */
+    /* The child should resume at fork_child_exit, which pops the context
+     * from its own stack and eret to user mode. */
+    child_task->context.x30 = (unsigned long)fork_child_exit;
+    child_task->context.sp = (unsigned long)child_task->stack_base + stack_offset;
+
+    /* 7. Fix the child's return value in its cloned exception context */
+    struct exception_context *child_ctx = (struct exception_context *)(dst_stack + stack_offset);
+    child_ctx->gpr[0] = 0;
+
+    KER_LOGF("[process] fork: parent PID=%lu, child PID=%lu\n", parent_task->id, child_task->id);
+
+    /* 8. Parent returns child PID */
+    return (unsigned long)child_task->id;
 }
 #else
 struct process *process_create_from_image(char *code_start, char *code_end)

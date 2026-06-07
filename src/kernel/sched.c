@@ -6,6 +6,8 @@
 #include <kernel/page_alloc.h>
 #include <kernel/process.h>
 #include <kernel/vm.h>
+#include <kernel/console.h>
+#include <arch/arm/cpu.h>
 
 extern void task_entry_trampoline(void);
 
@@ -27,6 +29,9 @@ static const char *sched_state_name(unsigned long state)
     }
     if (state == TASK_STATE_DEAD) {
         return "dead";
+    }
+    if (state == TASK_STATE_ZOMBIE) {
+        return "zombie";
     }
 
     return "unknown";
@@ -89,6 +94,10 @@ void sched_init(void)
     idle->stack_size = 0;
     idle->name = "idle";
     idle->next = idle;
+
+    for (int i = 0; i < MAX_FILES_PER_TASK; i++) {
+        idle->files[i] = (struct file *)0;
+    }
 
     current = idle;
 }
@@ -196,6 +205,11 @@ struct task *task_create_user(struct process *process,
     t->mm = process->mm;
     t->process = process;
 
+    for (int i = 0; i < MAX_FILES_PER_TASK; i++) {
+        t->files[i] = (struct file *)0;
+    }
+    t->files[1] = console_open_file();
+
     /* x19 = user entry VA, x20 = user SP_EL0, x30 = el0_entry_trampoline */
     t->context.x19 = process->entry_va;
     t->context.x20 = process->stack_top;
@@ -301,11 +315,22 @@ void schedule(void)
 
 void task_exit(void)
 {
-    current->state = TASK_STATE_DEAD;
+    struct task *t;
+    current->state = TASK_STATE_ZOMBIE;
+
+    /* Wake up parent if it's waiting */
+    for (unsigned long i = 0; i < MAX_TASKS; i++) {
+        t = &tasks[i];
+        if (t->name && t->id == current->parent_id && t->state == TASK_STATE_BLOCKED) {
+            t->state = TASK_STATE_READY;
+            break;
+        }
+    }
+
     schedule();
 
     while (1) {
-        __asm__ volatile("wfe");
+        cpu_wfe();
     }
 }
 
@@ -330,6 +355,36 @@ void sched_wake_task(struct task *task)
     }
 
     task->state = TASK_STATE_READY;
+}
+
+unsigned long sched_wait4(long pid, unsigned long status_ptr)
+{
+    struct task *curr = current;
+
+    for (;;) {
+        int found_child = 0;
+        for (unsigned long i = 0; i < MAX_TASKS; i++) {
+            struct task *t = &tasks[i];
+            if (t->name && t->parent_id == curr->id && (pid <= 0 || (long)t->id == pid)) {
+                found_child = 1;
+                if (t->state == TASK_STATE_ZOMBIE) {
+                    unsigned long child_id = t->id;
+                    if (status_ptr != 0) {
+                        int status = t->exit_status;
+                        extern int mmu_copy_to_user(const struct mm_context *mm, unsigned long va, const void *src, unsigned long len);
+                        mmu_copy_to_user(curr->mm, status_ptr, &status, sizeof(int));
+                    }
+                    t->state = TASK_STATE_DEAD; /* Mark for reaping by schedule() */
+                    return child_id;
+                }
+            }
+        }
+
+        if (!found_child) return (unsigned long)-1;
+
+        curr->state = TASK_STATE_BLOCKED;
+        schedule();
+    }
 }
 
 void sched_dump_tasks(void)

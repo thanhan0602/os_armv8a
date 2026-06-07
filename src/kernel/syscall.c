@@ -19,26 +19,38 @@ static unsigned long sys_write(unsigned long fd,
                                 unsigned long len)
 {
     struct task *task;
-    char byte;
-    unsigned long i;
-
-    if (fd != 1UL) {
-        return (unsigned long)-1;
-    }
+    struct file *file;
+    char kbuf[128];
+    unsigned long remaining = len;
+    unsigned long total_written = 0;
 
     task = sched_current();
-    if (task == (struct task *)0 || task->mm == (struct mm_context *)0) {
+    if (task == (struct task *)0) {
         return (unsigned long)-1;
     }
 
-    for (i = 0UL; i < len; i++) {
-        if (!mmu_copy_from_user(task->mm, &byte, buf_va + i, 1UL)) {
-            return (i != 0UL) ? i : (unsigned long)-1;
-        }
-        log_putc(byte);
+    if (fd >= MAX_FILES_PER_TASK || task->files[fd] == (struct file *)0) {
+        return (unsigned long)-1;
     }
 
-    return len;
+    file = task->files[fd];
+
+    while (remaining > 0) {
+        unsigned long chunk = (remaining < sizeof(kbuf)) ? remaining : sizeof(kbuf);
+        if (!mmu_copy_from_user(task->mm, kbuf, buf_va + total_written, chunk)) {
+            return (total_written != 0UL) ? total_written : (unsigned long)-1;
+        }
+
+        unsigned long written = fs_write(file, kbuf, chunk);
+        if (written == 0) {
+            break;
+        }
+        total_written += written;
+        remaining -= written;
+        if (written < chunk) break;
+    }
+
+    return total_written;
 }
 
 /*
@@ -61,6 +73,10 @@ static unsigned long sys_yield(void)
  */
 static unsigned long sys_exit(unsigned long code)
 {
+    struct task *task = sched_current();
+    if (task != (struct task *)0) {
+        task->exit_status = (int)code;
+    }
     KER_LOGF("[syscall] user task exited code=%lu\n", code);
     task_exit();
     return 0UL;
@@ -76,6 +92,20 @@ static unsigned long sys_brk(unsigned long new_break)
     }
 
     return process_brk(task->process, new_break);
+}
+
+static unsigned long sys_munmap(unsigned long addr, unsigned long len)
+{
+    struct task *t = sched_current();
+    if (t == (struct task *)0 || t->mm == (struct mm_context *)0) {
+        return (unsigned long)-1;
+    }
+    return (unsigned long)(mmu_unmap_user_range(t->mm, addr, len) ? 0 : -1);
+}
+
+static unsigned long sys_wait4(long pid, unsigned long status_ptr)
+{
+    return sched_wait4(pid, status_ptr);
 }
 
 static unsigned long sys_ipc_send(unsigned long channel_id,
@@ -163,6 +193,15 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
         break;
     case SYS_BRK:
         ret = sys_brk(ctx->gpr[0]);
+        break;
+    case SYS_MUNMAP:
+        ret = sys_munmap(ctx->gpr[0], ctx->gpr[1]);
+        break;
+    case SYS_FORK:
+        ret = process_fork(ctx);
+        break;
+    case SYS_WAIT4:
+        ret = sys_wait4(ctx->gpr[0], ctx->gpr[1]);
         break;
     case SYS_IPC_SEND:
         ret = sys_ipc_send(ctx->gpr[0], ctx->gpr[1], ctx->gpr[2]);

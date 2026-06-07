@@ -1,6 +1,8 @@
 #ifndef KERNEL_SCHED_H
 #define KERNEL_SCHED_H
 
+#include <kernel/fs.h>
+
 struct mm_context; /* defined in kernel/mmu.h */
 struct process;
 
@@ -31,11 +33,13 @@ struct task_context {
 #define TASK_STATE_READY    1UL
 #define TASK_STATE_BLOCKED  2UL
 #define TASK_STATE_DEAD     3UL
+#define TASK_STATE_ZOMBIE   4UL
 
 #define TASK_GUARD_PAGES    1UL
 #define TASK_STACK_PAGES    1UL
 #define TASK_TOTAL_PAGES    (TASK_GUARD_PAGES + TASK_STACK_PAGES)
 #define MAX_TASKS           16UL
+#define MAX_FILES_PER_TASK  16UL
 
 struct task {
     struct task_context context;
@@ -46,7 +50,10 @@ struct task {
     const char *name;
     struct mm_context *mm;
     struct process *process;
+    unsigned long parent_id;
+    int exit_status;
     struct task *next;
+    struct file *files[MAX_FILES_PER_TASK];
 };
 
 void sched_init(void);
@@ -67,6 +74,7 @@ void task_exit(void);
 struct task *sched_current(void);
 void sched_block_task(struct task *task);
 void sched_wake_task(struct task *task);
+unsigned long sched_wait4(long pid, unsigned long status_ptr);
 void sched_dump_tasks(void);
 int sched_kill_task(unsigned long task_id);
 
@@ -75,6 +83,7 @@ extern void switch_context(struct task_context *old_ctx,
 
 #ifdef CONFIG_KERNEL_VIRTUAL
 extern void el0_entry_trampoline(void);
+extern void fork_child_exit(void);
 #endif
 
 #endif

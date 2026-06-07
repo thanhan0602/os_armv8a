@@ -16,6 +16,7 @@
 #include <kernel/spinlock.h>
 #include <kernel/timer.h>
 #include <kernel/vm.h>
+#include <arch/arm/cpu.h>
 
 volatile unsigned long boot_stage;
 volatile unsigned long boot_heartbeat;
@@ -27,6 +28,7 @@ static void kernel_start_stage10_demos(void)
 {
     struct process *process_a;
     struct process *process_b;
+    struct process *process_cow;
 
     process_a = loader_load_process_image("/bin/hello.elf");
     if (process_a != (struct process *)0 && task_create_user(process_a, "user-a") == (struct task *)0) {
@@ -38,6 +40,12 @@ static void kernel_start_stage10_demos(void)
     if (process_b != (struct process *)0 && task_create_user(process_b, "user-b") == (struct task *)0) {
         KER_INFO("task_create_user failed: user-b");
         process_destroy(process_b);
+    }
+
+    process_cow = loader_load_process_image("/bin/test_cow.elf");
+    if (process_cow != (struct process *)0 && task_create_user(process_cow, "user-cow") == (struct task *)0) {
+        KER_INFO("task_create_user failed: user-cow");
+        process_destroy(process_cow);
     }
 }
 #endif
@@ -89,10 +97,20 @@ void kernel_main_early(unsigned long boot_fdt_pa)
 void kernel_main(void)
 {
     KER_INFO("kernel_main: jumped to high virtual address");
-#ifdef CONFIG_KERNEL_VIRTUAL
+
+    /* 
+     * Update exception vectors to use virtual addresses before we remove
+     * the identity map. This ensures any faults during or after unmapping
+     * can be handled and logged.
+     */
     exception_init();
 
-    /* Replace boot-time TTBR0 identity tables with an owned empty runtime root. */
+#ifdef CONFIG_KERNEL_VIRTUAL
+    /* 
+     * Now that we are safely running in the high virtual address space (TTBR1),
+     * we can remove the identity map (TTBR0 bridge) used during boot.
+     * This prepares TTBR0 for use by user processes.
+     */
     mmu_install_empty_ttbr0_root();
 #endif
 

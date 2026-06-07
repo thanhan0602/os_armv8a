@@ -94,8 +94,14 @@ int fs_open(const char *path, struct file *file)
 
 unsigned long fs_read(struct file *file, void *dst, unsigned long len)
 {
-    if (!file || !file->vn) return 0;
+    if (!file || !file->vn || !file->vn->ops->read) return 0;
     return file->vn->ops->read(file->vn, file, dst, len);
+}
+
+unsigned long fs_write(struct file *file, const void *src, unsigned long len)
+{
+    if (!file || !file->vn || !file->vn->ops->write) return 0;
+    return file->vn->ops->write(file->vn, file, src, len);
 }
 
 void fs_close(struct file *file)

@@ -1,6 +1,8 @@
 #include <kernel/timer.h>
 
 #include <arch/arm/virt.h>
+#include <arch/arm/cpu.h>
+#include <arch/arm/sysregs.h>
 #include <drivers/interrupt/gicv2.h>
 #include <kernel/log.h>
 
@@ -11,37 +13,29 @@ static volatile unsigned long timer_ticks;
 static unsigned long timer_frequency;
 static unsigned long timer_interval;
 
-static void local_irq_enable(void)
-{
-    __asm__ volatile(
-        "msr daifclr, #2\n"
-        "isb\n"
-        ::: "memory");
-}
-
 static void timer_program_next_tick(void)
 {
     unsigned long timer_ctl;
 
-    __asm__ volatile("msr cntv_tval_el0, %0" : : "r"(timer_interval));
+    arch_timer_set_cntv_tval(timer_interval);
 
     timer_ctl = CNTV_CTL_ENABLE;
-    __asm__ volatile("msr cntv_ctl_el0, %0" : : "r"(timer_ctl));
-    __asm__ volatile("isb");
+    arch_timer_set_cntv_ctl(timer_ctl);
+    cpu_isb();
 }
 
 void timer_init(void)
 {
     gicv2_enable_irq(TIMER_PPI);
 
-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(timer_frequency));
+    timer_frequency = arch_timer_get_cntfrq();
     timer_interval = timer_frequency / 2UL;
     if (timer_interval == 0UL) {
         timer_interval = 1UL;
     }
 
     timer_program_next_tick();
-    local_irq_enable();
+    arch_local_irq_enable();
 }
 
 int timer_handle_irq(unsigned int intid)

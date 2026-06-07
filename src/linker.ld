@@ -51,6 +51,12 @@ SECTIONS
     .rodata : AT(ADDR(.rodata) - KERNEL_VA_OFFSET) ALIGN(KERNEL_PAGE_SIZE) {
         __rodata_start = .;
         *(.rodata*)
+        
+        . = ALIGN(8);
+        __start_ramfs_builtins = .;
+        KEEP(*(.ramfs_builtins))
+        __stop_ramfs_builtins = .;
+
         __rodata_end = .;
     } :text
 

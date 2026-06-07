@@ -8,19 +8,6 @@
 #define RAMFS_FILES_MAX  16UL
 #define RAMFS_PATH_MAX   64UL
 
-extern unsigned char _binary_build_user_builtin_hello_elf_start[];
-extern unsigned char _binary_build_user_builtin_hello_elf_end[];
-extern unsigned char _binary_build_user_builtin_fault_elf_start[];
-extern unsigned char _binary_build_user_builtin_fault_elf_end[];
-extern unsigned char _binary_build_user_builtin_ipc_recv_elf_start[];
-extern unsigned char _binary_build_user_builtin_ipc_recv_elf_end[];
-extern unsigned char _binary_build_user_builtin_ipc_send_elf_start[];
-extern unsigned char _binary_build_user_builtin_ipc_send_elf_end[];
-extern unsigned char _binary_build_user_lib_libshared_so_start[];
-extern unsigned char _binary_build_user_lib_libshared_so_end[];
-extern unsigned char _binary_build_user_external_shared_client_elf_start[];
-extern unsigned char _binary_build_user_external_shared_client_elf_end[];
-
 struct ramfs_node {
     int in_use;
     int owns_data;
@@ -37,6 +24,10 @@ static unsigned long ramfs_read(struct vnode *vn, struct file *file, void *dst, 
 static void ramfs_close(struct vnode *vn, struct file *file);
 static int ramfs_lookup(struct vnode *vn, const char *name, struct vnode **out);
 static int ramfs_vfs_mount(struct vfs_mount *mnt, const char *device);
+
+/* External symbols from linker script for the builtins section */
+extern const struct ramfs_builtin_file __start_ramfs_builtins[];
+extern const struct ramfs_builtin_file __stop_ramfs_builtins[];
 
 static struct vnode_ops ramfs_vnode_ops = {
     .open = ramfs_open,
@@ -143,7 +134,7 @@ static int ramfs_lookup(struct vnode *vn, const char *name, struct vnode **out)
     return 0;
 }
 
-static void ramfs_add_builtin(const char *path, unsigned char *start, unsigned char *end)
+void ramfs_add_builtin(const char *path, unsigned char *start, unsigned char *end)
 {
     unsigned long index;
     for (index = 0UL; index < RAMFS_FILES_MAX; index++) {
@@ -163,17 +154,16 @@ static void ramfs_add_builtin(const char *path, unsigned char *start, unsigned c
 void ramfs_init(void)
 {
     unsigned long index;
+    const struct ramfs_builtin_file *builtin;
 
     for (index = 0UL; index < RAMFS_FILES_MAX; index++) {
         ramfs_nodes[index].in_use = 0;
     }
 
-    ramfs_add_builtin("/bin/hello.elf", _binary_build_user_builtin_hello_elf_start, _binary_build_user_builtin_hello_elf_end);
-    ramfs_add_builtin("/bin/fault.elf", _binary_build_user_builtin_fault_elf_start, _binary_build_user_builtin_fault_elf_end);
-    ramfs_add_builtin("/bin/ipc_recv.elf", _binary_build_user_builtin_ipc_recv_elf_start, _binary_build_user_builtin_ipc_recv_elf_end);
-    ramfs_add_builtin("/bin/ipc_send.elf", _binary_build_user_builtin_ipc_send_elf_start, _binary_build_user_builtin_ipc_send_elf_end);
-    ramfs_add_builtin("/bin/shared_client.elf", _binary_build_user_external_shared_client_elf_start, _binary_build_user_external_shared_client_elf_end);
-    ramfs_add_builtin("/lib/libshared.so", _binary_build_user_lib_libshared_so_start, _binary_build_user_lib_libshared_so_end);
+    /* Iterate over the linker-defined section for builtin files */
+    for (builtin = __start_ramfs_builtins; builtin < __stop_ramfs_builtins; builtin++) {
+        ramfs_add_builtin(builtin->path, builtin->start, builtin->end);
+    }
 
     vfs_register_fs("ramfs", &ramfs_vfs_ops);
 }

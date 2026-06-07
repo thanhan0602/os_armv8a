@@ -3,6 +3,7 @@
 #include <kernel/mmu_debug.h>
 #include <kernel/page_alloc.h>
 #include <kernel/vm.h>
+#include <arch/arm/sysregs.h>
 
 #define MMU_USE_4LEVEL 1
 #define MMU_DEBUG_WALK_ENABLED 1
@@ -454,17 +455,7 @@ static void mmu_debug_walk(unsigned long address)
 
 unsigned long mmu_debug_probe_address(unsigned long address)
 {
-    unsigned long par_el1;
-
-    __asm__ volatile(
-        "at s1e1r, %1\n"
-        "isb\n"
-        "mrs %0, par_el1\n"
-        : "=r"(par_el1)
-        : "r"(address)
-        : "memory");
-
-    return par_el1;
+    return mmu_probe_address_s1e1r(address);
 }
 
 void mmu_debug_walk_address(unsigned long address)
