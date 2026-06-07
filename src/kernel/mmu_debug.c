@@ -485,7 +485,10 @@ unsigned long *mmu_debug_alloc_named_table_page_chunk(const char *prefix, unsign
         return (unsigned long *)0;
     }
 
-    mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], prefix, chunk_index);
-    mmu_debug_record_table_page((unsigned long)table, mmu_table_page_names[mmu_table_page_count]);
+    if (mmu_table_page_count < MMU_DEBUG_MAX_TABLE_PAGES) {
+        mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], prefix, chunk_index);
+        mmu_debug_record_table_page((unsigned long)table, mmu_table_page_names[mmu_table_page_count]);
+    }
+
     return table;
 }

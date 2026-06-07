@@ -85,6 +85,13 @@
 #define MMU_DEBUG_MMU_PAGE     0x40082000UL
 #define MMU_DEBUG_BLOCK_PAGE   0x40400000UL
 
+#define L0_INDEX_FOR(address) ((address >> 39) & 0x1ffUL)
+#define L1_INDEX_FOR(address) ((address >> 30) & 0x1ffUL)
+#define L2_INDEX_FOR(address) ((address >> 21) & 0x1ffUL)
+#define L3_INDEX_FOR(address) ((address >> 12) & 0x1ffUL)
+
+#define ALIGN_UP(value, alignment) (((value) + (alignment) - 1UL) & ~((alignment) - 1UL))
+
 /*
  * Current mapping policy:
  * - L0 holds the single top-level entry used by the current identity map
@@ -122,33 +129,6 @@ extern char __stack_guard[];
 extern char __stack_guard_end[];
 extern char __kernel_end[];
 
-/* mmu boot debug targets moved to src/kernel/mmu_debug.c */
-
-static unsigned long l0_index_for(unsigned long address)
-{
-    return (address >> 39) & 0x1ffUL;
-}
-
-static unsigned long l1_index_for(unsigned long address)
-{
-    return (address >> 30) & 0x1ffUL;
-}
-
-static unsigned long l2_index_for(unsigned long address)
-{
-    return (address >> 21) & 0x1ffUL;
-}
-
-static unsigned long l3_index_for(unsigned long address)
-{
-    return (address >> 12) & 0x1ffUL;
-}
-
-static unsigned long align_up(unsigned long value, unsigned long alignment)
-{
-    return (value + alignment - 1UL) & ~(alignment - 1UL);
-}
-
 /* mmu debug helpers moved to src/kernel/mmu_debug.c */
 
 static unsigned long *alloc_named_table_page(const char *name)
@@ -171,21 +151,21 @@ static unsigned long *alloc_named_table_page(const char *name)
  */
 static unsigned long kernel_page_attrs(unsigned long address)
 {
-    unsigned long va = (unsigned long)pa_to_va(address);
+    unsigned long pa = (unsigned long)va_to_pa(address);
 
     /* Guard page: intentionally unmapped to catch stack overflow. */
-    if (va >= (unsigned long)__stack_guard && va < (unsigned long)__stack_guard_end) {
+    if (pa >= (unsigned long)va_to_pa(__stack_guard) && pa < (unsigned long)va_to_pa(__stack_guard_end)) {
         return 0;
     }
 
-    if (va >= (unsigned long)__text_start && va < (unsigned long)__text_end) {
+    if (pa >= (unsigned long)va_to_pa(__text_start) && pa < (unsigned long)va_to_pa(__text_end)) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RO |
                MMU_SH_INNER_SHAREABLE |
                MMU_AF;
     }
 
-    if (va >= (unsigned long)__rodata_start && va < (unsigned long)__rodata_end) {
+    if (pa >= (unsigned long)va_to_pa(__rodata_start) && pa < (unsigned long)va_to_pa(__rodata_end)) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RO |
                MMU_SH_INNER_SHAREABLE |
@@ -194,7 +174,7 @@ static unsigned long kernel_page_attrs(unsigned long address)
                MMU_UXN;
     }
 
-    if (va >= (unsigned long)__data_start && va < (unsigned long)__data_end) {
+    if (pa >= (unsigned long)va_to_pa(__data_start) && pa < (unsigned long)va_to_pa(__data_end)) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RW |
                MMU_SH_INNER_SHAREABLE |
@@ -203,7 +183,7 @@ static unsigned long kernel_page_attrs(unsigned long address)
                MMU_UXN;
     }
 
-    if (va >= (unsigned long)__bss_start && va < (unsigned long)__bss_end) {
+    if (pa >= (unsigned long)va_to_pa(__bss_start) && pa < (unsigned long)va_to_pa(__bss_end)) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RW |
                MMU_SH_INNER_SHAREABLE |
@@ -212,7 +192,7 @@ static unsigned long kernel_page_attrs(unsigned long address)
                MMU_UXN;
     }
 
-    if (va >= (unsigned long)__stack_bottom && va < (unsigned long)__stack_top) {
+    if (pa >= (unsigned long)va_to_pa(__stack_bottom) && pa < (unsigned long)va_to_pa(__stack_top)) {
         return MMU_ATTR_NORMAL |
                MMU_AP_RW |
                MMU_SH_INNER_SHAREABLE |
@@ -264,7 +244,7 @@ static int build_identity_map(void)
      * L1 block for the low physical region on QEMU virt.
      * This keeps MMIO strongly ordered as Device-nGnRnE and marks it NX.
      */
-    l1_table[l1_index_for(0x00000000UL)] = 0x00000000UL |
+    l1_table[L1_INDEX_FOR(0x00000000UL)] = 0x00000000UL |
                                            MMU_ATTR_DEVICE |
                                            MMU_AP_RW |
                                            MMU_SH_NON_SHAREABLE |
@@ -274,15 +254,15 @@ static int build_identity_map(void)
                                            MMU_DESC_BLOCK;
 
     /* TTBR0_EL1 root -> L0 -> L1 for the active lower VA space. */
-    l0_table[l0_index_for(0x00000000UL)] = ((unsigned long)l1_table) | MMU_DESC_TABLE;
+    l0_table[L0_INDEX_FOR(0x00000000UL)] = ((unsigned long)l1_table) | MMU_DESC_TABLE;
 
     /*
      * RAM fans out through L2 so the first part can either terminate as an L2
      * block or continue into L3 page tables for fine-grained permissions.
      */
-    l1_table[l1_index_for(QEMU_VIRT_RAM_BASE)] = ((unsigned long)l2_ram_table) | MMU_DESC_TABLE;
+    l1_table[L1_INDEX_FOR(QEMU_VIRT_RAM_BASE)] = ((unsigned long)l2_ram_table) | MMU_DESC_TABLE;
 
-    kernel_map_end = align_up((unsigned long)va_to_pa(__kernel_end), MMU_L2_BLOCK_SIZE);
+    kernel_map_end = ALIGN_UP((unsigned long)va_to_pa(__kernel_end), MMU_L2_BLOCK_SIZE);
     minimum_map_end = QEMU_VIRT_RAM_BASE + (MMU_KERNEL_FINE_MAP_MIN_CHUNKS * MMU_L2_BLOCK_SIZE);
     fine_map_end = kernel_map_end;
     if (fine_map_end < minimum_map_end) {
@@ -310,14 +290,14 @@ static int build_identity_map(void)
             return 0;
         }
 
-        l2_ram_table[l2_index_for(chunk_base)] = ((unsigned long)l3_table) | MMU_DESC_TABLE;
+        l2_ram_table[L2_INDEX_FOR(chunk_base)] = ((unsigned long)l3_table) | MMU_DESC_TABLE;
 
         for (address = chunk_base; address < chunk_base + MMU_L2_BLOCK_SIZE; address += PAGE_SIZE) {
             unsigned long attrs = kernel_page_attrs(address);
 
             if (attrs == 0)
                 continue; /* guard page: leave entry invalid */
-            l3_table[l3_index_for(address)] = (address & ~(PAGE_SIZE - 1UL)) |
+            l3_table[L3_INDEX_FOR(address)] = (address & ~(PAGE_SIZE - 1UL)) |
                                               attrs |
                                               MMU_DESC_PAGE;
         }
@@ -325,7 +305,7 @@ static int build_identity_map(void)
 
     /* The remaining RAM stays mapped as L2 normal-memory blocks, RW and NX. */
     for (address = fine_map_end; address < QEMU_VIRT_RAM_END; address += MMU_L2_BLOCK_SIZE) {
-        l2_ram_table[l2_index_for(address)] = (address & ~(MMU_L2_BLOCK_SIZE - 1UL)) |
+        l2_ram_table[L2_INDEX_FOR(address)] = (address & ~(MMU_L2_BLOCK_SIZE - 1UL)) |
                                               MMU_ATTR_NORMAL |
                                               MMU_AP_RW |
                                               MMU_SH_INNER_SHAREABLE |
@@ -359,7 +339,7 @@ static int build_kernel_map(void)
     unsigned long address;
 
     /* L1 device block — same PA as the identity map. */
-    l1_table_ttbr1[l1_index_for(0x00000000UL)] = 0x00000000UL |
+    l1_table_ttbr1[L1_INDEX_FOR(0x00000000UL)] = 0x00000000UL |
                                                    MMU_ATTR_DEVICE |
                                                    MMU_AP_RW |
                                                    MMU_SH_NON_SHAREABLE |
@@ -368,11 +348,11 @@ static int build_kernel_map(void)
                                                    MMU_UXN |
                                                    MMU_DESC_BLOCK;
 
-    l0_table_ttbr1[l0_index_for(0x00000000UL)] = ((unsigned long)l1_table_ttbr1) | MMU_DESC_TABLE;
+    l0_table_ttbr1[L0_INDEX_FOR(0x00000000UL)] = ((unsigned long)l1_table_ttbr1) | MMU_DESC_TABLE;
 
-    l1_table_ttbr1[l1_index_for(QEMU_VIRT_RAM_BASE)] = ((unsigned long)l2_ram_table_ttbr1) | MMU_DESC_TABLE;
+    l1_table_ttbr1[L1_INDEX_FOR(QEMU_VIRT_RAM_BASE)] = ((unsigned long)l2_ram_table_ttbr1) | MMU_DESC_TABLE;
 
-    kernel_map_end = align_up((unsigned long)va_to_pa(__kernel_end), MMU_L2_BLOCK_SIZE);
+    kernel_map_end = ALIGN_UP((unsigned long)va_to_pa(__kernel_end), MMU_L2_BLOCK_SIZE);
     minimum_map_end = QEMU_VIRT_RAM_BASE + (MMU_KERNEL_FINE_MAP_MIN_CHUNKS * MMU_L2_BLOCK_SIZE);
     fine_map_end = kernel_map_end;
     if (fine_map_end < minimum_map_end) {
@@ -390,21 +370,21 @@ static int build_kernel_map(void)
             return 0;
         }
 
-        l2_ram_table_ttbr1[l2_index_for(chunk_base)] = ((unsigned long)l3_table) | MMU_DESC_TABLE;
+        l2_ram_table_ttbr1[L2_INDEX_FOR(chunk_base)] = ((unsigned long)l3_table) | MMU_DESC_TABLE;
 
         for (address = chunk_base; address < chunk_base + MMU_L2_BLOCK_SIZE; address += PAGE_SIZE) {
             unsigned long attrs = kernel_page_attrs(address);
 
             if (attrs == 0)
                 continue; /* guard page: leave entry invalid */
-            l3_table[l3_index_for(address)] = (address & ~(PAGE_SIZE - 1UL)) |
+            l3_table[L3_INDEX_FOR(address)] = (address & ~(PAGE_SIZE - 1UL)) |
                                               attrs |
                                               MMU_DESC_PAGE;
         }
     }
 
     for (address = fine_map_end; address < QEMU_VIRT_RAM_END; address += MMU_L2_BLOCK_SIZE) {
-        l2_ram_table_ttbr1[l2_index_for(address)] = (address & ~(MMU_L2_BLOCK_SIZE - 1UL)) |
+        l2_ram_table_ttbr1[L2_INDEX_FOR(address)] = (address & ~(MMU_L2_BLOCK_SIZE - 1UL)) |
                                                      MMU_ATTR_NORMAL |
                                                      MMU_AP_RW |
                                                      MMU_SH_INNER_SHAREABLE |
@@ -460,7 +440,6 @@ void mmu_init(void)
     if (!build_kernel_map()) {
         return;
     }
-
 #endif
 
     kernel_debug_log_mmu_boot_targets();
@@ -745,25 +724,25 @@ static int mmu_resolve_user_page(const struct mm_context *mm,
     }
 
     l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
-    entry = l0[l0_index_for(va)];
+    entry = l0[L0_INDEX_FOR(va)];
     if ((entry & MMU_DESC_VALID) == 0UL || (entry & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
         return 0;
     }
 
     l1 = (unsigned long *)pa_to_va((void *)(entry & MMU_DESC_ADDR_MASK));
-    entry = l1[l1_index_for(va)];
+    entry = l1[L1_INDEX_FOR(va)];
     if ((entry & MMU_DESC_VALID) == 0UL || (entry & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
         return 0;
     }
 
     l2 = (unsigned long *)pa_to_va((void *)(entry & MMU_DESC_ADDR_MASK));
-    entry = l2[l2_index_for(va)];
+    entry = l2[L2_INDEX_FOR(va)];
     if ((entry & MMU_DESC_VALID) == 0UL || (entry & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
         return 0;
     }
 
     l3 = (unsigned long *)pa_to_va((void *)(entry & MMU_DESC_ADDR_MASK));
-    entry = l3[l3_index_for(va)];
+    entry = l3[L3_INDEX_FOR(va)];
     if ((entry & MMU_DESC_VALID) == 0UL || (entry & MMU_DESC_TYPE_MASK) != MMU_DESC_PAGE) {
         return 0;
     }
@@ -998,7 +977,7 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
     l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
 
     /* L0 -> L1 */
-    idx = l0_index_for(va);
+    idx = L0_INDEX_FOR(va);
     if ((l0[idx] & MMU_DESC_VALID) == 0UL) {
         new_page = page_alloc();
         if (new_page == (void *)0) {
@@ -1013,7 +992,7 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
     l1 = (unsigned long *)pa_to_va((void *)(l0[idx] & MMU_DESC_ADDR_MASK));
 
     /* L1 -> L2 */
-    idx = l1_index_for(va);
+    idx = L1_INDEX_FOR(va);
     if ((l1[idx] & MMU_DESC_VALID) == 0UL) {
         new_page = page_alloc();
         if (new_page == (void *)0) {
@@ -1028,7 +1007,7 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
     l2 = (unsigned long *)pa_to_va((void *)(l1[idx] & MMU_DESC_ADDR_MASK));
 
     /* L2 -> L3 */
-    idx = l2_index_for(va);
+    idx = L2_INDEX_FOR(va);
     if ((l2[idx] & MMU_DESC_VALID) == 0UL) {
         new_page = page_alloc();
         if (new_page == (void *)0) {
@@ -1046,7 +1025,7 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
      * Force nG=1 (bit 11) so the TLB entry is tagged with the current ASID
      * rather than being global — required for correct ASID-based isolation.
      */
-    idx = l3_index_for(va);
+    idx = L3_INDEX_FOR(va);
     l3[idx] = (pa & MMU_L3_PAGE_ADDR_MASK) | flags | MMU_DESC_PAGE | (1UL << 11);
 
     /*
@@ -1086,25 +1065,25 @@ int mmu_unmap_user_page(struct mm_context *mm, unsigned long va)
     }
 
     l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
-    idx = l0_index_for(va);
+    idx = L0_INDEX_FOR(va);
     if ((l0[idx] & MMU_DESC_VALID) == 0UL || (l0[idx] & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
         return 0;
     }
 
     l1 = (unsigned long *)pa_to_va((void *)(l0[idx] & MMU_DESC_ADDR_MASK));
-    idx = l1_index_for(va);
+    idx = L1_INDEX_FOR(va);
     if ((l1[idx] & MMU_DESC_VALID) == 0UL || (l1[idx] & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
         return 0;
     }
 
     l2 = (unsigned long *)pa_to_va((void *)(l1[idx] & MMU_DESC_ADDR_MASK));
-    idx = l2_index_for(va);
+    idx = L2_INDEX_FOR(va);
     if ((l2[idx] & MMU_DESC_VALID) == 0UL || (l2[idx] & MMU_DESC_TYPE_MASK) != MMU_DESC_TABLE) {
         return 0;
     }
 
     l3 = (unsigned long *)pa_to_va((void *)(l2[idx] & MMU_DESC_ADDR_MASK));
-    idx = l3_index_for(va);
+    idx = L3_INDEX_FOR(va);
     if ((l3[idx] & MMU_DESC_VALID) == 0UL || (l3[idx] & MMU_DESC_TYPE_MASK) != MMU_DESC_PAGE) {
         return 0;
     }

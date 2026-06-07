@@ -43,7 +43,12 @@
 /*
  * Convert a kernel virtual address (pointer) back to the underlying
  * physical address.  Returns an unsigned long, not a pointer.
+ *
+ * Safe for use both before and after the MMU is enabled: if the address
+ * is already in the physical range, it is returned unchanged.
  */
-#define va_to_pa(va)  ((unsigned long)(va) - KERNEL_VA_OFFSET)
+#define va_to_pa(va)  ((unsigned long)(va) >= KERNEL_VA_OFFSET ? \
+                        (unsigned long)(va) - KERNEL_VA_OFFSET : \
+                        (unsigned long)(va))
 
 #endif

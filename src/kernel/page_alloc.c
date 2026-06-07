@@ -171,12 +171,9 @@ void page_allocator_init(void)
      * text/data/bss/boot stack and must never re-enter the free list.
      */
     ram_end = QEMU_VIRT_RAM_BASE + QEMU_VIRT_RAM_SIZE;
-    managed_start = align_up((unsigned long)__kernel_end, PAGE_SIZE);
+    managed_start = align_up((unsigned long)va_to_pa(__kernel_end), PAGE_SIZE);
     managed_end = ram_end;
     reserved_bytes = managed_start - QEMU_VIRT_RAM_BASE;
-
-    KER_LOGF("[info] page_alloc init: image_end_raw=%lx image_end_aligned=%lx ram_end=%lx\n",
-             (unsigned long)__kernel_end, managed_start, managed_end);
 
     page_free_list_pa = 0UL;
     total_pages = 0UL;

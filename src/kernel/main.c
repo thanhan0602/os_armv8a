@@ -88,6 +88,7 @@ void kernel_main_early(unsigned long boot_fdt_pa)
  */
 void kernel_main(void)
 {
+    KER_INFO("kernel_main: jumped to high virtual address");
 #ifdef CONFIG_KERNEL_VIRTUAL
     exception_init();
 
