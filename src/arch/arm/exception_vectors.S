@@ -172,6 +172,7 @@ exception_sync_entry:
 
 .global fork_child_exit
 fork_child_exit:
+    bl sched_new_task_kickoff
     restore_context
     eret
 

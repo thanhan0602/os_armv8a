@@ -12,6 +12,7 @@
  * - later RAM uses L2 blocks to keep table usage small
  */
 void mmu_init(void);
+void mmu_init_secondary(void);
 int mmu_is_enabled(void);
 int mmu_handle_page_fault(unsigned long far_el1, unsigned long esr_el1);
 

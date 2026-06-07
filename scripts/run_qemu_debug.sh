@@ -3,10 +3,15 @@ set -euo pipefail
 
 echo "Starting QEMU"
 
-QEMU_BIN="${QEMU_BIN:-/home/a/qemu/build/qemu-system-aarch64}"
+QEMU_BIN="${QEMU_BIN:-/home/a/qemu/build}"
 KERNEL_IMG="${KERNEL_IMG:-build/kernel8.img}"
 MONITOR_PORT=4445
 GDB_PORT=1234
+
+# If QEMU_BIN is a directory, append the binary name
+if [[ -d "$QEMU_BIN" ]]; then
+  QEMU_BIN="$QEMU_BIN/qemu-system-aarch64"
+fi
 
 if [[ ! -x "$QEMU_BIN" ]]; then
   echo "QEMU binary not found or not executable: $QEMU_BIN" >&2

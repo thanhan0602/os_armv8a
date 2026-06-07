@@ -2,6 +2,7 @@
 #define KERNEL_DRIVER_H
 
 void driver_system_init(void);
+void driver_secondary_init(void);
 void driver_system_dump(void);
 
 int driver_uart_is_ready(void);

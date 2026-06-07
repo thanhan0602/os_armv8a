@@ -1,6 +1,8 @@
 .section .text.boot
 .global _start
+.global secondary_entry
 .type _start, %function
+.type secondary_entry, %function
 
 _start:
     mov x9, x0
@@ -8,6 +10,40 @@ _start:
     and x0, x0, #0xff
     cbz x0, 0f
 
+secondary_entry:
+    /* Secondary CPU path */
+    adrp x0, __stack_top
+    add  x0, x0, :lo12:__stack_top
+    
+    /* Give each CPU a separate 16KB stack */
+    mrs x1, mpidr_el1
+    and x1, x1, #0xff
+    lsl x1, x1, #14  /* CPU_ID * 16KB */
+    sub x0, x0, x1
+    mov sp, x0
+
+    /* Enable FP/SIMD */
+    mrs x0, cpacr_el1
+    orr x0, x0, #(3 << 20)
+    msr cpacr_el1, x0
+    isb
+
+    bl secondary_main_early
+    
+    /* 
+     * Now MMU is ON for this core.
+     * Switch to high VA space.
+     */
+    ldr x9, =__kernel_va_offset
+
+    mov x0, sp
+    add x0, x0, x9
+    mov sp, x0
+
+    ldr x0, =secondary_main
+    br  x0
+    
+    /* Should not return */
 1:
     wfe
     b 1b

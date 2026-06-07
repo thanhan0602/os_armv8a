@@ -1,4 +1,5 @@
 #include <user/syscall.h>
+#include <user/shared.h>
 
 int main(void)
 {
@@ -7,11 +8,11 @@ int main(void)
 
     result = user_ipc_send(1UL, message, sizeof(message) - 1UL);
     if (result < 0) {
-        user_write_string("[ipc-send] send failed\n");
+        printf("[ipc-send] send failed\n");
         user_exit(1UL);
     }
 
-    user_write_string("[ipc-send] sent message on channel 1\n");
+    printf("[ipc-send] sent message on channel 1\n");
     user_exit(0UL);
     return 0;
 }

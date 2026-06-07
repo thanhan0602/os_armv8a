@@ -42,6 +42,12 @@ void driver_system_init(void)
     }
 }
 
+void driver_secondary_init(void)
+{
+    gicv2_init_secondary();
+    timer_init();
+}
+
 void driver_system_dump(void)
 {
     KER_LOGF("[driver] uart=%s gic=%s timer=%s\n",

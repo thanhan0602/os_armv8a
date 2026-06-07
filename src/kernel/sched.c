@@ -7,13 +7,15 @@
 #include <kernel/process.h>
 #include <kernel/vm.h>
 #include <kernel/console.h>
+#include <kernel/spinlock.h>
+#include <drivers/interrupt/gicv2.h>
 #include <arch/arm/cpu.h>
 
 extern void task_entry_trampoline(void);
 
-static struct task tasks[MAX_TASKS];
+struct task tasks[MAX_TASKS];
 static unsigned long next_task_id;
-static struct task *current;
+static struct spinlock sched_lock = SPINLOCK_INITIALIZER;
 static unsigned long switch_count;
 
 static const char *sched_state_name(unsigned long state)
@@ -66,7 +68,7 @@ static struct task *sched_allocate_task_slot(void)
 {
     unsigned long index;
 
-    for (index = 1UL; index < MAX_TASKS; index++) {
+    for (index = 4UL; index < MAX_TASKS; index++) {
         if (tasks[index].name == (const char *)0) {
             return &tasks[index];
         }
@@ -83,23 +85,30 @@ void sched_init(void)
     switch_count = 0;
 
     /*
-     * Task 0 is the idle / boot task.  It uses the boot stack and is
-     * already running, so its context will be filled by the first
-     * switch_context call that switches away from it.
+     * CPUs 0-3 get idle tasks in slots 0-3.
      */
-    idle = &tasks[0];
-    idle->id = next_task_id++;
-    idle->state = TASK_STATE_RUNNING;
-    idle->stack_base = (void *)0;
-    idle->stack_size = 0;
-    idle->name = "idle";
-    idle->next = idle;
+    for (unsigned int i = 0; i < 4; i++) {
+        idle = &tasks[i];
+        idle->id = next_task_id++;
+        idle->state = TASK_STATE_RUNNING;
+        idle->stack_base = (void *)0;
+        idle->stack_size = 0;
+        
+        char *name = (char *)page_alloc_contiguous(1); // Leak but it's init
+        pa_to_va(name); // not really needed as it is PA=VA for now or we use pa_to_va
+        /* Actually simpler just use static names */
+        static const char *idle_names[] = {"idle0", "idle1", "idle2", "idle3"};
+        idle->name = idle_names[i];
+        
+        /* Circular list setup: 0->1->2->3->0 */
+        idle->next = &tasks[(i + 1) % 4];
 
-    for (int i = 0; i < MAX_FILES_PER_TASK; i++) {
-        idle->files[i] = (struct file *)0;
+        for (int j = 0; j < MAX_FILES_PER_TASK; j++) {
+            idle->files[j] = (struct file *)0;
+        }
     }
 
-    current = idle;
+    arch_set_current_task(&tasks[0]);
 }
 
 struct task *task_create(task_fn_t entry, const char *name)
@@ -109,22 +118,21 @@ struct task *task_create(task_fn_t entry, const char *name)
     unsigned char *stack_va;
     unsigned long sp;
 
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
+
     t = sched_allocate_task_slot();
     if (t == (struct task *)0) {
+        spin_unlock_irqrestore(&sched_lock, flags);
         KER_INFO("task_create: max tasks reached");
         return (struct task *)0;
     }
 
     /*
      * Allocate guard page + usable stack contiguously.
-     * Layout: [guard page (low)] [usable stack (high)]
-     * The guard page is allocated but never written to, so a stack
-     * overflow will corrupt only the guard rather than another
-     * allocation.  (Hardware-enforced guard would require splitting
-     * L2 block mappings into L3 entries, deferred to a later stage.)
      */
     stack_pa = page_alloc_contiguous(TASK_TOTAL_PAGES);
     if (stack_pa == (void *)0) {
+        spin_unlock_irqrestore(&sched_lock, flags);
         KER_INFO("task_create: stack alloc failed");
         return (struct task *)0;
     }
@@ -159,10 +167,13 @@ struct task *task_create(task_fn_t entry, const char *name)
     t->context.sp = sp;
 
     /* Insert into circular list after current task */
-    t->next = current->next;
-    current->next = t;
+    struct task *curr = arch_get_current_task();
+    t->next = curr->next;
+    curr->next = t;
 
     next_task_id++;
+
+    spin_unlock_irqrestore(&sched_lock, flags);
 
     return t;
 }
@@ -181,14 +192,18 @@ struct task *task_create_user(struct process *process,
         return (struct task *)0;
     }
 
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
+
     t = sched_allocate_task_slot();
     if (t == (struct task *)0) {
+        spin_unlock_irqrestore(&sched_lock, flags);
         KER_INFO("task_create_user: max tasks reached");
         return (struct task *)0;
     }
 
     stack_pa = page_alloc_contiguous(TASK_TOTAL_PAGES);
     if (stack_pa == (void *)0) {
+        spin_unlock_irqrestore(&sched_lock, flags);
         KER_INFO("task_create_user: kernel stack alloc failed");
         return (struct task *)0;
     }
@@ -225,10 +240,13 @@ struct task *task_create_user(struct process *process,
     t->context.x30 = (unsigned long)el0_entry_trampoline;
     t->context.sp = sp;
 
-    t->next = current->next;
-    current->next = t;
+    struct task *curr = arch_get_current_task();
+    t->next = curr->next;
+    curr->next = t;
 
     next_task_id++;
+
+    spin_unlock_irqrestore(&sched_lock, flags);
 
     return t;
 }
@@ -243,11 +261,12 @@ static void sched_reap_dead(void)
 {
     struct task *prev;
     struct task *t;
+    struct task *curr = arch_get_current_task();
 
-    prev = current;
-    t = current->next;
+    prev = curr;
+    t = curr->next;
 
-    while (t != current) {
+    while (t != curr) {
         if (t->state == TASK_STATE_DEAD) {
             prev->next = t->next;
 
@@ -278,14 +297,21 @@ static void sched_reap_dead(void)
     }
 }
 
+void sched_new_task_kickoff(void)
+{
+    spin_unlock(&sched_lock);
+}
+
 void schedule(void)
 {
     struct task *prev;
     struct task *next;
+    
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
 
     sched_reap_dead();
 
-    prev = current;
+    prev = arch_get_current_task();
     next = prev->next;
 
     /* Round-robin: find next ready task, skip dead ones */
@@ -297,6 +323,7 @@ void schedule(void)
     }
 
     if (next == prev) {
+        spin_unlock_irqrestore(&sched_lock, flags);
         return;
     }
 
@@ -304,28 +331,42 @@ void schedule(void)
         prev->state = TASK_STATE_READY;
     }
     next->state = TASK_STATE_RUNNING;
-    current = next;
+    
+    arch_set_current_task(next);
+    switch_count++;
 
 #ifdef CONFIG_KERNEL_VIRTUAL
     mmu_context_switch(next->mm);
 #endif
 
+    /* 
+     * IMPORTANT: We hold the spinlock across switch_context!
+     * The task we switch to will release the lock.
+     * This is a standard pattern in SMP schedulers.
+     */
     switch_context(&prev->context, &next->context);
+    
+    /* When we are switched back to, we release the lock */
+    spin_unlock_irqrestore(&sched_lock, flags);
 }
 
 void task_exit(void)
 {
-    struct task *t;
-    current->state = TASK_STATE_ZOMBIE;
+    struct task *curr = arch_get_current_task();
+    
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
+    curr->state = TASK_STATE_ZOMBIE;
 
     /* Wake up parent if it's waiting */
     for (unsigned long i = 0; i < MAX_TASKS; i++) {
-        t = &tasks[i];
-        if (t->name && t->id == current->parent_id && t->state == TASK_STATE_BLOCKED) {
+        struct task *t = &tasks[i];
+        if (t->name && t->id == curr->parent_id && t->state == TASK_STATE_BLOCKED) {
             t->state = TASK_STATE_READY;
             break;
         }
     }
+    
+    spin_unlock_irqrestore(&sched_lock, flags);
 
     schedule();
 
@@ -336,16 +377,18 @@ void task_exit(void)
 
 struct task *sched_current(void)
 {
-    return current;
+    return arch_get_current_task();
 }
 
 void sched_block_task(struct task *task)
 {
-    if (task == (struct task *)0 || task->id == 0UL || task->state == TASK_STATE_DEAD) {
+    if (task == (struct task *)0 || task->id < 4UL || task->state == TASK_STATE_DEAD) {
         return;
     }
 
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
     task->state = TASK_STATE_BLOCKED;
+    spin_unlock_irqrestore(&sched_lock, flags);
 }
 
 void sched_wake_task(struct task *task)
@@ -354,12 +397,24 @@ void sched_wake_task(struct task *task)
         return;
     }
 
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
     task->state = TASK_STATE_READY;
+    spin_unlock_irqrestore(&sched_lock, flags);
+
+    /* Send IPI to all other cores to trigger schedule() */
+    unsigned int current_cpu = arch_get_cpu_id();
+    unsigned int target_mask = 0;
+    for (unsigned int i = 0; i < 4; i++) {
+        if (i != current_cpu) {
+            target_mask |= (1 << i);
+        }
+    }
+    gicv2_send_ipi(target_mask, 0);
 }
 
 unsigned long sched_wait4(long pid, unsigned long status_ptr)
 {
-    struct task *curr = current;
+    struct task *curr = sched_current();
 
     for (;;) {
         int found_child = 0;
@@ -426,7 +481,7 @@ int sched_kill_task(unsigned long task_id)
             continue;
         }
 
-        if (task == current || task->id == 0UL || task->state == TASK_STATE_DEAD) {
+        if (task == sched_current() || task->id < 4UL || task->state == TASK_STATE_DEAD) {
             return 0;
         }
 

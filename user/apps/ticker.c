@@ -1,9 +1,10 @@
 #include <user/syscall.h>
+#include <user/shared.h>
 
 int main(void)
 {
     for (;;) {
-        user_write_string("[user-ticker] tick\n");
+        printf("[user-ticker] tick\n");
         user_yield();
     }
 }

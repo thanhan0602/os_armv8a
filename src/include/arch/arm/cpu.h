@@ -38,6 +38,31 @@ static inline void cpu_brk(unsigned short imm)
     __asm__ volatile("brk #0");
 }
 
+static inline unsigned long arch_get_mpidr(void)
+{
+    unsigned long mpidr;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return mpidr;
+}
+
+static inline unsigned int arch_get_cpu_id(void)
+{
+    /* AFF0 is usually the CPU ID in simple virt setups */
+    return (unsigned int)(arch_get_mpidr() & 0xFF);
+}
+
+static inline void arch_set_current_task(void *task)
+{
+    __asm__ volatile("msr tpidr_el1, %0" : : "r"(task));
+}
+
+static inline void *arch_get_current_task(void)
+{
+    void *task;
+    __asm__ volatile("mrs %0, tpidr_el1" : "=r"(task));
+    return task;
+}
+
 static inline unsigned long arch_local_irq_save(void)
 {
     unsigned long flags;

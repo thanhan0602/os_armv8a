@@ -58,10 +58,10 @@ void mmu_install_empty_ttbr0_root(void)
 /*
  * ASID allocation state.
  * ASID 0 is reserved for kernel tasks / the empty lower-half root.
- * 8-bit ASIDs (TCR_EL1.AS=0): valid user range is 1–255.
+ * 16-bit ASIDs (TCR_EL1.AS=1): valid user range is 1–65535.
  */
 static unsigned int next_asid = 1;
-static unsigned char asid_in_use[256];
+static unsigned long asid_bitmap[65536 / 64];
 
 static void mmu_tlbi_asid(unsigned int asid)
 {
@@ -72,23 +72,38 @@ static void mmu_tlbi_asid(unsigned int asid)
     mmu_invalidate_tlb_asid(asid);
 }
 
+static void mmu_asid_set(unsigned int asid)
+{
+    asid_bitmap[asid / 64] |= (1UL << (asid % 64));
+}
+
+static void mmu_asid_clear(unsigned int asid)
+{
+    asid_bitmap[asid / 64] &= ~(1UL << (asid % 64));
+}
+
+static int mmu_asid_test(unsigned int asid)
+{
+    return (asid_bitmap[asid / 64] & (1UL << (asid % 64))) != 0UL;
+}
+
 static unsigned int mmu_asid_alloc(void)
 {
     unsigned int attempts;
     unsigned int asid;
 
-    for (attempts = 0U; attempts < 255U; attempts++) {
+    for (attempts = 0U; attempts < 65535U; attempts++) {
         asid = next_asid;
         next_asid++;
-        if (next_asid >= 256U) {
+        if (next_asid >= 65536U) {
             next_asid = 1U;
         }
 
-        if (asid == 0U || asid >= 256U || asid_in_use[asid] != 0U) {
+        if (asid == 0U || asid >= 65536U || mmu_asid_test(asid)) {
             continue;
         }
 
-        asid_in_use[asid] = 1U;
+        mmu_asid_set(asid);
         mmu_tlbi_asid(asid);
         return asid;
     }
@@ -98,12 +113,12 @@ static unsigned int mmu_asid_alloc(void)
 
 static void mmu_asid_free(unsigned int asid)
 {
-    if (asid == 0U) {
+    if (asid == 0U || asid >= 65536U) {
         return;
     }
 
     mmu_tlbi_asid(asid);
-    asid_in_use[asid] = 0U;
+    mmu_asid_clear(asid);
 }
 
 static int mmu_context_has_page(const struct mm_context *mm, unsigned long pa)

@@ -3,6 +3,7 @@
 ## Subsystem handoff
 
 - [MMU](document/handoff_mmu.md)
+- [SMP](document/handoff_smp.md)
 - [Heap](document/handoff_heap.md)
 - [IPC](document/handoff_ipc.md)
 - [Loader](document/handoff_loader.md)
@@ -98,6 +99,13 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
   - user ELF hiện đã chuyển sang `ET_DYN`/PIE thay vì `ET_EXEC`; loader chọn load bias theo từng process trong user image window, nên app không còn phụ thuộc vào VMA link cứng như `0x10000`
   - `process_create_from_elf()` hiện map PT_LOAD tại `load_bias + p_vaddr`, cộng `load_bias` vào `e_entry`, và nếu có `R_AARCH64_RELATIVE` trong `PT_DYNAMIC` thì áp relocation tối thiểu trong kernel trước khi task chạy
   - heap của ELF process không còn cố định ở `0x00040000`; `brk(0)` giờ bắt đầu ngay sau image đã map, có một page guard giữa image và heap
+- **Stage 14 (Lazy Loading & Copy-on-Write)** — hoàn thành và verify trên QEMU:
+  - Chuyển đổi từ mô hình nạp code "eager" (copy toàn bộ vào RAM ngay khi nạp) sang "Lazy Loading" (Demand Paging).
+  - Thêm `struct vm_region` để quản lý các vùng nhớ ảo (ELF segments, Stack, Heap).
+  - Cập nhật Fault Handler để xử lý Translation Fault từ EL0 bằng cách nạp trang từ ELF image hoặc zero-fill cho vùng anonymous khi truy cập lần đầu.
+  - Hỗ trợ Copy-on-Write (CoW): Physical pages hiện có reference counting. Khi `fork()` (đã sẵn sàng kiến trúc) hoặc shared pages được truy cập ghi, kernel sẽ nhân bản trang nếu ref_count > 1.
+  - Cập nhật software-walk (`mmu_copy_from_user`/`mmu_copy_to_user`) để thủ công kích hoạt fault handler, đảm bảo syscalls hoạt động đúng trên các vùng nhớ chưa được nạp (e.g. string truyền vào syscall).
+  - Đã verify thành công với `test_cow.elf` (tính cô lập dữ liệu giữa cha và con qua CoW) và `hello.elf` (lazy load mã nguồn và dữ liệu).
   - runtime verify mới nhất cho PIE path: `hello` được load tại `entry=0x10000 brk=0x14000`, `fault` tại `entry=0x20000 brk=0x24000`, và một instance `hello` khác tại `entry=0x30000 brk=0x34000`; `fault` vẫn tạo permission fault bằng cách ghi vào chính image read-only của nó thay vì hardcode `0x10000`
 - **Shared-library groundwork** — đã chạy được end-to-end trên QEMU:
   - build hiện tạo thêm shared object mẫu `build/user/lib/libshared.so` và app phụ thuộc `build/user/external/shared_client.elf`

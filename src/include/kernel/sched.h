@@ -70,6 +70,7 @@ struct task *task_create_user(struct process *process,
 #endif
 
 void schedule(void);
+void sched_new_task_kickoff(void);
 void task_exit(void);
 struct task *sched_current(void);
 void sched_block_task(struct task *task);

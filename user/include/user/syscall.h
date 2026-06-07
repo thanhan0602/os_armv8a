@@ -5,6 +5,9 @@
 #define USER_SYS_EXIT   93UL
 #define USER_SYS_YIELD  124UL
 #define USER_SYS_BRK    214UL
+#define USER_SYS_MUNMAP 215UL
+#define USER_SYS_FORK   220UL
+#define USER_SYS_WAIT4  260UL
 #define USER_SYS_IPC_SEND  451UL
 #define USER_SYS_IPC_RECV  452UL
 
@@ -33,6 +36,21 @@ static inline long user_syscall1(unsigned long nr, unsigned long arg0)
         "svc #0"
         : "+r"(x0)
         : "r"(x8)
+        : "memory");
+
+    return (long)x0;
+}
+
+static inline long user_syscall2(unsigned long nr, unsigned long arg0, unsigned long arg1)
+{
+    register unsigned long x8 __asm__("x8") = nr;
+    register unsigned long x0 __asm__("x0") = arg0;
+    register unsigned long x1 __asm__("x1") = arg1;
+
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x8)
         : "memory");
 
     return (long)x0;
@@ -75,6 +93,21 @@ static inline long user_exit(unsigned long code)
 static inline unsigned long user_brk(unsigned long new_break)
 {
     return (unsigned long)user_syscall1(USER_SYS_BRK, new_break);
+}
+
+static inline long user_munmap(void *addr, unsigned long len)
+{
+    return user_syscall2(USER_SYS_MUNMAP, (unsigned long)addr, len);
+}
+
+static inline long user_fork(void)
+{
+    return user_syscall0(USER_SYS_FORK);
+}
+
+static inline long user_wait4(long pid, int *status)
+{
+    return user_syscall2(USER_SYS_WAIT4, (unsigned long)pid, (unsigned long)status);
 }
 
 static inline long user_ipc_send(unsigned long channel_id, const void *buf, unsigned long len)

@@ -3,6 +3,7 @@
 #include <kernel/log.h>
 #include <kernel/page_alloc.h>
 #include <kernel/vm.h>
+#include <kernel/spinlock.h>
 
 /*
  * Heap layout inside one physical page:
@@ -50,6 +51,7 @@ static unsigned long kernel_heap_free_space;
 static unsigned long kernel_heap_used_space;
 static unsigned long kernel_heap_allocations;
 static unsigned long kernel_heap_failed;
+static struct spinlock heap_lock = SPINLOCK_INITIALIZER;
 
 /* Keep allocations naturally aligned for 64-bit objects and small structs. */
 static unsigned long kernel_heap_align_up(unsigned long value, unsigned long alignment)
@@ -290,7 +292,10 @@ void *kmalloc(unsigned long size)
     unsigned long aligned_size;
     unsigned long required_pages;
 
+    unsigned long flags = spin_lock_irqsave(&heap_lock);
+
     if (size == 0UL) {
+        spin_unlock_irqrestore(&heap_lock, flags);
         return (void *)0;
     }
 
@@ -301,6 +306,7 @@ void *kmalloc(unsigned long size)
     while (page != (struct kernel_heap_page *)0) {
         allocation = kernel_heap_allocate_from_arena(page, aligned_size);
         if (allocation != (void *)0) {
+            spin_unlock_irqrestore(&heap_lock, flags);
             return allocation;
         }
 
@@ -310,10 +316,13 @@ void *kmalloc(unsigned long size)
     /* No existing arena had room, so grow the heap by the number of pages this size needs. */
     page = kernel_heap_add_arena(required_pages);
     if (page == (struct kernel_heap_page *)0) {
+        spin_unlock_irqrestore(&heap_lock, flags);
         return (void *)0;
     }
 
-    return kernel_heap_allocate_from_arena(page, aligned_size);
+    allocation = kernel_heap_allocate_from_arena(page, aligned_size);
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return allocation;
 }
 
 void kfree(void *ptr)
@@ -325,14 +334,18 @@ void kfree(void *ptr)
         return;
     }
 
+    unsigned long flags = spin_lock_irqsave(&heap_lock);
+
     page = kernel_heap_page_from_pointer(ptr);
     if (page == (struct kernel_heap_page *)0) {
+        spin_unlock_irqrestore(&heap_lock, flags);
         KER_LOGF("[warn] ignoring invalid heap free: %p\n", ptr);
         return;
     }
 
     block = ((struct kernel_heap_block *)ptr) - 1;
     if (block->is_free != 0UL) {
+        spin_unlock_irqrestore(&heap_lock, flags);
         KER_LOGF("[warn] ignoring duplicate heap free: %p\n", ptr);
         return;
     }
@@ -341,6 +354,8 @@ void kfree(void *ptr)
     kernel_heap_used_space -= block->size;
     kernel_heap_free_space += block->size;
     kernel_heap_coalesce(block);
+
+    spin_unlock_irqrestore(&heap_lock, flags);
 }
 
 unsigned long kernel_heap_total_pages(void)

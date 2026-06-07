@@ -14,6 +14,7 @@ fi
 exec "$QEMU_BIN" \
   -machine virt,gic-version=2 \
   -cpu max \
+  -smp 4 \
   -nographic \
   -serial mon:stdio \
   -kernel "$KERNEL_IMG"

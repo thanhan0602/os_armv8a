@@ -236,7 +236,10 @@ void exception_handle_irq(unsigned long vector_id,
         return;
     }
 
-    if (!timer_handle_irq(intid)) {
+    if (intid == 0U) {
+        /* IPI 0: reschedule request */
+        /* ACK/EOI is enough to clear the SGI */
+    } else if (!timer_handle_irq(intid)) {
         KER_LOGF("[irq] unexpected vector=%s\n", exception_vector_name(vector_id));
         KER_LOGF("[irq] unexpected intid=%u\n", intid);
     }

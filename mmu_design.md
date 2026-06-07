@@ -98,6 +98,30 @@ flowchart TD
         L0_0 --> L1R_0
         L1R_0 --> L2_0
         L2_0 --> L3_0
+
+## Lazy Loading (Demand Paging)
+
+Hệ thống đã chuyển từ việc copy toàn bộ image vào RAM sang cơ chế nạp theo yêu cầu (Demand Paging).
+
+### Vùng nhớ (VM Regions)
+Mỗi process quản lý một danh sách các `vm_region` mô tả các vùng nhớ ảo:
+- **ELF Region**: Trỏ tới buffer chứa nội dung file ELF gốc trong RAM (kernel identity map). Khi fault xảy ra, trang tương ứng sẽ được copy từ buffer này vào page mới được map cho user.
+- **Anonymous Region (Stack/Heap)**: Không có file backend. Khi fault xảy ra, một trang mới được cấp phát và xóa trắng (zero-filled).
+
+### Xử lý Fault (Software vs Hardware)
+- **Hardware Fault**: Xảy ra khi CPU truy cập địa chỉ chưa map. `mmu_handle_process_page_fault` sẽ tìm region tương ứng và map trang mới.
+- **Software Walk Fault**: Xảy ra khi kernel thực hiện `mmu_copy_from_user` (software walk qua page tables). Nếu không tìm thấy mapping, kernel chủ động gọi logic của fault handler để nạp trang đó trước khi tiếp tục thao tác copy. Điều này đảm bảo các syscall như `write(fd, "hello", 5)` hoạt động đúng ngay cả khi chuỗi `"hello"` chưa được nạp vào RAM.
+
+## Copy-on-Write (CoW)
+
+Cơ chế CoW cho phép các process chia sẻ cùng một trang vật lý cho đến khi có một process thực hiện thao tác ghi.
+
+1.  **Reference Counting**: Mỗi trang vật lý (`page_pa`) có một `ref_count` được lưu trữ trong kernel.
+2.  **ReadOnly Mapping**: Khi chia sẻ trang (ví dụ qua `fork` hoặc dùng chung library), trang được map với quyền `RO` (Read-only) ở cả hai process, và `ref_count` tăng lên.
+3.  **Permission Fault**: Khi một process ghi vào trang `RO` này, hardware kích hoạt Permission Fault.
+4.  **Handling**:
+    - Nếu `ref_count == 1`: Chỉ cần nâng cấp quyền trang lên `RW`.
+    - Nếu `ref_count > 1`: Cấp phát trang mới, copy dữ liệu, thay đổi mapping của process hiện tại sang trang mới, map nó là `RW`, và giảm `ref_count` của trang cũ.
         L3_0 --> KP_0
         L2_0 --> RB_0
     end
@@ -108,6 +132,38 @@ flowchart TD
         L1D_1[t1-L1 device block]
         L1R_1[t1-L1 RAM table entry]
         L2_1[t1-L2 RAM table]
+    end
+
+## Tính năng nâng cao
+
+### 1. ASID (Address Space Identifier)
+
+Chúng ta sử dụng 8-bit ASID để gán nhãn cho các entry trong TLB, cho phép nhiều process cùng tồn tại trong TLB mà không cần flush toàn bộ khi context switch.
+- **ASID Allocation**: Mỗi `mm_context` được gán một ASID duy nhất (từ 1 đến 255). ASID 0 được dành riêng cho Kernel.
+- **Hardware Config**: Sử dụng `TCR_EL1.A1=0` (ASID nằm trong TTBR0).
+- **Context Switch**: Khi đổi process, chỉ cần cập nhật `TTBR0_EL1` với giá trị `root_pa | (asid << 48)`. Do các entry là nG (non-global), phần cứng sẽ tự động phân biệt.
+
+### 2. Physical Page Reference Counting
+
+Để hỗ trợ chia sẻ trang (shared pages) giữa các process (như sau `fork`), chúng ta triển khai cơ chế đếm tham chiếu:
+- Mảng `page_ref_count` lưu trữ số lượng process đang map trang đó.
+- `page_alloc()` khởi tạo count = 1.
+- `page_ref_inc()` tăng count khi map thêm vào process mới.
+- `page_ref_dec()` giảm count. Nếu count = 0, trang thật sự được đưa về pool tự do.
+
+### 3. Copy-on-Write (CoW)
+
+Cơ chế CoW cho phép `fork()` diễn ra cực nhanh bằng cách chia sẻ bộ nhớ thay vì copy:
+- **Cloning**: `mmu_context_clone()` tạo ra một bản sao của page table cha. Tất cả các descriptor ở level 3 (L3) của cả cha và con đều được đánh dấu là Read-Only (`AP=10`).
+- **Fault Handling**: Khi một process cố gắng ghi vào trang Read-Only, một Permission Fault (FSC 0x0C) sẽ được kích hoạt.
+    - Nếu `ref_count > 1`: Kernel copy trang vật lý sang trang mới, update mapping của process hiện tại là Read-Write, và giảm `ref_count` của trang cũ.
+    - Nếu `ref_count == 1`: Kernel đơn giản là nâng cấp mapping hiện tại lên Read-Write.
+
+### 4. Lazy Loading (Demand Paging)
+
+Hệ thống không map toàn bộ Heap và Stack ngay lập tức:
+- Khi có Translation Fault (FSC 0x04), kernel kiểm tra xem địa chỉ ảo có nằm trong dải Stack (1MB từ đỉnh) hay Heap (vùng `brk`) hay không.
+- Nếu hợp lệ, kernel cấp phát trang vật lý mới và map theo yêu cầu. Điều này giúp tối ưu hóa sử dụng RAM cho các process lớn nhưng dùng ít stack/heap thực tế.
         L3_1[t1-L3 page table cho vùng kernel đầu]
         KP_1[Cùng PA: text rodata data bss stack]
         RB_1[t1-L2 block mappings cho RAM còn lại]
@@ -297,6 +353,31 @@ MMU dùng các symbol này để quyết định permission cho mỗi page trong
 - normal memory
 - read-only
 - non-executable
+
+## Hướng cải thiện tương lai
+
+Để hệ thống MMU hoàn thiện và mạnh mẽ hơn, các mục tiêu sau đây cần được thực hiện:
+
+### 1. Hỗ trợ ASID (Address Space Identifier)
+- **Mục tiêu**: Cho phép nhiều Address Space (của các process khác nhau) cùng tồn tại trong TLB.
+- **Lợi ích**: Giảm thiểu overhead khi context switch vì không cần flush toàn bộ TLB.
+- **Thực hiện**: Cấu hình `TCR_EL1.AS` và gán ASID duy nhất cho mỗi process qua `TTBR0_EL1`.
+
+### 2. Quản lý Address Space riêng cho Userspace
+- **Mục tiêu**: Mỗi process có một cây bảng trang riêng biệt trỏ bởi `TTBR0_EL1`.
+- **Thực hiện**: Cấp phát `L0` riêng cho mỗi process, mapping vùng nhớ user (thường là 0x0 đến 0x0000FFFFFFFFFFFF).
+
+### 3. Demand Paging & Lazy Loading
+- **Mục tiêu**: Chỉ cấp phát trang vật lý khi process thật sự truy cập.
+- **Thực hiện**: Xử lý `Translation Fault` trong exception handler, cấp phát trang từ `page_alloc` và cập nhật bảng trang runtime.
+
+### 4. Copy-on-Write (CoW)
+- **Mục tiêu**: Tối ưu lệnh `fork()`.
+- **Thực hiện**: Map các trang nhớ của process cha sang con với quyền Read-Only. Khi có hành động ghi, xử lý `Permission Fault` để nhân bản trang.
+
+### 5. Dynamic L3 Allocation
+- **Mục tiêu**: Linh hoạt hóa việc tạo fine-grained mapping.
+- **Thực hiện**: Xây dựng hàm `mmap` kernel-level để chèn thêm các bảng `L3` vào cây bảng trang hiện có khi vùng nhớ yêu cầu quyền chi tiết.
 
 ### `.data`
 

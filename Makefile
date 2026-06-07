@@ -20,7 +20,7 @@ USER_ASFLAGS := -g -ffreestanding -I$(USER_DIR)/include -MMD -MP
 USER_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie -Wl,--build-id=none -Wl,--no-dynamic-linker -Wl,-z,max-page-size=0x1000 -T $(USER_LINKER_SCRIPT)
 USER_DYNAMIC_APP_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie -Wl,--build-id=none -Wl,--no-dynamic-linker -Wl,-z,max-page-size=0x1000
 
-USER_BUILTIN_APPS := hello fault ipc_recv ipc_send
+USER_BUILTIN_APPS := hello fault ipc_recv ipc_send test_cow
 USER_EXTERNAL_APPS := ticker shared_client
 USER_BUILTIN_LIBS := shared
 USER_COMMON_OBJECT := $(BUILD_DIR)/user/common/start_s.o
@@ -29,7 +29,10 @@ USER_EXTERNAL_ELFS := $(addprefix $(BUILD_DIR)/user/external/,$(addsuffix .elf,$
 USER_SHARED_LIBRARIES := $(addprefix $(BUILD_DIR)/user/lib/lib,$(addsuffix .so,$(USER_BUILTIN_LIBS)))
 USER_BUILTIN_BLOB_OBJECTS := $(addprefix $(BUILD_DIR)/user/builtin/,$(addsuffix _elf_blob.o,$(USER_BUILTIN_APPS)))
 USER_BUILTIN_LIB_BLOB_OBJECTS := $(addprefix $(BUILD_DIR)/user/lib/lib,$(addsuffix _so_blob.o,$(USER_BUILTIN_LIBS)))
-USER_SHARED_CLIENT_BLOB_OBJECT := $(BUILD_DIR)/user/external/shared_client_elf_blob.o
+USER_EXTERNAL_BLOB_OBJECTS := $(addprefix $(BUILD_DIR)/user/external/,$(addsuffix _elf_blob.o,$(USER_EXTERNAL_APPS)))
+
+BUILTIN_CONFIG_C := $(BUILD_DIR)/kernel/builtin_files_config.c
+BUILTIN_CONFIG_OBJ := $(BUILD_DIR)/kernel/builtin_files_config_c.o
 
 DEBUG_PRE_MMU ?= 0
 DEBUG_MMU_BOOT ?= 0
@@ -56,7 +59,7 @@ S_SOURCES := $(shell find $(SRC_DIR) -type f -name '*.S')
 
 C_OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%_c.o,$(C_SOURCES))
 S_OBJECTS := $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%_s.o,$(S_SOURCES))
-OBJECTS := $(C_OBJECTS) $(S_OBJECTS) $(USER_BUILTIN_BLOB_OBJECTS) $(USER_BUILTIN_LIB_BLOB_OBJECTS) $(USER_SHARED_CLIENT_BLOB_OBJECT)
+OBJECTS := $(C_OBJECTS) $(S_OBJECTS) $(USER_BUILTIN_BLOB_OBJECTS) $(USER_BUILTIN_LIB_BLOB_OBJECTS) $(USER_EXTERNAL_BLOB_OBJECTS) $(BUILTIN_CONFIG_OBJ)
 DEPS := $(C_OBJECTS:.o=.d) $(S_OBJECTS:.o=.d) $(USER_COMMON_OBJECT:.o=.d) $(addprefix $(BUILD_DIR)/user/builtin/,$(addsuffix _c.d,$(USER_BUILTIN_APPS))) $(addprefix $(BUILD_DIR)/user/external/,$(addsuffix _c.d,$(USER_EXTERNAL_APPS))) $(addprefix $(BUILD_DIR)/user/lib/,$(addsuffix _c.d,$(USER_BUILTIN_LIBS)))
 
 all: $(TARGET_IMG) $(USER_EXTERNAL_ELFS) $(USER_SHARED_LIBRARIES)
@@ -75,6 +78,31 @@ $(BUILD_DIR)/%_s.o: $(SRC_DIR)/%.S
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
+$(BUILTIN_CONFIG_C): Makefile
+	@mkdir -p $(dir $@)
+	@echo "Generating $@"
+	@echo '#include <kernel/ramfs.h>' > $@
+	@echo '#include <stddef.h>' >> $@
+	@echo '' >> $@
+	@$(foreach app,$(USER_BUILTIN_APPS), \
+		echo 'extern unsigned char _binary_build_user_builtin_$(app)_elf_start[];' >> $@; \
+		echo 'extern unsigned char _binary_build_user_builtin_$(app)_elf_end[];' >> $@; \
+		echo 'REGISTER_RAMFS_BUILTIN($(app), "/bin/$(app).elf", _binary_build_user_builtin_$(app)_elf_start, _binary_build_user_builtin_$(app)_elf_end);' >> $@; \
+	)
+	@$(foreach lib,$(USER_BUILTIN_LIBS), \
+		echo 'extern unsigned char _binary_build_user_lib_lib$(lib)_so_start[];' >> $@; \
+		echo 'extern unsigned char _binary_build_user_lib_lib$(lib)_so_end[];' >> $@; \
+		echo 'REGISTER_RAMFS_BUILTIN(lib$(lib), "/lib/lib$(lib).so", _binary_build_user_lib_lib$(lib)_so_start, _binary_build_user_lib_lib$(lib)_so_end);' >> $@; \
+	)
+	@$(foreach app,$(USER_EXTERNAL_APPS), \
+		echo 'extern unsigned char _binary_build_user_external_$(app)_elf_start[];' >> $@; \
+		echo 'extern unsigned char _binary_build_user_external_$(app)_elf_end[];' >> $@; \
+		echo 'REGISTER_RAMFS_BUILTIN($(app), "/bin/$(app).elf", _binary_build_user_external_$(app)_elf_start, _binary_build_user_external_$(app)_elf_end);' >> $@; \
+	)
+
+$(BUILTIN_CONFIG_OBJ): $(BUILTIN_CONFIG_C)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(USER_COMMON_OBJECT): $(USER_DIR)/common/start.S
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_ASFLAGS) -c $< -o $@
@@ -91,14 +119,16 @@ $(BUILD_DIR)/user/lib/%_c.o: $(USER_DIR)/lib/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -fPIC -c $< -o $@
 
-$(BUILD_DIR)/user/builtin/%.elf: $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/builtin/%_c.o $(USER_LINKER_SCRIPT)
+USER_LIB_OBJECT := $(BUILD_DIR)/user/lib/shared_c.o
+
+$(BUILD_DIR)/user/builtin/%.elf: $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/builtin/%_c.o $(USER_LIB_OBJECT) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_LDFLAGS) -o $@ $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/builtin/$*_c.o
+	$(CC) $(USER_LDFLAGS) -o $@ $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/builtin/$*_c.o $(USER_LIB_OBJECT)
 	$(OBJCOPY) --strip-debug $@
 
-$(BUILD_DIR)/user/external/%.elf: $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/external/%_c.o $(USER_LINKER_SCRIPT)
+$(BUILD_DIR)/user/external/%.elf: $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/external/%_c.o $(USER_LIB_OBJECT) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_LDFLAGS) -o $@ $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/external/$*_c.o
+	$(CC) $(USER_LDFLAGS) -o $@ $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/external/$*_c.o $(USER_LIB_OBJECT)
 	$(OBJCOPY) --strip-debug $@
 
 $(BUILD_DIR)/user/external/shared_client.elf: $(USER_COMMON_OBJECT) $(BUILD_DIR)/user/external/shared_client_c.o $(USER_LINKER_SCRIPT) $(USER_SHARED_LIBRARIES)
@@ -123,7 +153,7 @@ $(BUILD_DIR)/user/lib/lib%_so_blob.o: $(BUILD_DIR)/user/lib/lib%.so
 		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
 		$< $@
 
-$(BUILD_DIR)/user/external/shared_client_elf_blob.o: $(BUILD_DIR)/user/external/shared_client.elf
+$(BUILD_DIR)/user/external/%_elf_blob.o: $(BUILD_DIR)/user/external/%.elf
 	@mkdir -p $(dir $@)
 	$(OBJCOPY) -I binary -O elf64-littleaarch64 -B aarch64 \
 		--rename-section .data=.rodata,alloc,load,readonly,data,contents \

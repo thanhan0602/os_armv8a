@@ -24,6 +24,7 @@
 14. [Stack các hệ thống con](#14-stack-các-hệ-thống-con)
 15. [Quyết định thiết kế quan trọng và bài học kỹ thuật](#15-quyết-định-thiết-kế-quan-trọng-và-bài-học-kỹ-thuật)
 16. [Trạng thái các stage](#16-trạng-thái-các-stage)
+17. [Đa lõi (SMP)](#17-đa-lõi-smp)
 
 ---
 
@@ -33,6 +34,8 @@
 |---|---|
 | Platform | QEMU `virt`, ARMv8-A |
 | Execution level | EL1 |
+| CPUs | 4 cores (SMP enabled) |
+| PSCI | Conduit `hvc`, PSCI 1.1 |
 | RAM | `0x40000000` – `0x48000000` (128 MiB) |
 | Kernel load PA | `0x40080000` |
 | GICD base | `0x08000000` |
@@ -104,44 +107,41 @@ Macro chuyển đổi địa chỉ:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  start.S                                                     │
-│  _start  (PA)                                               │
-│    ├─ park non-boot cores                                    │
-│    ├─ enable FP/SIMD (CPACR_EL1)                            │
-│    ├─ clear .bss                                             │
-│    └─ call kernel_main_early()  (PA)                        │
+│  Primary core (CPU 0)                                       │
+│  _start (PA)                                                │
+│    ├─ set stack, clear .bss                                 │
+│    └─ call kernel_main_early()                              │
 └──────────────────────┬──────────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  kernel_main_early()  (PA, pre-MMU→post-MMU)                │
-│    ├─ uart/console init                                     │
-│    ├─ page_alloc_init()                                     │
-│    └─ mmu_init()                                            │
-│         ├─ build TTBR0 identity tables                      │
-│         ├─ build TTBR1 kernel VA tables                     │
-│         ├─ program MAIR_EL1, TCR_EL1                        │
-│         ├─ set TTBR0_EL1, TTBR1_EL1                        │
-│         └─ enable SCTLR_EL1.M/C/I  ← MMU ON               │
+│  kernel_main_early() -> mmu_init() (MMU ON)                 │
+│    └─ nhảy sang kernel_main() (High VA)                     │
 └──────────────────────┬──────────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  Trampoline  (start.S)                                      │
-│    adrp + add + KERNEL_VA_OFFSET                            │
-│    br x_target  ← nhảy sang high VA                        │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│  kernel_main()  (VA qua TTBR1)                              │
+│  kernel_main()                                              │
 │    ├─ mmu_install_empty_ttbr0_root()                        │
-│    │     └─ TTBR0 → owned empty root, free boot tables     │
-│    ├─ exception_init()  (VBAR_EL1)                          │
-│    ├─ heap_init()                                           │
+│    ├─ exception_init(), heap_init()                         │
 │    ├─ gic_init(), timer_init()                              │
-│    ├─ sched_init(), task_create(...)                        │
-│    └─ enable IRQ, enter idle loop                           │
+│    ├─ psci_wake_secondary_cores()  ← CPU 0 khơi chạy core ✅ │
+│    │     └─ dùng PSCI_CPU_ON (hvc) dẫn lối vào secondary_entry│
+│    ├─ sched_init()                                          │
+│    └─ start_secondary_early_done = 1; enable IRQ            │
+└─────────────────────────────────────────────────────────────┘
+                       │
+                       │ (Sau khi CPU 0 gõ lệnh thức tỉnh)
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Secondary cores (CPU 1, 2, 3)                              │
+│  secondary_entry (PA)                                       │
+│    ├─ bật MMU (reuse bảng trang của CPU 0)                  │
+│    ├─ nhảy sang secondary_main (High VA)                    │
+│    └─ secondary_main()                                      │
+│         ├─ gicv2_init_secondary(), timer_init()             │
+│         ├─ arch_set_current_task(tasks[core_id])            │
+│         └─ enable IRQ, enter schedule()                     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -197,9 +197,21 @@ PA 0x40080000
 |---|---|
 | Granule | 4 KiB |
 | VA width | 48-bit (T0SZ=T1SZ=16) |
+| ASID | 16-bit (Hardware supported) |
 | Số level | 4 (L0 → L1 → L2 → L3) |
 | MAIR index 0 | Normal WB WA (RAM) |
 | MAIR index 1 | Device-nGnRnE (MMIO) |
+
+### Quản lý ASID & TLB
+
+Hệ điều hành sử dụng ASID (Address Space Identifier) để tối ưu hóa TLB (Translation Lookaside Buffer):
+- **ASID Allocation**: Mỗi tiến trình (`struct mm_context`) được gán một ASID duy nhất (từ 1–65535).
+- **Global Mapping**: Các trang của kernel (TTBR1_EL1) được đánh dấu là Global (`nG=0`), dùng chung cho tất cả tiến trình.
+- **Context Switch**: Khi chuyển context, chỉ cần cập nhật `TTBR0_EL1` với giá trị `root_pa | (asid << 48)`. Không cần dùng `tlbi vmalle1`, giúp bảo tồn TLB entries của các tiến trình khác.
+- **TLB Maintenance**:
+    - `tlbi aside1is`: Dùng khi giải phóng ASID để tái sử dụng.
+    - `tlbi vae1is`: Dùng khi unmap hoặc thay đổi quyền trang (CoW) cho một VA cụ thể.
+- **Hardware Support**: Tự động phát hiện hỗ trợ 8-bit hoặc 16-bit ASID qua `ID_AA64MMFR0_EL1`.
 
 ### Hybrid mapping
 
@@ -247,6 +259,14 @@ Với `KERNEL_VIRTUAL=0`: 5 pages bảng trang, không có TTBR1.
 | `.rodata` | RO (AP=10) | PXN=1 (NX) |
 | `.data` / `.bss` / `.boot_stack` | RW (AP=00) | PXN=1 (NX) |
 | MMIO | RW (AP=00) | PXN=1 (NX) |
+
+### Lazy Loading và Copy-on-Write (Stage 14)
+
+Kernel hiện sử dụng cơ chế quản lý bộ nhớ dựa trên vùng (Region-based Memory Management):
+
+- **Demand Paging**: Khi nạp ELF, kernel chỉ đăng ký các vùng `vm_region`. Trang vật lý thực sự chỉ được cấp phát và nạp dữ liệu từ file (hoặc zero-fill cho stack/heap) khi xảy ra Page Fault (`Translation Fault`).
+- **Copy-on-Write (CoW)**: Khi một trang cần được chia sẻ (ví dụ qua relocation hoặc fork), nó được map Read-Only và tăng `ref_count`. Nếu có thao tác ghi, kernel sẽ nhân bản trang đó cho process hiện tại (nếu `ref_count > 1`).
+- **Software Fault Handling**: Các hàm `copy_from_user` thực hiện software walk qua page tables. Nếu phát hiện trang chưa được map, chúng sẽ chủ động gọi logic của fault handler để nạp trang đó, thay vì để hardware trap xảy ra.
 
 ---
 
@@ -401,34 +421,32 @@ FP/SIMD được bật sớm trong `_start` (`CPACR_EL1`). Exception vectors sav
 
 **Files**: [src/kernel/sched.c](../src/kernel/sched.c), [src/arch/arm/switch.S](../src/arch/arm/switch.S), [src/include/kernel/sched.h](../src/include/kernel/sched.h)
 
-### Thiết kế
+### Thiết kế (SMP-aware)
 
-Round-robin preemptive, driven bằng timer IRQ (~500 ms/tick).
+Round-robin preemptive, hỗ trợ 4 cores.
 
-```c
-struct task_context {
-    uint64_t x19, x20, ..., x30;   // callee-saved GPR
-    uint64_t sp;
-};
+*   **Global Runqueue:** Một danh sách liên kết vòng duy nhất (`tasks`) chứa tất cả các task.
+*   **Per-CPU Context:** Mỗi core sử dụng thanh ghi `tpidr_el1` để lưu trỏ tới task hiện tại của mình.
+*   **Locking:** Một `sched_lock` (spinlock) toàn cục bảo vệ toàn bộ danh sách task. Khi `schedule()` chạy, nó giữ lock này xuyên suốt quá trình `switch_context`. Lock sẽ được giải phóng bởi task vừa được switch sang (trong `schedule()` hoặc `sched_new_task_kickoff()`).
+*   **Idle Tasks:** Slots 0-3 trong mảng `tasks` được dành riêng làm Idle Tasks cho 4 cores. 
 
-struct task {
-    struct task_context  context;
-    uint32_t             id;
-    enum task_state      state;     // RUNNING / READY / DEAD
-    void                *stack_base;
-    size_t               stack_size;
-    const char          *name;
-    struct mm_context   *mm;        // reserved for Stage 10
-    struct task         *next;      // circular linked list
-};
-```
-
-### Luồng context switch
+### Luồng context switch (SMP)
 
 ```
-Timer IRQ
+Timer IRQ (trên core X)
   → exception_vectors.S  (save full frame GPR+SIMD)
   → exception_handle_irq()
+  → schedule()
+       ├─ spin_lock_irqsave(&sched_lock)
+       ├─ chọn task tiếp theo (next = current->next)
+       ├─ mmu_context_switch(next->mm)
+       ├─ switch_context(&prev->context, &next->context)  ← Nhảy sang task mới
+       └─ spin_unlock_irqrestore(&sched_lock)             ← Chạy khi task này được switch back
+```
+
+### IPI (Inter-Processor Interrupt)
+
+Khi một task được đánh thức bởi một core, nó có thể cần được chạy ngay lập tức trên một core khác. Kernel sử dụng SGI (Software Generated Interrupt) ID 0 để yêu cầu các core khác gọi `schedule()`.
   → GIC EOI
   → schedule()
        → sched_reap_dead()  (free stack pages của dead tasks)
@@ -495,14 +513,15 @@ Filesystem hiện là kernel-only ramfs với hai nhóm node:
 
 User apps hiện được build từ cây `user/` thành ELF64 AArch64 thật. Các app tự chứa dùng linker script zero-based và được link kiểu `ET_DYN`/PIE thay vì `ET_EXEC`, nên image không còn phụ thuộc vào một load address cố định.
 
-Luồng load hiện tại:
+Luồng load hiện tại (Lazy Loading):
 
-1. đọc toàn bộ ELF image vào heap kernel
+1. mở file ELF qua VFS
 2. validate ELF header và program headers
 3. chọn `load_bias` cho object nếu là `ET_DYN`
-4. map từng `PT_LOAD` tại `load_bias + p_vaddr`
+4. **Đăng ký `vm_region`** cho từng `PT_LOAD` thay vì copy dữ liệu ngay lập tức.
 5. đặt `entry_va = load_bias + e_entry`
-6. đặt `heap_start` và `brk` ngay sau vùng image đã map, kèm một page guard
+6. đăng ký vùng `ANON` cho heap và stack
+7. khi task bắt đầu chạy, Hardware Fault sẽ kích hoạt nạp trang đầu tiên (`_start`).
 
 Vì `brk` bắt đầu sau image thay vì tại một địa chỉ cố định, user heap cũng di chuyển theo load bias của mỗi process.
 
@@ -669,19 +688,81 @@ Công cụ hữu ích nhất: QEMU trace với `-d int,mmu,guest_errors`. `AT S1
 | 7 | Kernel heap | ✅ Hoàn thành |
 | 8 | Scheduler and kernel threads | ✅ Hoàn thành |
 | 9 | EL0 and syscalls | ✅ Hoàn thành |
-| 10 | Processes and address spaces | 🔄 Đang tiến hành (increments 1-8 đã chạy ổn) |
-| 11 | IPC and synchronization | 🔄 Đang tiến hành (spinlock + fixed IPC channels đã có) |
+| 10 | Processes and address spaces | ✅ Hoàn thành |
+| 11 | IPC and synchronization | ✅ Hoàn thành |
 | 12 | Filesystem and program loading | ✅ Hoàn thành |
 | 13 | Console shell | ✅ Hoàn thành |
+| 14 | Lazy Loading & Copy-on-Write | ✅ Hoàn thành |
 
-### Stage 10 — trạng thái increment 1
+### Stage 14 — Lazy Loading & Copy-on-Write
 
-- TTBR0 runtime root đã là owned empty lower-half root (không còn boot identity map)
-- Low VA kernel alias fault như mong đợi
-- TTBR1 high alias vẫn translates
-- Boot TTBR0 identity tables đã được freed (runtime: 6 table pages)
-- Bước tiếp theo: physical sharing cho shared library pages, object cache/refcount, và ABI/version policy cho dependency resolution
+- Paging theo yêu cầu (Demand Paging): trang chỉ được nạp khi có truy cập thực tế.
+- Copy-on-Write (CoW): chia sẻ trang vật lý giữa các process hỗ trợ tiết kiệm RAM.
+- Reference counting cho physical pages.
+- Software-walk fault handling cho syscall handlers.
 
 ---
 
 *Tài liệu này mô tả trạng thái implementation thực tế. Để biết chi tiết từng subsystem, đọc các tài liệu chuyên sâu: [mmu_design.md](../mmu_design.md), [heap_design.md](../heap_design.md), [page_alloc_design.md](../page_alloc_design.md). Để nắm trạng thái làm việc gần nhất, đọc [handoff.md](../handoff.md).*
+
+---
+
+## 17. Đa lõi (SMP)
+
+**Files**: [src/arch/arm/start.S](../src/arch/arm/start.S), [src/kernel/main.c](../src/kernel/main.c), [src/drivers/interrupt/gicv2.c](../src/drivers/interrupt/gicv2.c), [src/kernel/sched.c](../src/kernel/sched.c)
+
+Hệ thống hỗ trợ 4 core chạy song song (SMP) từ Stage 16.
+
+### Cơ chế hạ tầng
+
+- **PSCI (Power State Coordination Interface)**: Kernel sử dụng PSCI 1.1 ( conduit) để bật các core phụ.  được gọi từ  trên CPU 0.
+- **Spinlocks**: Sử dụng tập lệnh  /  của AArch64 để thực hiện synchronization. Mọi biến dùng chung quan trọng (scheduler queue, page lists, heap blocks) đều được bảo vệ bởi spinlock.
+- **Per-CPU Data**:
+    - Mỗi core có stack riêng trong kernel (8 KiB stack + 4 KiB guard).
+    -  trỏ tới  hiện tại của core đó.
+- **GICv2 SMP**:
+    - **Distributor**: Init một lần bởi CPU 0. SGI (Software Generated Interrupts) được dùng cho IPI.
+    - **CPU Interface**: Init bởi từng core khi boot (bao gồm cả CPU 0).
+- **IPI (Inter-Processor Interrupt)**: Hiện tại dùng SGI ID 0 cho "Reschedule IPI". Khi một core tạo ra task mới hoặc wake task, nó gửi SGI 0 tới các core còn lại để kích hoạt scheduler ngay lập tức.
+
+### Thiết kế Scheduler trong SMP
+
+Để đơn giản, kernel sử dụng một **Global Runqueue** duy nhất. 
+- Ưu điểm: Tự động cân bằng tải (Load balancing), core nào rảnh sẽ tự pick task tiếp theo.
+- Nhược điểm: Lock contention trên . Tuy nhiên với 4 core, contention này chưa phải là nghẽn cổ chai.
+
+### Chiến lược TLB & Cache Coherency
+
+- Kernel map bộ nhớ là **Inner Shareable**.
+- Lệnh  (TLB Invalidate) được sử dụng với các hộ tố  (ví dụ , ) để broadcast việc flush TLB tới tất cả các core trong hệ thống, đảm bảo tính nhất quán của bảng trang.
+
+---
+
+## 17. Đa lõi (SMP)
+
+**Files**: [src/arch/arm/start.S](../src/arch/arm/start.S), [src/kernel/main.c](../src/kernel/main.c), [src/drivers/interrupt/gicv2.c](../src/drivers/interrupt/gicv2.c), [src/kernel/sched.c](../src/kernel/sched.c)
+
+Hệ thống hỗ trợ 4 core chạy song song (SMP) từ Stage 16.
+
+### Cơ chế hạ tầng
+
+- **PSCI (Power State Coordination Interface)**: Kernel sử dụng PSCI 1.1 (`hvc` conduit) để bật các core phụ. `psci_cpu_on` được gọi từ `kernel_main` trên CPU 0.
+- **Spinlocks**: Sử dụng tập lệnh `ldaxr` / `stxr` của AArch64 để thực hiện synchronization. Mọi biến dùng chung quan trọng (scheduler queue, page lists, heap blocks) đều được bảo vệ bởi spinlock.
+- **Per-CPU Data**:
+    - Mỗi core có stack riêng trong kernel (8 KiB stack + 4 KiB guard).
+    - `tpidr_el1` trỏ tới `struct task` hiện tại của core đó.
+- **GICv2 SMP**:
+    - **Distributor**: Init một lần bởi CPU 0. SGI (Software Generated Interrupts) được dùng cho IPI.
+    - **CPU Interface**: Init bởi từng core khi boot (bao gồm cả CPU 0).
+- **IPI (Inter-Processor Interrupt)**: Hiện tại dùng SGI ID 0 cho "Reschedule IPI". Khi một core tạo ra task mới hoặc wake task, nó gửi SGI 0 tới các core còn lại để kích hoạt scheduler ngay lập tức.
+
+### Thiết kế Scheduler trong SMP
+
+Để đơn giản, kernel sử dụng một **Global Runqueue** duy nhất. 
+- Ưu điểm: Tự động cân bằng tải (Load balancing), core nào rảnh sẽ tự pick task tiếp theo.
+- Nhược điểm: Lock contention trên `sched_lock`. Tuy nhiên với 4 core, contention này chưa phải là nghẽn cổ chai.
+
+### Chiến lược TLB & Cache Coherency
+
+- Kernel map bộ nhớ là **Inner Shareable**.
+- Lệnh `tlbi` (TLB Invalidate) được sử dụng với các hậu tố `is` (ví dụ `tlbi vmalle1is`, `tlbi vae1is`) để broadcast việc flush TLB tới tất cả các core trong hệ thống, đảm bảo tính nhất quán của bảng trang.

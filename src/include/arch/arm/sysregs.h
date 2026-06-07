@@ -91,6 +91,13 @@ static inline unsigned long mmu_get_sctlr(void)
     return sctlr;
 }
 
+static inline unsigned long arch_get_aa64mmfr0(void)
+{
+    unsigned long val;
+    __asm__ volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(val));
+    return val;
+}
+
 static inline void mmu_set_sctlr(unsigned long sctlr)
 {
     __asm__ volatile(

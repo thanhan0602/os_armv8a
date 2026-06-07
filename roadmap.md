@@ -222,7 +222,7 @@ Current behavior:
 
 ### Stage 10: Processes And Address Spaces
 
-Status: in progress
+Status: completed
 
 Goals:
 - Give each process its own page tables
@@ -248,7 +248,7 @@ Current behavior:
 
 ### Stage 11: IPC And Synchronization
 
-Status: in progress
+Status: completed
 
 Goals:
 - Add spinlocks and simple waiting primitives
@@ -281,7 +281,7 @@ Current behavior:
 
 ### Stage 12: Filesystem And Program Loading
 
-Status: in progress
+Status: completed
 
 Goals:
 - Start with ramfs or initramfs
@@ -335,20 +335,17 @@ Implemented (fifth increment — ASID support):
 
 ## Immediate Next Steps
 
-1. ~~Stage 10 increment 4: handle permission faults (FSC=0x0C–0x0F) separately from translation faults; log access type (read/write) from `ESR_EL1[6]` (WnR bit).~~ ✅ Done.
-2. ~~Stage 10 increment 5: ASID support.~~ ✅ Done.
-3. ~~Stage 10 increment 6: user page tracking + unmap on exit.~~ ✅ Done.
-4. ~~Stage 10 increment 7: multi-page code mapping.~~ ✅ Done.
-5. ~~Stage 12 increment 2: define executable file format boundary clearly, starting with either a small flat-header format or a minimal ELF loader.~~ ✅ Done.
-6. Stage 11 increment 3: add a real wait-queue abstraction or multi-waiter channel queue so IPC is no longer limited to one blocked receiver per channel.
-7. Stage 11 increment 4: decide whether the next IPC surface is pipe/stream semantics, request/reply, or `waitpid`-style lifecycle events for the future process manager.
-8. Stage 12 increment 3: add a real init-style launch path so the kernel boots one named program from the filesystem instead of hardcoding demo pairs in `main.c`.
-9. Stage 13 increment 2: replace raw hex `receive` with a host-assisted upload path or a framed protocol so large external programs are less fragile over UART.
-10. User runtime increment 1: add a tiny libc surface for argv/env-style startup or reusable printing/string helpers beyond the current syscall wrappers.
+1. ~~Stage 16: Multicore Support (SMP).~~ ✅ Done.
+2. Stage 16 increment 2: Implement more robust synchronization primitives (Mutex, Semaphore) with wait-queues to replace simple spinlocks where blocking is preferred.
+3. Stage 16 increment 3: Kernel Preemption. Currently, the kernel only reschedules on explicit yield or return from interrupt. Full kernel preemption would allow higher priority tasks to interrupt lower priority kernel work.
+4. Stage 11 increment 3: add a real wait-queue abstraction or multi-waiter channel queue so IPC is no longer limited to one blocked receiver per channel.
+5. Stage 12 increment 3: add a real init-style launch path so the kernel boots one named program from the filesystem instead of hardcoding demo pairs in `main.c`.
+6. User runtime increment 1: add a tiny libc surface for argv/env-style startup or reusable printing/string helpers beyond the current syscall wrappers.
+7. Stage 17: Support FAT32/SD Card via VIRTIO or dedicated driver for persistent storage.
 
 ### Stage 13: Console Shell
 
-Status: in progress
+Status: completed
 
 Goals:
 - Add an interactive serial console shell for bring-up and inspection
@@ -366,3 +363,75 @@ Current behavior:
 - Default boot now reaches a serial shell prompt after `[info] kernel init complete`
 - `ps`, `memory`, `read`, `write`, `load`, `receive`, and `unload` have been verified on QEMU
 - External user ELF flow is now validated end-to-end with `/ext/ticker.elf`: upload through shell, `read` header check, `load`, repeated user output, then `unload`
+
+### Stage 14: Lazy Loading & Copy-on-Write
+
+Status: completed
+
+Goals:
+- Implement demand paging (Loading pages only when accessed)
+- Support Copy-on-Write for memory efficiency and process forking
+- Handle software-walk faults for kernel syscalls
+
+Implemented:
+- Added `struct vm_region` and region management in `process.c`
+- Updated `mmu_handle_process_page_fault` to load data from ELF buffers or zero-fill for anonymous regions (Stack/Heap)
+- Implemented physical page reference counting in `page_alloc.c`
+- Handled permission faults to implement Copy-on-Write: pages are shared with RO permissions and duplicated only on write
+- Instrumented `mmu_copy_user_range` to manually call the page fault handler during software walks, fixing syscall string access issues
+- Verified isolation with `test_cow.elf` and performance/correctness with existing ELF apps
+
+Current behavior:
+- User apps boot without copy-overhead for their entire image
+- Syscalls like `write` correctly trigger page loads when accessing unmapped buffers
+- Parent/Child isolation via CoW is verified
+
+### Stage 15: Optimizations & Advanced VFS
+
+Status: completed
+
+Goals:
+- ASID Recycling & TLB Optimization (Minimize flushes)
+- Multi-bit ASID support (8/16-bit)
+- Bitmask-based ASID management
+- Removed full TLB flushes on context switch
+
+Implemented:
+- Hardware capability detection for ASID bits (8 vs 16)
+- Enabled 16-bit ASID range (1-65535) via TCR_EL1.AS=1
+- Implemented efficient bitmask allocation for ASIDs (8KB BSS)
+- Optimized TLB maintenance: using `ASIDE1IS` for ASID reuse and `VAE1IS` for CoW
+- Confirmed kernel mappings are Global (`nG=0`) and shared across contexts
+
+### Stage 16: Multicore Support (SMP)
+
+Status: completed
+
+Goals:
+- Support multi-core execution (4 cores)
+- Implement hardware wake-up (PSCI)
+- Add thread-safe synchronization (Spinlocks)
+- Implement Inter-Processor Interrupts (IPI) for scheduling
+
+Implemented:
+- **PSCI Booting:** CPU 0 wakes secondary cores (1, 2, 3) using `psci_cpu_on` via `hvc`.
+- **Per-CPU Isolation:** Each core has its own 16KB stack in the kernel VA space and uses `tpidr_el1` to point to its current `struct task`.
+- **SMP-Safe Scheduler:** Refactored `sched.c` to use a global `sched_lock`. Idle tasks are created for each core (slots 0-3). `schedule()` holds the lock across `switch_context`, which is then released by the incoming task.
+- **GICv2 Secondary Initialization:** Added `gicv2_init_secondary` to enable the CPU interface and timers for each core.
+- **Inter-Processor Interrupts (IPI):** Implemented `gicv2_send_ipi` using GICv2 SGIs. `sched_wake_task` sends an IPI to all other cores to trigger a reschedule, ensuring low latency for task wakeup.
+- **Concurrency Safety:** Added spinlocks to `page_alloc.c` and `heap.c` to prevent race conditions during memory allocation from multiple cores.
+
+Current behavior:
+- All 4 cores boot successfully and enter the scheduler.
+- Shell runs on CPU 0 but can interact with tasks on other cores.
+- Preemptive multitasking works across all cores using independent timers.
+
+### Stage 17: Swap to Disk & Advanced VFS (Next Steps)
+
+Status: planned
+
+Goals:
+- Swap to Disk (Ramfs-backed basic implementation)
+- Support FAT32/SD Card via VFS
+- Advanced IPC (Shared memory regions, Pipes)
+- Signal handling and process lifecycle management

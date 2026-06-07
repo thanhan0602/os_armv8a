@@ -2,6 +2,6 @@
 
 int main(void)
 {
-    shared_write("[shared-client] hello via shared lib\n");
+    printf("[shared-client] hello via printf\n");
     return 0;
 }

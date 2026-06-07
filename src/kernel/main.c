@@ -8,6 +8,7 @@
 #include <kernel/ipc.h>
 #include <kernel/loader.h>
 #include <kernel/log.h>
+#include <kernel/driver.h>
 #include <kernel/mmu.h>
 #include <kernel/page_alloc.h>
 #include <kernel/process.h>
@@ -18,8 +19,11 @@
 #include <kernel/vm.h>
 #include <arch/arm/cpu.h>
 
+#include <arch/arm/psci.h>
+
 volatile unsigned long boot_stage;
 volatile unsigned long boot_heartbeat;
+volatile int secondary_ready = 0;
 
 extern char __text_start[];
 
@@ -79,13 +83,54 @@ void kernel_main_early(unsigned long boot_fdt_pa)
     }
     driver_system_init();
 
-    /*
-     * MMU bring-up programs MAIR_EL1, TCR_EL1, TTBR0_EL1, TTBR1_EL1,
-     * invalidates stale EL1 translations, then sets SCTLR_EL1.M/C/I.
-     * After this point both identity map (TTBR0) and kernel VA map
-     * (TTBR1) are live.
-     */
     mmu_init();
+    log_write("[boot] MMU initialized\n");
+
+    /* Initialise scheduler early so idle tasks exist for secondary cores */
+    sched_init();
+
+    /* Wake up secondary CPUs */
+    extern void secondary_entry(void);
+    unsigned long entry_pa = (unsigned long)va_to_pa(secondary_entry);
+    
+    /* log_write("[boot] waking up secondary CPUs...\n"); */
+    
+    KER_LOGF("[boot] entry_pa=%lx psci_version=%x\n", entry_pa, psci_version());
+    
+    unsigned long boot_mpidr;
+    asm volatile("mrs %0, mpidr_el1" : "=r"(boot_mpidr));
+    unsigned int boot_cpu_id = (unsigned int)(boot_mpidr & 0xFF);
+    KER_LOGF("[boot] Boot CPU MPIDR=%lx (ID=%u)\n", boot_mpidr, boot_cpu_id);
+
+    for (unsigned int i = 0; i < 4; i++) {
+        if (i == boot_cpu_id) continue;
+        
+        unsigned long mpidr = i;
+        secondary_ready = 0;
+        int status = psci_cpu_on(mpidr, entry_pa, 0); 
+        
+        KER_LOGF("[boot] Waking CPU %u (MPIDR=%lx) return=%d\n", i, mpidr, status);
+
+        if (status == 0) {
+            /* Wait for the CPU to signal readiness with a timeout */
+            volatile unsigned long timeout = 0x1000000;
+            while (1) {
+                /* dsb ish ensures we see the update from the secondary core */
+                __asm__ volatile("dsb ish" ::: "memory");
+                if (secondary_ready) break;
+                if (timeout == 0) break;
+                timeout--;
+                cpu_yield();
+            }
+            if (secondary_ready) {
+                KER_LOGF("[boot] CPU %u is ready\n", i);
+            } else {
+                KER_LOGF("[boot] CPU %u timed out (final check secondary_ready=%d)\n", i, secondary_ready);
+            }
+        } else {
+            KER_LOGF("[boot] CPU %u wake failed: %d\n", i, status);
+        }
+    }
 }
 
 /*
@@ -94,8 +139,54 @@ void kernel_main_early(unsigned long boot_fdt_pa)
  * heap init happens here so dynamic kernel memory already runs under the
  * final Stage-1 translation regime at the intended VA.
  */
+void secondary_main_early(void)
+{
+    mmu_init_secondary();
+}
+
+/*
+ * Called from start.S at the kernel virtual address after the trampoline.
+ * TTBR1_EL1 is now the active translation path for all kernel code.
+ */
+extern struct task tasks[];
+void secondary_main(void)
+{
+    unsigned int cpu_id = arch_get_cpu_id();
+    
+    /* Set current task to the per-CPU idle task initialized in sched_init */
+    arch_set_current_task(&tasks[cpu_id]);
+
+    /* Init Core-local GIC and Timer */
+    driver_secondary_init();
+    
+    /* Enable interrupts for this core */
+    arch_local_irq_enable();
+
+    /* Ensure secondary_ready update is visible across cores */
+    secondary_ready = 1;
+    __asm__ volatile("dsb ish; sev" ::: "memory");
+    
+    /* Now we are at VA, we can safely log and continue */
+    KER_LOGF("[cpu] CPU %u online\n", cpu_id);
+    
+    while (1) {
+        schedule();
+    }
+}
+
 void kernel_main(void)
 {
+    /* 
+     * CPU 0 was initialized with a physical address for its current task
+     * during kernel_main_early. Now that we are in high VA, update it to
+     * use the proper virtual address of its idle task.
+     */
+    extern struct task tasks[];
+    for (int i = 0; i < 4; i++) {
+        tasks[i].next = &tasks[(i + 1) % 4];
+    }
+    arch_set_current_task(&tasks[0]);
+
     KER_INFO("kernel_main: jumped to high virtual address");
 
     /* 
@@ -118,7 +209,6 @@ void kernel_main(void)
     fs_init();
     ipc_init();
 
-    sched_init();
 #if defined(CONFIG_KERNEL_VIRTUAL) && defined(CONFIG_RUN_OS_DEMOS)
     kernel_start_stage10_demos();
 #endif
@@ -129,7 +219,7 @@ void kernel_main(void)
     while (1) {
         boot_heartbeat++;
         if (!shell_poll()) {
-            cpu_relax();
+            schedule();
         }
     }
 }

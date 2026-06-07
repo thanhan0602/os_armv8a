@@ -52,6 +52,7 @@ switch_context:
  * timer interrupts.
  */
 task_entry_trampoline:
+    bl sched_new_task_kickoff
     msr daifclr, #2
     isb
     blr x19
@@ -76,6 +77,7 @@ task_entry_trampoline:
  * subsequent EL0->EL1 exceptions naturally use it for save_context.
  */
 el0_entry_trampoline:
+    bl sched_new_task_kickoff
     msr     elr_el1, x19        /* EL0 program counter */
     msr     sp_el0,  x20        /* EL0 stack pointer */
     mov     x0,  xzr

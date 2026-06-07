@@ -1,4 +1,5 @@
 #include <user/syscall.h>
+#include <user/shared.h>
 
 int main(void)
 {
@@ -12,8 +13,8 @@ int main(void)
     heap_ok = "[user-elf] brk ok\n";
 
     for (index = 0UL; index < 3UL; index++) {
-        user_write_string(hello);
-        user_yield();
+        printf("%s", hello);
+        // user_yield();
     }
 
     heap_base = user_brk(0UL);
@@ -25,9 +26,9 @@ int main(void)
         for (index = 0UL; index < user_strlen(heap_ok); index++) {
             heap_text[index] = heap_ok[index];
         }
-        user_write(1UL, heap_text, user_strlen(heap_ok));
+        printf("%s", heap_text);
     }
 
-    *(volatile unsigned long *)0xDEAD0000UL = 0xDEAD0000UL;
+    user_exit(0);
     return 0;
 }
