@@ -131,6 +131,7 @@ static int ramfs_lookup(struct vnode *vn, const char *name, struct vnode **out)
         *out = new_vn;
         return 1;
     }
+    KER_LOGF("[ramfs] lookup failed: node not found for %s\n", name);
     return 0;
 }
 
@@ -205,6 +206,17 @@ int ramfs_unregister_file(const char *path)
     if (node->owns_data) kfree(node->data);
     node->in_use = 0;
     return 1;
+}
+
+void *ramfs_get_data_ptr(struct file *file)
+{
+    if (!file || !file->vn || !file->vn->data) return (void *)0;
+    /* Basic check: make sure the vnode ops are ramfs ops */
+    extern struct vnode_ops ramfs_vnode_ops;
+    if (file->vn->ops != &ramfs_vnode_ops) return (void *)0;
+    
+    struct ramfs_node *node = (struct ramfs_node *)file->vn->data;
+    return (void *)node->data;
 }
 
 #else

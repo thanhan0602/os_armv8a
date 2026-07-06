@@ -5,6 +5,7 @@
 #include <arch/arm/sysregs.h>
 #include <drivers/interrupt/gicv2.h>
 #include <kernel/log.h>
+#include <kernel/sched.h>
 
 #define CNTV_CTL_ENABLE  (1UL << 0)
 #define TIMER_PPI        QEMU_VIRT_TIMER_PPI
@@ -45,6 +46,7 @@ int timer_handle_irq(unsigned int intid)
     }
 
     timer_ticks++;
+    sched_tick();
     timer_program_next_tick();
 
     return 1;

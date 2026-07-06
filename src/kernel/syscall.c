@@ -5,6 +5,10 @@
 #include <kernel/mmu.h>
 #include <kernel/process.h>
 #include <kernel/sched.h>
+#include <kernel/fs.h>
+#include <kernel/ramfs.h>
+#include <kernel/heap.h>
+#include <arch/arm/cpu.h>
 
 /*
  * sys_write(fd, buf_va, len)
@@ -53,16 +57,175 @@ static unsigned long sys_write(unsigned long fd,
     return total_written;
 }
 
+static unsigned long sys_read(unsigned long fd,
+                               unsigned long buf_va,
+                               unsigned long len)
+{
+    struct task *task;
+    struct file *file;
+    char kbuf[128];
+    unsigned long remaining = len;
+    unsigned long total_read = 0;
+
+    task = sched_current();
+    if (task == (struct task *)0) return (unsigned long)-1;
+
+    if (fd >= MAX_FILES_PER_TASK || task->files[fd] == (struct file *)0) {
+        return (unsigned long)-1;
+    }
+
+    file = task->files[fd];
+    KER_LOGF("[syscall] sys_read: fd=%lu, buf=%p, len=%lu\n", fd, (void*)buf_va, len);
+
+    while (remaining > 0) {
+        unsigned long chunk = (remaining < sizeof(kbuf)) ? remaining : sizeof(kbuf);
+        unsigned long nread = fs_read(file, kbuf, chunk);
+        if (nread == 0) break;
+
+        if (!mmu_copy_to_user(task->mm, buf_va + total_read, kbuf, nread)) {
+            return (total_read != 0UL) ? total_read : (unsigned long)-1;
+        }
+
+        total_read += nread;
+        remaining -= nread;
+        if (nread < chunk) break;
+    }
+
+    KER_LOGF("[syscall] sys_read: returns %lu\n", total_read);
+    return total_read;
+}
+
+static unsigned long sys_open(unsigned long path_va)
+{
+    struct task *task;
+    char path[128];
+    int fd = -1;
+    struct file *file;
+
+    task = sched_current();
+    if (task == (struct task *)0) return (unsigned long)-1;
+
+    /* Copy path from user space */
+    unsigned long i = 0;
+    for (i = 0; i < sizeof(path) - 1; i++) {
+        char c;
+        if (!mmu_copy_from_user(task->mm, &c, path_va + i, 1)) {
+            KER_LOGF("[syscall] sys_open: copy_from_user failed at i=%lu\n", i);
+            return (unsigned long)-1;
+        }
+        path[i] = c;
+        if (c == '\0') break;
+    }
+    path[i] = '\0';
+    
+    KER_LOGF("[syscall] sys_open: path=\"%s\"\n", path);
+
+    /* Find a free FD */
+    for (int j = 0; j < (int)MAX_FILES_PER_TASK; j++) {
+        if (task->files[j] == (struct file *)0) {
+            fd = j;
+            break;
+        }
+    }
+
+    if (fd == -1) return (unsigned long)-1;
+
+    file = (struct file *)kmalloc(sizeof(struct file));
+    if (!file) return (unsigned long)-1;
+
+    if (fs_open(path, file) == 0) {
+        kfree(file);
+        return (unsigned long)-1;
+    }
+
+    task->files[fd] = file;
+    return (unsigned long)fd;
+}
+
 /*
  * sys_yield()
  *
  * Voluntarily gives up the CPU.  schedule() will pick the next ready
  * task; when this task is re-scheduled the syscall returns 0.
  */
+static unsigned long sys_mmap(unsigned long addr, unsigned long len,
+                              unsigned long prot, unsigned long flags,
+                              unsigned long fd, unsigned long offset)
+{
+    struct task *task = sched_current();
+    if (!task || !task->process) return (unsigned long)-1;
+
+    /* Simplified mmap: we just add a region */
+    /* In a real OS, we would look for a free range if addr is 0 */
+    /* and handle file vs anonymous mappings */
+    
+    struct file *file = (struct file *)0;
+    if (!(flags & 0x20)) { /* NOT MAP_ANONYMOUS (Linux value is 0x20) */
+        if (fd < MAX_FILES_PER_TASK) {
+            file = task->files[fd];
+        }
+    }
+
+    /* We only support mapping at specific addresses for now (fixed or hint) */
+    unsigned long start = addr;
+    if (start == 0) {
+        /* Find a free spot. For now, just use somewhere high in heap area */
+        static unsigned long next_mmap_addr = 0x7000000000UL;
+        start = next_mmap_addr;
+        next_mmap_addr += (len + 0xFFFUL) & ~0xFFFUL;
+    }
+
+    unsigned long mmu_flags = MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF;
+    if (prot & 0x1) mmu_flags |= MMU_USER_PAGE_AP_RO; /* PROT_READ */
+    if (prot & 0x2) mmu_flags = (mmu_flags & ~MMU_USER_PAGE_AP_RO) | MMU_USER_PAGE_AP_RW; /* PROT_WRITE */
+    if (!(prot & 0x4)) mmu_flags |= MMU_USER_PAGE_UXN; /* NO PROT_EXEC */
+
+    /* For internal simplify, we just use VM_TYPE_ELF to reuse lazy loader if it's a file */
+    /* Actually we should have a VM_TYPE_FILE */
+    
+    if (file) {
+        /* File mapping - we need to pass the image pointer if it's in ramfs */
+        /* Currently our ramfs files are just pointers to data */
+        /* We'll need a way to get the data pointer from the file */
+        extern void *ramfs_get_data_ptr(struct file *file); // I'll add this
+        void *data = ramfs_get_data_ptr(file);
+        if (!data) return (unsigned long)-1;
+
+        if (!process_add_region(task->process, start, start + len,
+                               VM_TYPE_ELF, mmu_flags,
+                               (const unsigned char *)data, offset, file->size - offset)) {
+            return (unsigned long)-1;
+        }
+    } else {
+        /* Anonymous mapping */
+        if (!process_add_region(task->process, start, start + len,
+                               VM_TYPE_HEAP, mmu_flags,
+                               (const unsigned char *)0, 0, 0)) {
+            return (unsigned long)-1;
+        }
+    }
+
+    return start;
+}
+
 static unsigned long sys_yield(void)
 {
     schedule();
     return 0UL;
+}
+
+static unsigned long sys_getpid(void)
+{
+    struct task *task = sched_current();
+    if (task == (struct task *)0) {
+        return (unsigned long)-1;
+    }
+    return task->id;
+}
+
+static unsigned long sys_getcpu(void)
+{
+    return (unsigned long)arch_get_cpu_id();
 }
 
 /*
@@ -176,6 +339,21 @@ static unsigned long sys_ipc_recv(unsigned long channel_id,
     }
 }
 
+static unsigned long sys_nanosleep(unsigned long seconds)
+{
+    struct task *t = sched_current();
+    if (!t) return (unsigned long)-1;
+
+    /* Our timer frequency is currently 2Hz (timer_interval = frequency / 2) */
+    /* So 1 second = 2 ticks */
+    t->sleep_ticks = seconds * 2;
+    t->state = TASK_STATE_BLOCKED;
+    
+    schedule();
+    
+    return 0;
+}
+
 void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
 {
     unsigned long ret;
@@ -184,8 +362,23 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
     case SYS_WRITE:
         ret = sys_write(ctx->gpr[0], ctx->gpr[1], ctx->gpr[2]);
         break;
+    case SYS_READ:
+        ret = sys_read(ctx->gpr[0], ctx->gpr[1], ctx->gpr[2]);
+        break;
+    case SYS_OPEN:
+        ret = sys_open(ctx->gpr[0]);
+        break;
+    case SYS_MMAP:
+        ret = sys_mmap(ctx->gpr[0], ctx->gpr[1], ctx->gpr[2], ctx->gpr[3], ctx->gpr[4], ctx->gpr[5]);
+        break;
     case SYS_YIELD:
         ret = sys_yield();
+        break;
+    case SYS_GETPID:
+        ret = sys_getpid();
+        break;
+    case SYS_GETCPU:
+        ret = sys_getcpu();
         break;
     case SYS_EXIT:
         ret = sys_exit(ctx->gpr[0]);
@@ -208,6 +401,9 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
         break;
     case SYS_IPC_RECV:
         ret = sys_ipc_recv(ctx->gpr[0], ctx->gpr[1], ctx->gpr[2]);
+        break;
+    case SYS_NANOSLEEP:
+        ret = sys_nanosleep(ctx->gpr[0]);
         break;
     default:
         KER_LOGF("[syscall] unknown nr=%lu\n", nr);

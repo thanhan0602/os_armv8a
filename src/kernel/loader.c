@@ -31,6 +31,8 @@ struct process *loader_load_process_image(const char *path)
     }
 
     process = process_create_from_elf(buffer, image_size);
-    kfree(buffer);
+    /* Note: We do NOT kfree(buffer) here because the process regions 
+     * use it for lazy loading from the ELF image. 
+     * The process takes ownership of this buffer. */
     return process;
 }

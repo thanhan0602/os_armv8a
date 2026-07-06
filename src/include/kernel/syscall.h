@@ -8,12 +8,18 @@
  * The caller places the number in x8 before executing svc #0.
  */
 #define SYS_WRITE   64UL
+#define SYS_READ    63UL
+#define SYS_OPEN    56UL
 #define SYS_EXIT    93UL
 #define SYS_YIELD   124UL
+#define SYS_GETPID  172UL
+#define SYS_GETCPU  168UL
 #define SYS_BRK     214UL
 #define SYS_MUNMAP  215UL
+#define SYS_MMAP    222UL
 #define SYS_FORK    220UL
 #define SYS_WAIT4   260UL
+#define SYS_NANOSLEEP 101UL
 #define SYS_IPC_SEND  451UL
 #define SYS_IPC_RECV  452UL
 

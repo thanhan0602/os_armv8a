@@ -36,7 +36,7 @@ struct task_context {
 #define TASK_STATE_ZOMBIE   4UL
 
 #define TASK_GUARD_PAGES    1UL
-#define TASK_STACK_PAGES    1UL
+#define TASK_STACK_PAGES    4UL
 #define TASK_TOTAL_PAGES    (TASK_GUARD_PAGES + TASK_STACK_PAGES)
 #define MAX_TASKS           16UL
 #define MAX_FILES_PER_TASK  16UL
@@ -47,6 +47,8 @@ struct task {
     unsigned long state;
     void *stack_base;
     unsigned long stack_size;
+    unsigned long sleep_ticks;
+    unsigned int current_cpu;
     const char *name;
     struct mm_context *mm;
     struct process *process;
@@ -70,6 +72,7 @@ struct task *task_create_user(struct process *process,
 #endif
 
 void schedule(void);
+void sched_tick(void);
 void sched_new_task_kickoff(void);
 void task_exit(void);
 struct task *sched_current(void);

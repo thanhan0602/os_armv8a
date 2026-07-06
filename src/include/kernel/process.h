@@ -8,6 +8,7 @@
 enum vm_type {
     VM_TYPE_ANON,
     VM_TYPE_ELF,
+    VM_TYPE_HEAP,
 };
 
 struct vm_region {
@@ -34,6 +35,9 @@ struct process {
 
     struct vm_region regions[PROCESS_VM_REGIONS_MAX];
     unsigned int region_count;
+
+    unsigned char *owned_images[8];
+    unsigned int owned_image_count;
 };
 
 struct process *process_create_from_buffer(const unsigned char *code, unsigned long code_size);
@@ -42,5 +46,10 @@ struct process *process_create_from_image(char *code_start, char *code_end);
 void process_destroy(struct process *process);
 unsigned long process_brk(struct process *process, unsigned long new_break);
 unsigned long process_fork(struct exception_context *ctx);
+int process_add_region(struct process *process, 
+                      unsigned long start, unsigned long end,
+                      enum vm_type type, unsigned long flags,
+                      const unsigned char *image, unsigned long offset,
+                      unsigned long filesz);
 
 #endif

@@ -370,6 +370,7 @@ static void shell_cmd_load(unsigned int argc, char *argv[])
         KER_LOGF("[shell] spawn failed: %s\n", task_name);
         return;
     }
+    sched_wake_task(task);
 
     KER_LOGF("[shell] loaded %s as task id=%lu entry=%lx brk=%lx\n",
              task_name,

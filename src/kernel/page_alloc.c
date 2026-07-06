@@ -374,9 +374,16 @@ int page_ref_dec(unsigned long pa)
 
 unsigned int page_ref_get(unsigned long pa)
 {
+    unsigned int ref;
+    unsigned long flags = spin_lock_irqsave(&page_lock);
     unsigned int idx = page_index_from_address(pa);
-    if (pa < managed_start || pa >= managed_end) return 0;
-    return (unsigned int)pages[idx].ref_count;
+    if (pa < managed_start || pa >= managed_end) {
+        spin_unlock_irqrestore(&page_lock, flags);
+        return 0;
+    }
+    ref = (unsigned int)pages[idx].ref_count;
+    spin_unlock_irqrestore(&page_lock, flags);
+    return ref;
 }
 
 void page_free_contiguous(void *page, unsigned long page_count)

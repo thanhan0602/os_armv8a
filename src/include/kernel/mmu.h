@@ -15,6 +15,7 @@ void mmu_init(void);
 void mmu_init_secondary(void);
 int mmu_is_enabled(void);
 int mmu_handle_page_fault(unsigned long far_el1, unsigned long esr_el1);
+void mmu_log_kernel_layout(void);
 
 /* Refactored version to handle faults for a specific process (used during loading) */
 struct process;
@@ -38,6 +39,7 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
 
 #define MMU_AP_RW              (0UL << 6)
 #define MMU_AP_RO              (2UL << 6)
+#define MMU_DESC_SOFTWARE_COW  (1UL << 55)   /* Software-defined bit for CoW */
 #define MMU_SH_NON_SHAREABLE   (0UL << 8)
 #define MMU_SH_INNER_SHAREABLE (3UL << 8)
 #define MMU_AF                 (1UL << 10)

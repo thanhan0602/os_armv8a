@@ -9,6 +9,8 @@
 #include <kernel/sched.h>
 #include <arch/arm/cpu.h>
 
+extern void fork_child_exit(void);
+
 #ifdef CONFIG_KERNEL_VIRTUAL
 #define ELF_MAGIC 0x464c457fUL
 #define ELF_CLASS_64 2U
@@ -143,11 +145,11 @@ static int process_map_elf_segment(struct process *process,
                                    const struct elf64_phdr *phdr,
                                    unsigned long load_bias);
 
-static int process_add_region(struct process *process, 
-                              unsigned long start, unsigned long end,
-                              enum vm_type type, unsigned long flags,
-                              const unsigned char *image, unsigned long offset,
-                              unsigned long filesz);
+int process_add_region(struct process *process, 
+                      unsigned long start, unsigned long end,
+                      enum vm_type type, unsigned long flags,
+                      const unsigned char *image, unsigned long offset,
+                      unsigned long filesz);
 
 static unsigned long process_align_up(unsigned long value, unsigned long alignment)
 {
@@ -562,7 +564,7 @@ static int process_parse_dynamic_info(struct process_elf_object *object)
     dyn_entries = (const struct elf64_dyn *)0;
     dyn_count = 0UL;
     for (index = 0UL; index < object->phnum; index++) {
-        if (object->phdrs[index].p_type != ELF_PT_DYNAMIC) {
+        if (object->phdrs[index].p_type != ELF_PT_DYNAMIC || object->phdrs[index].p_filesz == 0UL) {
             continue;
         }
 
@@ -868,6 +870,25 @@ static void process_release_loaded_images(struct process_elf_load_state *state)
     }
 }
 
+static void process_capture_loaded_images(struct process *process, struct process_elf_load_state *state)
+{
+    unsigned long index;
+
+    for (index = 0UL; index < state->object_count; index++) {
+        if (state->objects[index].owned_image != (unsigned char *)0) {
+            if (process->owned_image_count < 8) {
+                process->owned_images[process->owned_image_count++] = state->objects[index].owned_image;
+                /* Clear it from state so release_loaded_images doesn't free it */
+                state->objects[index].owned_image = (unsigned char *)0;
+            } else {
+                /* Too many images, just free it (should not happen in this OS) */
+                kfree(state->objects[index].owned_image);
+                state->objects[index].owned_image = (unsigned char *)0;
+            }
+        }
+    }
+}
+
 static int process_find_loaded_object(const struct process_elf_load_state *state,
                                       const char *name)
 {
@@ -953,13 +974,20 @@ static int process_register_loaded_object(struct process_elf_load_state *state,
                                  &object->image_end)) {
         return 0;
     }
+
     if (ehdr->e_type == ELF_ET_DYN) {
         object->load_bias = process_choose_elf_load_bias(object->image_start, object->image_end);
-        if (object->load_bias == 0UL && object->image_start != USER_CODE_BASE) {
+        /* If load_bias is 0 it's fine for the first object at 0x0, but we need to check if it's the 1st or not */
+        if (object->load_bias == 0UL && object->image_start != 0UL && state->object_count > 0) {
             return 0;
         }
     } else {
         object->load_bias = 0UL;
+        /* For static/ET_EXEC binaries, we must still move the next_base beyond this image */
+        unsigned long image_span = process_align_up(object->image_end - object->image_start, PAGE_SIZE);
+        if (process_next_elf_load_base < object->image_start + image_span) {
+            process_next_elf_load_base = process_align_up(object->image_start + image_span, PROCESS_ELF_LOAD_STRIDE);
+        }
     }
 
     if (set_entry != 0) {
@@ -1050,11 +1078,11 @@ static int process_load_needed_objects(struct process_elf_load_state *state)
     return 1;
 }
 
-static int process_add_region(struct process *process, 
-                              unsigned long start, unsigned long end,
-                              enum vm_type type, unsigned long flags,
-                              const unsigned char *image, unsigned long offset,
-                              unsigned long filesz)
+int process_add_region(struct process *process, 
+                      unsigned long start, unsigned long end,
+                      enum vm_type type, unsigned long flags,
+                      const unsigned char *image, unsigned long offset,
+                      unsigned long filesz)
 {
     if (process->region_count >= PROCESS_VM_REGIONS_MAX) {
         return 0;
@@ -1139,6 +1167,7 @@ static struct process *process_create_flat_binary(const unsigned char *code, uns
     process->heap_limit = USER_HEAP_LIMIT;
     process->heap_mapped_end = USER_HEAP_BASE;
     process->region_count = 0U;
+    process->owned_image_count = 0U;
 
     /* Register Code region */
     process_add_region(process, USER_CODE_BASE, USER_CODE_BASE + (code_pages * PAGE_SIZE),
@@ -1215,8 +1244,9 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
     process->heap_limit = USER_HEAP_LIMIT;
     process->heap_mapped_end = 0UL;
     process->region_count = 0U;
+    process->owned_image_count = 0U;
 
-    if (!process_register_loaded_object(&load_state, "<main>", (unsigned char *)0, image, image_size, 1)) {
+    if (!process_register_loaded_object(&load_state, "<main>", (unsigned char *)image, image, image_size, 1)) {
         process_destroy(process);
         return (struct process *)0;
     }
@@ -1265,6 +1295,7 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
 
     cpu_invalidate_icache_all();
 
+    process_capture_loaded_images(process, &load_state);
     process_release_loaded_images(&load_state);
 
     return process;
@@ -1289,6 +1320,14 @@ void process_destroy(struct process *process)
     if (process->mm != (struct mm_context *)0) {
         mmu_context_destroy(process->mm);
         process->mm = (struct mm_context *)0;
+    }
+
+    /* Free owned ELF images */
+    for (unsigned int i = 0; i < process->owned_image_count; i++) {
+        if (process->owned_images[i] != (unsigned char *)0) {
+            kfree(process->owned_images[i]);
+            process->owned_images[i] = (unsigned char *)0;
+        }
     }
 
     kfree(process);
@@ -1367,7 +1406,12 @@ unsigned long process_fork(struct exception_context *ctx)
     struct exception_context *child_ctx = (struct exception_context *)(dst_stack + stack_offset);
     child_ctx->gpr[0] = 0;
 
-    KER_LOGF("[process] fork: parent PID=%lu, child PID=%lu\n", parent_task->id, child_task->id);
+    sched_wake_task(child_task);
+
+    KER_LOGF("[process] fork: parent PID=%lu, child PID=%lu, offset=0x%lx, ctx=0x%lx\n", 
+             parent_task->id, child_task->id, stack_offset, (unsigned long)ctx);
+    KER_LOGF("          child_elr=0x%lx, child_spsr=0x%lx, child_sp_el0=0x%lx\n",
+             child_ctx->elr_el1, child_ctx->spsr_el1, child_ctx->sp_el0);
 
     /* 8. Parent returns child PID */
     return (unsigned long)child_task->id;

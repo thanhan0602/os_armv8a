@@ -404,7 +404,7 @@ void mmu_context_destroy(struct mm_context *mm)
     kfree(mm);
 }
 
-static void mmu_clone_walk(unsigned long *src_tbl, unsigned long *dst_tbl, int level)
+static void mmu_clone_walk(struct mm_context *mm, unsigned long *src_tbl, unsigned long *dst_tbl, int level)
 {
     for (int i = 0; i < 512; i++) {
         unsigned long entry = src_tbl[i];
@@ -416,19 +416,31 @@ static void mmu_clone_walk(unsigned long *src_tbl, unsigned long *dst_tbl, int l
             unsigned long next_dst_pa = (unsigned long)page_alloc();
             if (!next_dst_pa) continue;
             
+            if (!mmu_context_add_page(mm, next_dst_pa)) {
+                page_free((void *)next_dst_pa);
+                continue;
+            }
+            
             unsigned long *next_dst_va = (unsigned long *)pa_to_va(next_dst_pa);
             for (int k = 0; k < 512; k++) next_dst_va[k] = 0;
             
             dst_tbl[i] = (next_dst_pa & MMU_L3_PAGE_ADDR_MASK) | (entry & ~MMU_L3_PAGE_ADDR_MASK);
-            mmu_clone_walk(next_src, next_dst_va, level + 1);
+            mmu_clone_walk(mm, next_src, next_dst_va, level + 1);
         } else if (level == 3) {
             /* L3 Leaf entry - Mark as Read-Only for CoW */
             unsigned long pa = entry & MMU_L3_PAGE_ADDR_MASK;
+            
+            /* Ensure it is Read-Only in both and marked for CoW */
+            unsigned long cow_entry = (entry & ~MMU_AP_RW) | MMU_AP_RO | MMU_DESC_SOFTWARE_COW;
+            
+            /* 
+             * Order is important: increment ref_count before making src_tbl entry RO 
+             * to avoid potential race where other CPU might see RO and try to free/upgrade 
+             */
             page_ref_inc(pa);
             
-            /* Ensure it is Read-Only in both */
-            dst_tbl[i] = entry | MMU_AP_RO;
-            src_tbl[i] = entry | MMU_AP_RO;
+            dst_tbl[i] = cow_entry;
+            src_tbl[i] = cow_entry;
         }
     }
 }
@@ -443,7 +455,7 @@ struct mm_context *mmu_context_clone(struct mm_context *src)
     unsigned long *src_root = (unsigned long *)pa_to_va(src->root_pa);
     unsigned long *dst_root = (unsigned long *)pa_to_va(dst->root_pa);
 
-    mmu_clone_walk(src_root, dst_root, 0);
+    mmu_clone_walk(dst, src_root, dst_root, 0);
 
     /* Invalidate TLB for the source ASID since we modified its entries to RO */
     mmu_invalidate_tlb_asid(src->asid);
@@ -767,7 +779,6 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
     unsigned long page_va;
     void *new_page;
     unsigned long flags;
-    unsigned long *entry_ptr;
     unsigned int ec = (unsigned int)(esr_el1 >> 26) & 0x3F;
     unsigned int iss = (unsigned int)esr_el1 & 0x1FFFFFF;
 
@@ -784,31 +795,43 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
 
     /* KER_LOGF("[mmu] Fault: VA=%lx ESR=%lx (EC=%x FSC=%x)\n", far_el1, esr_el1, ec, (unsigned int)fsc); */
 
-    /* Handle Permission Fault (0x0C) for Copy-on-Write (CoW) */
+    /* Handle Permission Fault (range 0x0C-0x0F) for Copy-on-Write (CoW) */
     if (fsc_type == 0x0CUL) {
         unsigned long old_pa;
         unsigned long entry;
         void *copy_page;
+        unsigned long * volatile cow_entry_ptr = (unsigned long *)0;
 
-        if (!mmu_resolve_user_page_desc(p->mm, far_el1, &entry_ptr)) {
+        if (!mmu_resolve_user_page_desc(p->mm, far_el1, (unsigned long **)&cow_entry_ptr)) {
             goto cleanup_fatal;
         }
 
-        entry = *entry_ptr;
+        entry = *cow_entry_ptr;
         if ((entry & MMU_DESC_VALID) != 0UL && 
             (entry & MMU_AP_RO) == MMU_AP_RO &&
-            (entry & (1UL << 11)) != 0UL) {
+            (entry & MMU_DESC_SOFTWARE_COW) != 0UL) {
             
             old_pa = entry & MMU_L3_PAGE_ADDR_MASK;
             page_va = far_el1 & ~0xFFFUL;
 
             if (page_ref_get(old_pa) == 1U) {
-                *entry_ptr = (*entry_ptr & ~MMU_AP_RO) | MMU_AP_RW;
+                *cow_entry_ptr = (*cow_entry_ptr & ~MMU_AP_RO & ~MMU_DESC_SOFTWARE_COW) | MMU_AP_RW;
                 mmu_invalidate_tlb_va(p->mm->asid, page_va);
-                KER_LOGF("[mmu] CoW: VA=%lx upgraded to RW (ref=1)\n", page_va);
+                struct task *curr = sched_current();
+                if (curr) {
+                    KER_LOGF("[mmu] [%s:%lu] CoW: VA=%lx upgraded to RW (ref=1)\n", curr->name, curr->id, page_va);
+                } else {
+                    KER_LOGF("[mmu] CoW: VA=%lx upgraded to RW (ref=1)\n", page_va);
+                }
                 return 1;
             }
 
+            struct task *curr = sched_current();
+            if (curr) {
+                KER_LOGF("[mmu] [%s:%lu] CoW: VA=%lx copying (ref=%u)\n", curr->name, curr->id, page_va, page_ref_get(old_pa));
+            } else {
+                KER_LOGF("[mmu] CoW: VA=%lx copying (ref=%u)\n", page_va, page_ref_get(old_pa));
+            }
             copy_page = page_alloc();
             if (copy_page == (void *)0) return 0;
 
@@ -816,8 +839,8 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
             unsigned char *dst = (unsigned char *)pa_to_va(copy_page);
             for (unsigned long i = 0; i < PAGE_SIZE; i++) dst[i] = src[i];
 
-            *entry_ptr = ((unsigned long)va_to_pa(copy_page) & MMU_L3_PAGE_ADDR_MASK) | 
-                         (entry & ~MMU_L3_PAGE_ADDR_MASK & ~MMU_AP_RO) | MMU_AP_RW;
+            *cow_entry_ptr = ((unsigned long)va_to_pa(copy_page) & MMU_L3_PAGE_ADDR_MASK) | 
+                         (entry & ~MMU_L3_PAGE_ADDR_MASK & ~MMU_AP_RO & ~MMU_DESC_SOFTWARE_COW) | MMU_AP_RW;
 
             if (!mmu_context_add_page(p->mm, (unsigned long)va_to_pa(copy_page))) {}
             page_ref_dec(old_pa);
@@ -934,6 +957,7 @@ cleanup_fatal:
 int mmu_handle_page_fault(unsigned long far_el1, unsigned long esr_el1)
 {
     struct task *t = sched_current();
+
     if (t == (struct task *)0 || t->process == (struct process *)0) {
         return 0;
     }

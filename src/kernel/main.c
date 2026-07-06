@@ -27,29 +27,49 @@ volatile int secondary_ready = 0;
 
 extern char __text_start[];
 
-#if defined(CONFIG_KERNEL_VIRTUAL) && defined(CONFIG_RUN_OS_DEMOS)
-static void kernel_start_stage10_demos(void)
+#ifdef CONFIG_KERNEL_VIRTUAL
+struct boot_service {
+    const char *path;
+    const char *name;
+    int count;
+};
+
+static const struct boot_service boot_services[] = {
+    {"/lib/ld.so",          "ld.so",    1},
+    {"/bin/hello.elf",      "user-a",   1},
+    {"/bin/fault.elf",      "user-b",   1},
+    {"/bin/test_cow.elf",   "user-cow", 1},
+    {"/bin/cpu_stress.elf", "stress",   4},
+    {(const char *)0, (const char *)0, 0}
+};
+
+static void kernel_spawn_service(const char *path, const char *name)
 {
-    struct process *process_a;
-    struct process *process_b;
-    struct process *process_cow;
-
-    process_a = loader_load_process_image("/bin/hello.elf");
-    if (process_a != (struct process *)0 && task_create_user(process_a, "user-a") == (struct task *)0) {
-        KER_INFO("task_create_user failed: user-a");
-        process_destroy(process_a);
+    struct process *proc = loader_load_process_image(path);
+    if (proc == (struct process *)0) {
+        KER_LOGF("[boot] failed to load %s\n", path);
+        return;
     }
 
-    process_b = loader_load_process_image("/bin/fault.elf");
-    if (process_b != (struct process *)0 && task_create_user(process_b, "user-b") == (struct task *)0) {
-        KER_INFO("task_create_user failed: user-b");
-        process_destroy(process_b);
+    struct task *t = task_create_user(proc, name);
+    if (t == (struct task *)0) {
+        KER_LOGF("[boot] task_create_user failed: %s\n", name);
+        process_destroy(proc);
+        return;
     }
 
-    process_cow = loader_load_process_image("/bin/test_cow.elf");
-    if (process_cow != (struct process *)0 && task_create_user(process_cow, "user-cow") == (struct task *)0) {
-        KER_INFO("task_create_user failed: user-cow");
-        process_destroy(process_cow);
+    sched_wake_task(t);
+    KER_LOGF("[boot] spawned %s (%s)\n", name, path);
+}
+
+static void kernel_start_user_services(void)
+{
+    KER_INFO("starting user services");
+    
+    for (int i = 0; boot_services[i].path != (const char *)0; i++) {
+        for (int j = 0; j < boot_services[i].count; j++) {
+            kernel_spawn_service(boot_services[i].path, boot_services[i].name);
+        }
     }
 }
 #endif
@@ -156,6 +176,9 @@ void secondary_main(void)
     /* Set current task to the per-CPU idle task initialized in sched_init */
     arch_set_current_task(&tasks[cpu_id]);
 
+    /* Set exception vector table for this core (VBAR_EL1 is per-core) */
+    exception_init();
+
     /* Init Core-local GIC and Timer */
     driver_secondary_init();
     
@@ -209,8 +232,8 @@ void kernel_main(void)
     fs_init();
     ipc_init();
 
-#if defined(CONFIG_KERNEL_VIRTUAL) && defined(CONFIG_RUN_OS_DEMOS)
-    kernel_start_stage10_demos();
+#ifdef CONFIG_KERNEL_VIRTUAL
+    kernel_start_user_services();
 #endif
     KER_INFO("kernel init complete");
     driver_system_dump();

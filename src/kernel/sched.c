@@ -41,27 +41,10 @@ static const char *sched_state_name(unsigned long state)
 
 static void sched_clear_task(struct task *task)
 {
-    task->context.x19 = 0UL;
-    task->context.x20 = 0UL;
-    task->context.x21 = 0UL;
-    task->context.x22 = 0UL;
-    task->context.x23 = 0UL;
-    task->context.x24 = 0UL;
-    task->context.x25 = 0UL;
-    task->context.x26 = 0UL;
-    task->context.x27 = 0UL;
-    task->context.x28 = 0UL;
-    task->context.x29 = 0UL;
-    task->context.x30 = 0UL;
-    task->context.sp = 0UL;
-    task->id = 0UL;
-    task->state = 0UL;
-    task->stack_base = (void *)0;
-    task->stack_size = 0UL;
-    task->name = (const char *)0;
-    task->mm = (struct mm_context *)0;
-    task->process = (struct process *)0;
-    task->next = (struct task *)0;
+    if (!task) return;
+    for (unsigned long i = 0; i < sizeof(struct task); i++) {
+        ((unsigned char *)task)[i] = 0;
+    }
 }
 
 static struct task *sched_allocate_task_slot(void)
@@ -83,6 +66,11 @@ void sched_init(void)
 
     next_task_id = 0;
     switch_count = 0;
+    
+    /* Zero out all tasks */
+    for (int i = 0; i < MAX_TASKS; i++) {
+        sched_clear_task(&tasks[i]);
+    }
 
     /*
      * CPUs 0-3 get idle tasks in slots 0-3.
@@ -91,6 +79,7 @@ void sched_init(void)
         idle = &tasks[i];
         idle->id = next_task_id++;
         idle->state = TASK_STATE_RUNNING;
+        idle->current_cpu = i;
         idle->stack_base = (void *)0;
         idle->stack_size = 0;
         
@@ -144,7 +133,6 @@ struct task *task_create(task_fn_t entry, const char *name)
     sp &= ~0xFUL;
 
     t->id = next_task_id;
-    t->state = TASK_STATE_READY;
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
@@ -171,6 +159,7 @@ struct task *task_create(task_fn_t entry, const char *name)
     t->next = curr->next;
     curr->next = t;
 
+    t->state = TASK_STATE_READY;
     next_task_id++;
 
     spin_unlock_irqrestore(&sched_lock, flags);
@@ -213,7 +202,6 @@ struct task *task_create_user(struct process *process,
     sp &= ~0xFUL;
 
     t->id = next_task_id;
-    t->state = TASK_STATE_READY;
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
@@ -244,6 +232,7 @@ struct task *task_create_user(struct process *process,
     t->next = curr->next;
     curr->next = t;
 
+    t->state = TASK_STATE_BLOCKED;
     next_task_id++;
 
     spin_unlock_irqrestore(&sched_lock, flags);
@@ -302,6 +291,23 @@ void sched_new_task_kickoff(void)
     spin_unlock(&sched_lock);
 }
 
+void sched_tick(void)
+{
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
+
+    for (unsigned long i = 0; i < MAX_TASKS; i++) {
+        struct task *t = &tasks[i];
+        if (t->name && t->state == TASK_STATE_BLOCKED && t->sleep_ticks > 0) {
+            t->sleep_ticks--;
+            if (t->sleep_ticks == 0) {
+                t->state = TASK_STATE_READY;
+            }
+        }
+    }
+
+    spin_unlock_irqrestore(&sched_lock, flags);
+}
+
 void schedule(void)
 {
     struct task *prev;
@@ -331,7 +337,12 @@ void schedule(void)
         prev->state = TASK_STATE_READY;
     }
     next->state = TASK_STATE_RUNNING;
+    next->current_cpu = arch_get_cpu_id();
     
+    /* 
+    KER_LOGF("[sched] CPU %u: %s -> %s\n", arch_get_cpu_id(), prev->name, next->name);
+    */
+
     arch_set_current_task(next);
     switch_count++;
 
@@ -354,6 +365,8 @@ void task_exit(void)
 {
     struct task *curr = arch_get_current_task();
     
+    KER_LOGF("[sched] task %s exiting\n", curr->name);
+
     unsigned long flags = spin_lock_irqsave(&sched_lock);
     curr->state = TASK_STATE_ZOMBIE;
 
@@ -455,9 +468,10 @@ void sched_dump_tasks(void)
             continue;
         }
 
-        KER_LOGF("[shell]   id=%lu state=%s name=%s mode=%s",
+        KER_LOGF("[shell]   id=%lu state=%s cpu=%u name=%s mode=%s",
                  task->id,
                  sched_state_name(task->state),
+                 task->current_cpu,
                  task->name,
                  task->process != (struct process *)0 ? "user" : "kernel");
 #ifdef CONFIG_KERNEL_VIRTUAL

@@ -17,5 +17,6 @@ void ramfs_init(void);
 void ramfs_add_builtin(const char *path, unsigned char *start, unsigned char *end);
 int ramfs_register_file(const char *path, unsigned char *data, unsigned long size);
 int ramfs_unregister_file(const char *path);
+void *ramfs_get_data_ptr(struct file *file);
 
 #endif
