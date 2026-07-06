@@ -1,43 +1,44 @@
-#include <user/syscall.h>
-#include <user/shared.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
 
 /* Data in .data section to test CoW */
 static unsigned long shared_data = 0x12345678;
 
 int main(void) {
-    printf("--- CoW Test Start ---\n");
-    printf("Initial shared_data = 0x%lx at 0x%lx\n", shared_data, (unsigned long)&shared_data);
+    printf("[cow:%d] --- CoW Test Start ---\n", getpid());
+    printf("[cow:%d] Initial shared_data = 0x%lx at 0x%lx\n", getpid(), shared_data, (unsigned long)&shared_data);
 
-    long pid = user_fork();
+    long pid = fork();
 
     if (pid < 0) {
-        printf("Fork failed!\n");
-        user_exit(1);
+        printf("[cow:%d] Fork failed!\n", getpid());
+        exit(1);
     } else if (pid == 0) {
         /* Child */
-        printf("Child: Updating shared_data to 0xdeadbeef\n");
+        printf("[cow:%d] Child: Updating shared_data to 0xdeadbeef\n", getpid());
         shared_data = 0xdeadbeef;
-        printf("Child: shared_data = 0x%lx\n", shared_data);
-        user_exit(0);
+        printf("[cow:%d] Child: shared_data = 0x%lx\n", getpid(), shared_data);
+        exit(0);
     } else {
         /* Parent */
-        printf("Parent: Waiting for child PID=%ld\n", pid);
+        printf("[cow:%d] Parent: Waiting for child PID=%ld\n", getpid(), pid);
         
         int status = -1;
-        long waited_pid = user_wait4(pid, &status);
+        long waited_pid = wait(&status);
         
-        printf("Parent: Child %ld exited with status %d\n", waited_pid, status);
+        printf("[cow:%d] Parent: Child %ld exited with status %d\n", getpid(), waited_pid, status);
 
-        printf("Parent: Checking shared_data...\n");
-        printf("Parent: shared_data = 0x%lx\n", shared_data);
+        printf("[cow:%d] Parent: Checking shared_data...\n", getpid());
+        printf("[cow:%d] Parent: shared_data = 0x%lx\n", getpid(), shared_data);
 
         if (shared_data == 0x12345678) {
-            printf("CoW SUCCESS: Parent data unchanged!\n");
+            printf("[cow:%d] CoW SUCCESS: Parent data unchanged!\n", getpid());
         } else {
-            printf("CoW FAILURE: Parent data corrupted!\n");
+            printf("[cow:%d] CoW FAILURE: Parent data corrupted!\n", getpid());
         }
     }
 
-    user_exit(0);
+    exit(0);
     return 0;
 }

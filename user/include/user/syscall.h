@@ -4,10 +4,13 @@
 #define USER_SYS_WRITE  64UL
 #define USER_SYS_EXIT   93UL
 #define USER_SYS_YIELD  124UL
+#define USER_SYS_GETPID 172UL
+#define USER_SYS_GETCPU 168UL
 #define USER_SYS_BRK    214UL
 #define USER_SYS_MUNMAP 215UL
 #define USER_SYS_FORK   220UL
 #define USER_SYS_WAIT4  260UL
+#define USER_SYS_NANOSLEEP 101UL
 #define USER_SYS_IPC_SEND  451UL
 #define USER_SYS_IPC_RECV  452UL
 
@@ -99,6 +102,15 @@ static inline long user_munmap(void *addr, unsigned long len)
 {
     return user_syscall2(USER_SYS_MUNMAP, (unsigned long)addr, len);
 }
+static inline long user_getpid(void)
+{
+    return user_syscall0(USER_SYS_GETPID);
+}
+
+static inline long user_getcpu(void)
+{
+    return user_syscall0(USER_SYS_GETCPU);
+}
 
 static inline long user_fork(void)
 {
@@ -135,6 +147,11 @@ static inline unsigned long user_strlen(const char *text)
 static inline void user_write_string(const char *text)
 {
     user_write(1UL, text, user_strlen(text));
+}
+
+static inline unsigned int user_nanosleep(unsigned int seconds)
+{
+    return (unsigned int)user_syscall1(USER_SYS_NANOSLEEP, (unsigned long)seconds);
 }
 
 #endif

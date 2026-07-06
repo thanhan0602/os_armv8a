@@ -3,34 +3,46 @@ ENTRY(_start)
 
 PHDRS
 {
-    text PT_LOAD FLAGS(5);
-    data PT_LOAD FLAGS(6);
-    dynamic PT_DYNAMIC FLAGS(6);
+    text PT_LOAD FLAGS(5); /* R E */
+    data PT_LOAD FLAGS(6); /* RW  */
+    dynamic PT_DYNAMIC;
 }
 
 SECTIONS
 {
-    . = 0;
+    . = 0x0;
 
     .text ALIGN(0x1000) : {
         *(.text.start)
         *(.text*)
     } :text
 
-    .rodata ALIGN(0x1000) : {
-        *(.rodata*)
-        *(.dynsym)
-        *(.dynstr)
-        *(.gnu.hash)
-        *(.rela.dyn)
+    .plt ALIGN(8) : {
+        *(.plt)
     } :text
 
+    .rodata ALIGN(0x1000) : {
+        *(.rodata*)
+    } :text
+
+    .dynsym ALIGN(8) : { *(.dynsym) } :text
+    .dynstr ALIGN(8) : { *(.dynstr) } :text
+    .hash ALIGN(8) : { *(.hash) } :text
+    .gnu.hash ALIGN(8) : { *(.gnu.hash) } :text
+    .rela.dyn ALIGN(8) : { *(.rela*) } :text
+
     .data ALIGN(0x1000) : {
+        *(.data*)
+    } :data
+
+    .dynamic ALIGN(8) : {
         *(.dynamic)
+    } :data :dynamic
+
+    .got ALIGN(8) : {
         *(.got)
         *(.got.plt)
-        *(.data*)
-    } :data :dynamic
+    } :data
 
     .bss ALIGN(0x1000) (NOLOAD) : {
         *(.bss*)

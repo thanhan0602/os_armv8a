@@ -1,12 +1,8 @@
-#include <user/shared.h>
-#include <user/syscall.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
 
-void shared_write(const char *text)
-{
-    user_write_string(text);
-}
-
-static void shared_reverse(char *s, int len)
+static void reverse(char *s, int len)
 {
     int i = 0, j = len - 1;
     while (i < j) {
@@ -17,7 +13,7 @@ static void shared_reverse(char *s, int len)
     }
 }
 
-static int shared_itoa(long long n, char *s, int base, int is_unsigned)
+static int itoa(long long n, char *s, int base, int is_unsigned)
 {
     int i = 0;
     unsigned long long num = (unsigned long long)n;
@@ -39,11 +35,11 @@ static int shared_itoa(long long n, char *s, int base, int is_unsigned)
 
     if (negative) s[i++] = '-';
     s[i] = '\0';
-    shared_reverse(s, i);
+    reverse(s, i);
     return i;
 }
 
-int shared_vsnprintf(char *buf, unsigned long size, const char *fmt, va_list args)
+int vsnprintf(char *buf, unsigned long size, const char *fmt, va_list args)
 {
     unsigned long i = 0;
     const char *p = fmt;
@@ -59,20 +55,21 @@ int shared_vsnprintf(char *buf, unsigned long size, const char *fmt, va_list arg
             }
             if (*p == 's') {
                 char *s = va_arg(args, char *);
+                if (!s) s = "(null)";
                 while (*s && i < size - 1) {
                     out[i++] = *s++;
                 }
             } else if (*p == 'd' || *p == 'i') {
                 char tmp[32];
                 long long val = long_mod ? va_arg(args, long) : va_arg(args, int);
-                int len = shared_itoa(val, tmp, 10, 0);
+                int len = itoa(val, tmp, 10, 0);
                 for (int j = 0; j < len && i < size - 1; j++) {
                     out[i++] = tmp[j];
                 }
             } else if (*p == 'u') {
                 char tmp[32];
                 unsigned long long val = long_mod ? va_arg(args, unsigned long) : va_arg(args, unsigned int);
-                int len = shared_itoa((long long)val, tmp, 10, 1);
+                int len = itoa((long long)val, tmp, 10, 1);
                 for (int j = 0; j < len && i < size - 1; j++) {
                     out[i++] = tmp[j];
                 }
@@ -81,10 +78,12 @@ int shared_vsnprintf(char *buf, unsigned long size, const char *fmt, va_list arg
                 unsigned long long val;
                 if (*p == 'p') val = (unsigned long long)va_arg(args, void *);
                 else val = long_mod ? va_arg(args, unsigned long) : va_arg(args, unsigned int);
-                int len = shared_itoa((long long)val, tmp, 16, 1);
+                int len = itoa((long long)val, tmp, 16, 1);
                 for (int j = 0; j < len && i < size - 1; j++) {
                     out[i++] = tmp[j];
                 }
+            } else if (*p == '%') {
+                out[i++] = '%';
             } else {
                 out[i++] = '%';
                 if (i < size - 1) out[i++] = *p;
@@ -98,16 +97,29 @@ int shared_vsnprintf(char *buf, unsigned long size, const char *fmt, va_list arg
     return (int)i;
 }
 
-int shared_printf(const char *fmt, ...)
+int printf(const char *fmt, ...)
 {
     char buf[256];
     va_list args;
     int len;
 
     va_start(args, fmt);
-    len = shared_vsnprintf(buf, sizeof(buf), fmt, args);
+    len = vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    user_write(1UL, buf, (unsigned long)len);
+    write(1, buf, (unsigned long)len);
     return len;
+}
+
+int puts(const char *s)
+{
+    int res = printf("%s\n", s);
+    return res >= 0 ? 0 : -1;
+}
+
+int putchar(int c)
+{
+    char ch = (char)c;
+    write(1, &ch, 1);
+    return c;
 }

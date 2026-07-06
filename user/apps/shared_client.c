@@ -1,4 +1,4 @@
-#include <user/shared.h>
+#include <stdio.h>
 
 int main(void)
 {

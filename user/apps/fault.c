@@ -1,4 +1,5 @@
-#include <user/syscall.h>
+#include <stdio.h>
+#include <unistd.h>
 
 int main(void)
 {
@@ -6,8 +7,8 @@ int main(void)
     unsigned long index;
 
     for (index = 0UL; index < 3UL; index++) {
-        user_write_string("[user-fault] hello from ELF\n");
-        user_yield();
+        printf("[fault:%d] hello from ELF\n", getpid());
+        yield();
     }
 
     text = "[user-fault] hello from ELF\n";

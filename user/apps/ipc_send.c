@@ -1,18 +1,19 @@
-#include <user/syscall.h>
-#include <user/shared.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
 
 int main(void)
 {
     static const char message[] = "hello from ipc_send\n";
     long result;
 
-    result = user_ipc_send(1UL, message, sizeof(message) - 1UL);
+    result = ipc_send(1UL, message, sizeof(message) - 1UL);
     if (result < 0) {
         printf("[ipc-send] send failed\n");
-        user_exit(1UL);
+        exit(1);
     }
 
     printf("[ipc-send] sent message on channel 1\n");
-    user_exit(0UL);
+    exit(0);
     return 0;
 }

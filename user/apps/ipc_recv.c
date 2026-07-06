@@ -1,5 +1,7 @@
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
 #include <user/syscall.h>
-#include <user/shared.h>
 
 int main(void)
 {
@@ -7,10 +9,10 @@ int main(void)
     long len;
 
     printf("[ipc-recv] waiting on channel 1\n");
-    len = user_ipc_recv(1UL, buffer, USER_IPC_MESSAGE_MAX);
+    len = ipc_recv(1UL, buffer, USER_IPC_MESSAGE_MAX);
     if (len < 0) {
         printf("[ipc-recv] recv failed\n");
-        user_exit(1UL);
+        exit(1);
     }
 
     if ((unsigned long)len > USER_IPC_MESSAGE_MAX) {
@@ -23,6 +25,6 @@ int main(void)
         printf("\n");
     }
 
-    user_exit(0UL);
+    exit(0);
     return 0;
 }

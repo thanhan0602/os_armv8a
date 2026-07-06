@@ -1,10 +1,10 @@
-#include <user/syscall.h>
-#include <user/shared.h>
+#include <stdio.h>
+#include <unistd.h>
 
 int main(void)
 {
     for (;;) {
         printf("[user-ticker] tick\n");
-        user_yield();
+        yield();
     }
 }

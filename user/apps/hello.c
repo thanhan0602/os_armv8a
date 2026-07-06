@@ -1,34 +1,29 @@
-#include <user/syscall.h>
-#include <user/shared.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
 
 int main(void)
 {
-    const char *hello;
-    const char *heap_ok;
+    const char *hello = "hello";
+    const char *heap_ok = "heap is working\n";
     unsigned long heap_base;
     unsigned long new_break;
     unsigned long index;
 
-    hello = "[user-elf] hello from ELF\n";
-    heap_ok = "[user-elf] brk ok\n";
-
     for (index = 0UL; index < 3UL; index++) {
-        printf("%s", hello);
-        // user_yield();
+        int cpu = getcpu();
+        printf("[hello:%d:cpu%d] hello from ELF\n", getpid(), cpu);
+        yield();
     }
 
-    heap_base = user_brk(0UL);
-    new_break = user_brk(heap_base + user_strlen(heap_ok));
-    if (new_break != heap_base) {
-        char *heap_text;
-
-        heap_text = (char *)heap_base;
-        for (index = 0UL; index < user_strlen(heap_ok); index++) {
-            heap_text[index] = heap_ok[index];
-        }
+    heap_base = (unsigned long)sbrk(strlen(heap_ok));
+    if (heap_base != (unsigned long)-1) {
+        char *heap_text = (char *)heap_base;
+        strcpy(heap_text, heap_ok);
         printf("%s", heap_text);
     }
 
-    user_exit(0);
+    exit(0);
     return 0;
 }
