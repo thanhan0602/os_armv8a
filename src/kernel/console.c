@@ -4,6 +4,28 @@
 
 #include <drivers/uart/pl011.h>
 #include <kernel/driver.h>
+#include <kernel/spinlock.h>
+
+static struct spinlock console_lock = SPINLOCK_INITIALIZER;
+
+void console_lock_acquire(unsigned long *flags)
+{
+    *flags = spin_lock_irqsave(&console_lock);
+}
+
+void console_lock_release(unsigned long flags)
+{
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+void console_putc_unlocked(char ch)
+{
+    if (ch == '\n') {
+        pl011_write('\r');
+    }
+
+    pl011_write((unsigned int)(unsigned char)ch);
+}
 
 static int console_vnode_open(struct vnode *vn, struct file *file)
 {
@@ -18,9 +40,12 @@ static unsigned long console_vnode_write(struct vnode *vn, struct file *file, co
     (void)vn;
     (void)file;
     const char *buf = (const char *)src;
+    unsigned long flags;
+    console_lock_acquire(&flags);
     for (unsigned long i = 0; i < len; i++) {
-        console_putc(buf[i]);
+        console_putc_unlocked(buf[i]);
     }
+    console_lock_release(flags);
     return len;
 }
 
@@ -47,6 +72,7 @@ struct file *console_open_file(void)
 
 void console_init(void)
 {
+    spinlock_init(&console_lock);
     if (!driver_uart_is_ready()) {
         pl011_init();
     }
@@ -54,22 +80,29 @@ void console_init(void)
 
 void console_putc(char ch)
 {
-    if (ch == '\n') {
-        pl011_write('\r');
-    }
-
-    pl011_write((unsigned int)(unsigned char)ch);
+    unsigned long flags;
+    console_lock_acquire(&flags);
+    console_putc_unlocked(ch);
+    console_lock_release(flags);
 }
 
-void console_write(const char *message)
+void console_write_unlocked(const char *message)
 {
     while (*message != '\0') {
-        console_putc(*message);
+        console_putc_unlocked(*message);
         message++;
     }
 }
 
-void console_write_hex(unsigned long value)
+void console_write(const char *message)
+{
+    unsigned long flags;
+    console_lock_acquire(&flags);
+    console_write_unlocked(message);
+    console_lock_release(flags);
+}
+
+void console_write_hex_unlocked(unsigned long value)
 {
     static const char digits[] = "0123456789abcdef";
     char buffer[2 + (sizeof(unsigned long) * 2) + 1];
@@ -88,7 +121,15 @@ void console_write_hex(unsigned long value)
     }
 
     buffer[index] = '\0';
-    console_write(buffer);
+    console_write_unlocked(buffer);
+}
+
+void console_write_hex(unsigned long value)
+{
+    unsigned long flags;
+    console_lock_acquire(&flags);
+    console_write_hex_unlocked(value);
+    console_lock_release(flags);
 }
 
 int console_try_getc(char *ch)

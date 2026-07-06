@@ -44,6 +44,39 @@ unsigned long *alloc_named_table_page(const char *name)
 }
 #endif
 
+static void mmu_log_segment(const char *name, void *start, void *end)
+{
+    unsigned long k_start_pa = (unsigned long)va_to_pa(__text_start);
+    unsigned long s_pa = (unsigned long)va_to_pa(start);
+    unsigned long e_pa = (unsigned long)va_to_pa(end);
+    unsigned long size = e_pa - s_pa;
+    unsigned long start_page = (s_pa - k_start_pa) / PAGE_SIZE;
+    unsigned long end_page = (e_pa - 1 - k_start_pa) / PAGE_SIZE;
+    unsigned long start_chunk = (s_pa - QEMU_VIRT_RAM_BASE) / MMU_L2_BLOCK_SIZE;
+    unsigned long end_chunk = (e_pa - 1 - QEMU_VIRT_RAM_BASE) / MMU_L2_BLOCK_SIZE;
+
+    if (size == 0) return;
+
+    KER_LOGF("[boot] Segment %s: %lx - %lx (%lu KB) | Kernel Pages: %lu-%lu | Chunks: %lu-%lu\n",
+             name, s_pa, e_pa, size / 1024, start_page, end_page, start_chunk, end_chunk);
+}
+
+void mmu_log_kernel_layout(void)
+{
+    unsigned long k_start = (unsigned long)va_to_pa(__text_start);
+    unsigned long k_end = (unsigned long)va_to_pa(__kernel_end);
+
+    KER_LOGF("[boot] Kernel Physical Layout:\n");
+    KER_LOGF("[boot] Total Size: %lu KB\n", (k_end - k_start) / 1024);
+
+    mmu_log_segment(".text", __text_start, __text_end);
+    mmu_log_segment(".rodata", __rodata_start, __rodata_end);
+    mmu_log_segment(".data", __data_start, __data_end);
+    mmu_log_segment(".bss", __bss_start, __bss_end);
+    mmu_log_segment("guard", __stack_guard, __stack_guard_end);
+    mmu_log_segment("stack", __stack_bottom, __stack_top);
+}
+
 /*
  * The fine-mapped kernel region is split by linker sections so we can keep
  * .text executable, .rodata read-only, and writable data non-executable.

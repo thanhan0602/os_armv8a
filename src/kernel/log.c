@@ -2,24 +2,24 @@
 
 #include <kernel/console.h>
 #include <kernel/spinlock.h>
+#include <kernel/sched.h>
+#include <arch/arm/cpu.h>
 
 #include <stdarg.h>
 
-static struct spinlock log_lock = SPINLOCK_INITIALIZER;
-
 static void log_putc_unlocked(char ch)
 {
-    console_putc(ch);
+    console_putc_unlocked(ch);
 }
 
 static void log_write_unlocked(const char *message)
 {
-    console_write(message);
+    console_write_unlocked(message);
 }
 
 static void log_write_hex_unlocked(unsigned long value)
 {
-    console_write_hex(value);
+    console_write_hex_unlocked(value);
 }
 
 static void log_write_u64_unlocked(unsigned long value)
@@ -46,43 +46,42 @@ static void log_write_u64_unlocked(unsigned long value)
 void log_init(void)
 {
     console_init();
-    spinlock_init(&log_lock);
 }
 
 void log_putc(char ch)
 {
     unsigned long flags;
 
-    flags = spin_lock_irqsave(&log_lock);
+    console_lock_acquire(&flags);
     log_putc_unlocked(ch);
-    spin_unlock_irqrestore(&log_lock, flags);
+    console_lock_release(flags);
 }
 
 void log_write(const char *message)
 {
     unsigned long flags;
 
-    flags = spin_lock_irqsave(&log_lock);
+    console_lock_acquire(&flags);
     log_write_unlocked(message);
-    spin_unlock_irqrestore(&log_lock, flags);
+    console_lock_release(flags);
 }
 
 void log_write_hex(unsigned long value)
 {
     unsigned long flags;
 
-    flags = spin_lock_irqsave(&log_lock);
+    console_lock_acquire(&flags);
     log_write_hex_unlocked(value);
-    spin_unlock_irqrestore(&log_lock, flags);
+    console_lock_release(flags);
 }
 
 void log_write_u64(unsigned long value)
 {
     unsigned long flags;
 
-    flags = spin_lock_irqsave(&log_lock);
+    console_lock_acquire(&flags);
     log_write_u64_unlocked(value);
-    spin_unlock_irqrestore(&log_lock, flags);
+    console_lock_release(flags);
 }
 
 /*
@@ -103,7 +102,20 @@ void log_printf(const char *fmt, ...)
     unsigned long flags;
 
     va_start(args, fmt);
-    flags = spin_lock_irqsave(&log_lock);
+    console_lock_acquire(&flags);
+
+    /* Dynamic prefix: [cpuX:task] */
+    struct task *curr = arch_get_current_task();
+    log_putc_unlocked('[');
+    log_write_unlocked("cpu");
+    log_write_u64_unlocked((unsigned long)arch_get_cpu_id());
+    if (curr && curr->name) {
+        log_putc_unlocked(':');
+        log_write_unlocked(curr->name);
+        log_putc_unlocked(':');
+        log_write_u64_unlocked(curr->id);
+    }
+    log_write_unlocked("] ");
 
     for (p = fmt; *p != '\0'; p++) {
         if (*p != '%') {
@@ -169,6 +181,6 @@ void log_printf(const char *fmt, ...)
         }
     }
 
-    spin_unlock_irqrestore(&log_lock, flags);
+    console_lock_release(flags);
     va_end(args);
 }

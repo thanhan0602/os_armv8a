@@ -23,7 +23,7 @@ int vfs_register_fs(const char *name, struct vfs_ops *ops)
     type->next = fs_types;
     fs_types = type;
 
-    KER_LOGF("vfs", "registered filesystem: %s", name);
+    KER_LOGF("[vfs] registered filesystem: %s\n", name);
     return 1;
 }
 
@@ -54,7 +54,7 @@ int vfs_mount(const char *path, const char *fs_name, const char *device)
     }
 
     mounts = mnt;
-    KER_LOGF("vfs", "mounted %s on %s", fs_name, path);
+    KER_LOGF("[vfs] mounted %s on %s\n", fs_name, path);
     return 1;
 }
 
@@ -78,7 +78,10 @@ int vfs_lookup(const char *path, struct vnode **out)
         mnt = mnt->next;
     }
 
-    if (!best_mnt) return 0;
+    if (!best_mnt) {
+        KER_LOGF("[vfs] lookup failed: no mount for %s\n", path);
+        return 0;
+    }
 
     return best_mnt->vnode_root->ops->lookup(best_mnt->vnode_root, path, out);
 }
