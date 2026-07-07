@@ -10,6 +10,8 @@
 #include <arch/arm/cpu.h>
 
 extern void fork_child_exit(void);
+extern int mmu_copy_to_user(const struct mm_context *mm, unsigned long dst_va, const void *src, unsigned long len);
+extern int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsigned long esr_el1);
 
 #ifdef CONFIG_KERNEL_VIRTUAL
 #define ELF_MAGIC 0x464c457fUL
@@ -20,28 +22,9 @@ extern void fork_child_exit(void);
 #define ELF_EM_AARCH64 183U
 #define ELF_PT_LOAD 1U
 #define ELF_PT_DYNAMIC 2U
+#define ELF_PT_INTERP 3U
 #define ELF_PF_X 0x1U
 #define ELF_PF_W 0x2U
-
-#define ELF_DT_NEEDED 1L
-#define ELF_DT_PLTRELSZ 2L
-#define ELF_DT_PLTGOT 3L
-#define ELF_DT_NULL 0L
-#define ELF_DT_STRTAB 5L
-#define ELF_DT_SYMTAB 6L
-#define ELF_DT_RELA 7L
-#define ELF_DT_RELASZ 8L
-#define ELF_DT_RELAENT 9L
-#define ELF_DT_STRSZ 10L
-#define ELF_DT_SYMENT 11L
-#define ELF_DT_SONAME 14L
-#define ELF_DT_PLTREL 20L
-#define ELF_DT_JMPREL 23L
-
-#define ELF_R_AARCH64_ABS64 257U
-#define ELF_R_AARCH64_GLOB_DAT 1025U
-#define ELF_R_AARCH64_JUMP_SLOT 1026U
-#define ELF_R_AARCH64_RELATIVE 1027U
 
 #define PROCESS_BRK_ROLLBACK_MAX_PAGES  ((USER_HEAP_LIMIT - USER_HEAP_BASE) / PAGE_SIZE)
 #define PROCESS_ELF_HEAP_GUARD_SIZE PAGE_SIZE
@@ -78,43 +61,6 @@ struct elf64_phdr {
     unsigned long p_align;
 };
 
-struct elf64_dyn {
-    long d_tag;
-    union {
-        unsigned long d_val;
-        unsigned long d_ptr;
-    } d_un;
-};
-
-struct elf64_rela {
-    unsigned long r_offset;
-    unsigned long r_info;
-    long r_addend;
-};
-
-struct elf64_sym {
-    unsigned int st_name;
-    unsigned char st_info;
-    unsigned char st_other;
-    unsigned short st_shndx;
-    unsigned long st_value;
-    unsigned long st_size;
-};
-
-struct process_elf_dynamic_info {
-    const char *strtab;
-    unsigned long strtab_size;
-    const struct elf64_sym *symtab;
-    unsigned long symtab_count;
-    const struct elf64_rela *rela_entries;
-    unsigned long rela_count;
-    const struct elf64_rela *jmprel_entries;
-    unsigned long jmprel_count;
-    unsigned long needed_offsets[PROCESS_ELF_NEEDED_MAX];
-    unsigned long needed_count;
-    unsigned long soname_offset;
-};
-
 struct process_elf_object {
     char name[PROCESS_ELF_NAME_MAX];
     unsigned char *owned_image;
@@ -127,7 +73,6 @@ struct process_elf_object {
     unsigned long image_end;
     unsigned long load_bias;
     unsigned long mapped_end;
-    struct process_elf_dynamic_info dynamic;
 };
 
 struct process_elf_load_state {
@@ -135,7 +80,26 @@ struct process_elf_load_state {
     struct process_elf_object objects[PROCESS_ELF_OBJECTS_MAX];
     unsigned long object_count;
     unsigned long max_mapped_end;
+    
+    /* For Auxiliary Vector */
+    unsigned long main_phdr_va;
+    unsigned long main_phent;
+    unsigned long main_phnum;
+    unsigned long main_entry;
+    unsigned long interp_load_bias;
+    unsigned long interp_entry;
 };
+
+/* Auxiliary Vector Types */
+#define AT_NULL   0
+#define AT_PHDR   3
+#define AT_PHENT  4
+#define AT_PHNUM  5
+#define AT_PAGESZ 6
+#define AT_BASE   7
+#define AT_FLAGS  8
+#define AT_ENTRY  9
+#define AT_EXECFN 31
 
 static unsigned long process_next_elf_load_base = USER_CODE_BASE;
 
@@ -154,6 +118,11 @@ int process_add_region(struct process *process,
 static unsigned long process_align_up(unsigned long value, unsigned long alignment)
 {
     return (value + alignment - 1UL) & ~(alignment - 1UL);
+}
+
+static unsigned long process_align_down(unsigned long value, unsigned long alignment)
+{
+    return value & ~(alignment - 1UL);
 }
 
 static void process_zero_bytes(void *ptr, unsigned long size)
@@ -198,85 +167,6 @@ static int process_copy_string(char *dst, const char *src, unsigned long max_len
     }
 
     dst[index] = '\0';
-    return 1;
-}
-
-static int process_make_library_path(char *dst, const char *name)
-{
-    static const char prefix[] = "/lib/";
-    unsigned long out_index;
-    unsigned long index;
-
-    if (dst == (char *)0 || name == (const char *)0) {
-        return 0;
-    }
-
-    if (name[0] == '/') {
-        return process_copy_string(dst, name, PROCESS_ELF_NAME_MAX);
-    }
-
-    out_index = 0UL;
-    for (index = 0UL; prefix[index] != '\0'; index++) {
-        if (out_index + 1UL >= PROCESS_ELF_NAME_MAX) {
-            return 0;
-        }
-
-        dst[out_index++] = prefix[index];
-    }
-
-    for (index = 0UL; name[index] != '\0'; index++) {
-        if (out_index + 1UL >= PROCESS_ELF_NAME_MAX) {
-            return 0;
-        }
-
-        dst[out_index++] = name[index];
-    }
-
-    dst[out_index] = '\0';
-    return 1;
-}
-
-static void process_copy_image_page(unsigned long page_pa,
-                                    const unsigned char *source,
-                                    unsigned long byte_count)
-{
-    unsigned char *page_va;
-    unsigned long index;
-
-    page_va = (unsigned char *)pa_to_va((void *)page_pa);
-    for (index = 0UL; index < byte_count; index++) {
-        page_va[index] = source[index];
-    }
-}
-
-static void process_copy_image_page_region(unsigned long page_pa,
-                                           unsigned long page_offset,
-                                           const unsigned char *source,
-                                           unsigned long byte_count)
-{
-    unsigned char *page_va;
-    unsigned long index;
-
-    page_va = (unsigned char *)pa_to_va((void *)page_pa);
-    for (index = 0UL; index < byte_count; index++) {
-        page_va[page_offset + index] = source[index];
-    }
-}
-
-static int process_map_page(struct process *process,
-                            unsigned long va,
-                            unsigned long pa,
-                            unsigned long flags)
-{
-    if (!mmu_context_add_page(process->mm, pa)) {
-        return 0;
-    }
-
-    if (!mmu_map_user_page(process->mm, va, pa, flags)) {
-        mmu_context_remove_page(process->mm, pa);
-        return 0;
-    }
-
     return 1;
 }
 
@@ -339,16 +229,6 @@ static int process_validate_elf_header(const struct elf64_ehdr *ehdr,
         return 0;
     }
     return 1;
-}
-
-static unsigned int process_elf_relocation_type(unsigned long r_info)
-{
-    return (unsigned int)(r_info & 0xffffffffUL);
-}
-
-static unsigned long process_elf_relocation_symbol(unsigned long r_info)
-{
-    return r_info >> 32;
 }
 
 static int process_elf_load_bounds(const struct elf64_phdr *phdrs,
@@ -432,432 +312,6 @@ static unsigned long process_choose_elf_load_bias(unsigned long image_start,
     return base - image_start;
 }
 
-static const unsigned char *process_elf_image_ptr(const unsigned char *image,
-                                                  unsigned long image_size,
-                                                  const struct elf64_phdr *phdrs,
-                                                  unsigned long phnum,
-                                                  unsigned long vaddr,
-                                                  unsigned long size)
-{
-    unsigned long index;
-
-    for (index = 0UL; index < phnum; index++) {
-        const struct elf64_phdr *phdr;
-
-        phdr = &phdrs[index];
-        if (phdr->p_type != ELF_PT_LOAD || phdr->p_filesz == 0UL) {
-            continue;
-        }
-
-        if (vaddr < phdr->p_vaddr || vaddr > (phdr->p_vaddr + phdr->p_filesz)) {
-            continue;
-        }
-
-        if (size > (phdr->p_vaddr + phdr->p_filesz - vaddr)) {
-            continue;
-        }
-
-        if (phdr->p_offset + (vaddr - phdr->p_vaddr) + size > image_size) {
-            return (const unsigned char *)0;
-        }
-
-        return image + phdr->p_offset + (vaddr - phdr->p_vaddr);
-    }
-
-    return (const unsigned char *)0;
-}
-
-static int process_write_user_u64(struct process *process,
-                                  unsigned long va,
-                                  unsigned long value)
-{
-    unsigned long page_va;
-    unsigned long page_pa;
-    unsigned long page_offset;
-    unsigned char *page_ptr;
-    unsigned int index;
-
-    page_va = va & ~(PAGE_SIZE - 1UL);
-    page_offset = va & (PAGE_SIZE - 1UL);
-    if (page_offset + sizeof(unsigned long) > PAGE_SIZE) {
-        return 0;
-    }
-
-    if (!mmu_user_page_pa(process->mm, page_va, &page_pa)) {
-        /* ESR_EL1 value 0x90000004 corresponds to a translation fault from EL0 (Data Abort) */
-        if (!mmu_handle_process_page_fault(process, page_va, 0x90000004UL)) {
-            return 0;
-        }
-        if (!mmu_user_page_pa(process->mm, page_va, &page_pa)) {
-            return 0;
-        }
-    }
-
-    page_ptr = (unsigned char *)pa_to_va((void *)page_pa) + page_offset;
-    for (index = 0U; index < sizeof(unsigned long); index++) {
-        page_ptr[index] = (unsigned char)((value >> (index * 8U)) & 0xffUL);
-    }
-
-    return 1;
-}
-
-static const char *process_object_dynamic_string(const struct process_elf_object *object,
-                                                 unsigned long offset)
-{
-    unsigned long index;
-
-    if (object == (const struct process_elf_object *)0 ||
-        object->dynamic.strtab == (const char *)0 ||
-        offset >= object->dynamic.strtab_size) {
-        return (const char *)0;
-    }
-
-    for (index = offset; index < object->dynamic.strtab_size; index++) {
-        if (object->dynamic.strtab[index] == '\0') {
-            return object->dynamic.strtab + offset;
-        }
-    }
-
-    return (const char *)0;
-}
-
-static void process_init_dynamic_info(struct process_elf_dynamic_info *dynamic_info)
-{
-    unsigned long index;
-
-    dynamic_info->strtab = (const char *)0;
-    dynamic_info->strtab_size = 0UL;
-    dynamic_info->symtab = (const struct elf64_sym *)0;
-    dynamic_info->symtab_count = 0UL;
-    dynamic_info->rela_entries = (const struct elf64_rela *)0;
-    dynamic_info->rela_count = 0UL;
-    dynamic_info->jmprel_entries = (const struct elf64_rela *)0;
-    dynamic_info->jmprel_count = 0UL;
-    dynamic_info->needed_count = 0UL;
-    dynamic_info->soname_offset = ~0UL;
-    for (index = 0UL; index < PROCESS_ELF_NEEDED_MAX; index++) {
-        dynamic_info->needed_offsets[index] = 0UL;
-    }
-}
-
-static int process_parse_dynamic_info(struct process_elf_object *object)
-{
-    const struct elf64_dyn *dyn_entries;
-    const unsigned char *strtab_bytes;
-    const unsigned char *symtab_bytes;
-    const unsigned char *rela_bytes;
-    const unsigned char *jmprel_bytes;
-    unsigned long dyn_count;
-    unsigned long strtab_addr;
-    unsigned long symtab_addr;
-    unsigned long rela_addr;
-    unsigned long rela_size;
-    unsigned long rela_ent;
-    unsigned long jmprel_addr;
-    unsigned long jmprel_size;
-    unsigned long plt_rel_type;
-    unsigned long sym_ent;
-    unsigned long index;
-
-    process_init_dynamic_info(&object->dynamic);
-
-    dyn_entries = (const struct elf64_dyn *)0;
-    dyn_count = 0UL;
-    for (index = 0UL; index < object->phnum; index++) {
-        if (object->phdrs[index].p_type != ELF_PT_DYNAMIC || object->phdrs[index].p_filesz == 0UL) {
-            continue;
-        }
-
-        if (object->phdrs[index].p_offset + object->phdrs[index].p_filesz > object->image_size ||
-            object->phdrs[index].p_filesz < sizeof(struct elf64_dyn)) {
-            return 0;
-        }
-
-        dyn_entries = (const struct elf64_dyn *)(object->image + object->phdrs[index].p_offset);
-        dyn_count = object->phdrs[index].p_filesz / sizeof(struct elf64_dyn);
-        break;
-    }
-
-    if (dyn_entries == (const struct elf64_dyn *)0) {
-        return 1;
-    }
-
-    strtab_addr = 0UL;
-    symtab_addr = 0UL;
-    rela_addr = 0UL;
-    rela_size = 0UL;
-    rela_ent = sizeof(struct elf64_rela);
-    jmprel_addr = 0UL;
-    jmprel_size = 0UL;
-    plt_rel_type = 0UL;
-    sym_ent = sizeof(struct elf64_sym);
-    for (index = 0UL; index < dyn_count; index++) {
-        if (dyn_entries[index].d_tag == ELF_DT_NULL) {
-            break;
-        }
-
-        if (dyn_entries[index].d_tag == ELF_DT_NEEDED) {
-            if (object->dynamic.needed_count >= PROCESS_ELF_NEEDED_MAX) {
-                return 0;
-            }
-
-            object->dynamic.needed_offsets[object->dynamic.needed_count++] =
-                dyn_entries[index].d_un.d_val;
-        } else if (dyn_entries[index].d_tag == ELF_DT_STRTAB) {
-            strtab_addr = dyn_entries[index].d_un.d_ptr;
-        } else if (dyn_entries[index].d_tag == ELF_DT_SYMTAB) {
-            symtab_addr = dyn_entries[index].d_un.d_ptr;
-        } else if (dyn_entries[index].d_tag == ELF_DT_RELA) {
-            rela_addr = dyn_entries[index].d_un.d_ptr;
-        } else if (dyn_entries[index].d_tag == ELF_DT_RELASZ) {
-            rela_size = dyn_entries[index].d_un.d_val;
-        } else if (dyn_entries[index].d_tag == ELF_DT_RELAENT) {
-            rela_ent = dyn_entries[index].d_un.d_val;
-        } else if (dyn_entries[index].d_tag == ELF_DT_STRSZ) {
-            object->dynamic.strtab_size = dyn_entries[index].d_un.d_val;
-        } else if (dyn_entries[index].d_tag == ELF_DT_SYMENT) {
-            sym_ent = dyn_entries[index].d_un.d_val;
-        } else if (dyn_entries[index].d_tag == ELF_DT_SONAME) {
-            object->dynamic.soname_offset = dyn_entries[index].d_un.d_val;
-        } else if (dyn_entries[index].d_tag == ELF_DT_JMPREL) {
-            jmprel_addr = dyn_entries[index].d_un.d_ptr;
-        } else if (dyn_entries[index].d_tag == ELF_DT_PLTRELSZ) {
-            jmprel_size = dyn_entries[index].d_un.d_val;
-        } else if (dyn_entries[index].d_tag == ELF_DT_PLTREL) {
-            plt_rel_type = dyn_entries[index].d_un.d_val;
-        }
-    }
-
-    if (strtab_addr != 0UL && object->dynamic.strtab_size != 0UL) {
-        strtab_bytes = process_elf_image_ptr(object->image,
-                                             object->image_size,
-                                             object->phdrs,
-                                             object->phnum,
-                                             strtab_addr,
-                                             object->dynamic.strtab_size);
-        if (strtab_bytes == (const unsigned char *)0) {
-            return 0;
-        }
-
-        object->dynamic.strtab = (const char *)strtab_bytes;
-    }
-
-    if (symtab_addr != 0UL) {
-        if (object->dynamic.strtab == (const char *)0 || sym_ent != sizeof(struct elf64_sym) ||
-            object->dynamic.strtab_size == 0UL || strtab_addr <= symtab_addr) {
-            return 0;
-        }
-
-        symtab_bytes = process_elf_image_ptr(object->image,
-                                             object->image_size,
-                                             object->phdrs,
-                                             object->phnum,
-                                             symtab_addr,
-                                             strtab_addr - symtab_addr);
-        if (symtab_bytes == (const unsigned char *)0) {
-            return 0;
-        }
-
-        object->dynamic.symtab = (const struct elf64_sym *)symtab_bytes;
-        object->dynamic.symtab_count = (strtab_addr - symtab_addr) / sizeof(struct elf64_sym);
-    }
-
-    if (rela_size != 0UL) {
-        if (rela_addr == 0UL || rela_ent != sizeof(struct elf64_rela) ||
-            (rela_size % sizeof(struct elf64_rela)) != 0UL) {
-            return 0;
-        }
-
-        rela_bytes = process_elf_image_ptr(object->image,
-                                           object->image_size,
-                                           object->phdrs,
-                                           object->phnum,
-                                           rela_addr,
-                                           rela_size);
-        if (rela_bytes == (const unsigned char *)0) {
-            return 0;
-        }
-
-        object->dynamic.rela_entries = (const struct elf64_rela *)rela_bytes;
-        object->dynamic.rela_count = rela_size / sizeof(struct elf64_rela);
-    }
-
-    if (jmprel_size != 0UL) {
-        if (jmprel_addr == 0UL || plt_rel_type != ELF_DT_RELA ||
-            (jmprel_size % sizeof(struct elf64_rela)) != 0UL) {
-            return 0;
-        }
-
-        jmprel_bytes = process_elf_image_ptr(object->image,
-                                             object->image_size,
-                                             object->phdrs,
-                                             object->phnum,
-                                             jmprel_addr,
-                                             jmprel_size);
-        if (jmprel_bytes == (const unsigned char *)0) {
-            return 0;
-        }
-
-        object->dynamic.jmprel_entries = (const struct elf64_rela *)jmprel_bytes;
-        object->dynamic.jmprel_count = jmprel_size / sizeof(struct elf64_rela);
-    }
-
-    return 1;
-}
-
-static int process_object_defined_symbol(const struct process_elf_object *object,
-                                         unsigned long sym_index,
-                                         unsigned long *value)
-{
-    const struct elf64_sym *symbol;
-
-    if (object == (const struct process_elf_object *)0 ||
-        object->dynamic.symtab == (const struct elf64_sym *)0 ||
-        sym_index >= object->dynamic.symtab_count) {
-        return 0;
-    }
-
-    symbol = &object->dynamic.symtab[sym_index];
-    if (symbol->st_shndx == 0U) {
-        return 0;
-    }
-
-    *value = object->load_bias + symbol->st_value;
-    return 1;
-}
-
-static int process_resolve_symbol_name(const struct process_elf_load_state *state,
-                                       const char *symbol_name,
-                                       unsigned long *value)
-{
-    unsigned long object_index;
-
-    if (symbol_name == (const char *)0 || symbol_name[0] == '\0') {
-        return 0;
-    }
-
-    for (object_index = 0UL; object_index < state->object_count; object_index++) {
-        const struct process_elf_object *object;
-        unsigned long sym_index;
-
-        object = &state->objects[object_index];
-        if (object->dynamic.symtab == (const struct elf64_sym *)0 ||
-            object->dynamic.strtab == (const char *)0) {
-            continue;
-        }
-
-        for (sym_index = 1UL; sym_index < object->dynamic.symtab_count; sym_index++) {
-            const struct elf64_sym *symbol;
-            const char *candidate_name;
-
-            symbol = &object->dynamic.symtab[sym_index];
-            if (symbol->st_shndx == 0U) {
-                continue;
-            }
-
-            candidate_name = process_object_dynamic_string(object, symbol->st_name);
-            if (candidate_name == (const char *)0) {
-                continue;
-            }
-
-            if (!process_streq(candidate_name, symbol_name)) {
-                continue;
-            }
-
-            *value = object->load_bias + symbol->st_value;
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
-static int process_resolve_relocation_symbol(const struct process_elf_load_state *state,
-                                             const struct process_elf_object *object,
-                                             unsigned long sym_index,
-                                             unsigned long *value)
-{
-    const struct elf64_sym *symbol;
-    const char *symbol_name;
-
-    if (object->dynamic.symtab == (const struct elf64_sym *)0 ||
-        sym_index >= object->dynamic.symtab_count) {
-        return 0;
-    }
-
-    if (process_object_defined_symbol(object, sym_index, value)) {
-        return 1;
-    }
-
-    symbol = &object->dynamic.symtab[sym_index];
-    symbol_name = process_object_dynamic_string(object, symbol->st_name);
-    return process_resolve_symbol_name(state, symbol_name, value);
-}
-
-static int process_apply_relocation_list(struct process_elf_load_state *state,
-                                         const struct process_elf_object *object,
-                                         const struct elf64_rela *entries,
-                                         unsigned long entry_count)
-{
-    unsigned long index;
-
-    for (index = 0UL; index < entry_count; index++) {
-        unsigned long relocation_value;
-        unsigned long sym_index;
-        unsigned int relocation_type;
-
-        relocation_type = process_elf_relocation_type(entries[index].r_info);
-        sym_index = process_elf_relocation_symbol(entries[index].r_info);
-        if (relocation_type == ELF_R_AARCH64_RELATIVE) {
-            if (sym_index != 0UL) {
-                return 0;
-            }
-
-            relocation_value = object->load_bias + (unsigned long)entries[index].r_addend;
-        } else if (relocation_type == ELF_R_AARCH64_JUMP_SLOT ||
-                   relocation_type == ELF_R_AARCH64_GLOB_DAT ||
-                   relocation_type == ELF_R_AARCH64_ABS64) {
-            if (!process_resolve_relocation_symbol(state, object, sym_index, &relocation_value)) {
-                KER_INFO("unresolved ELF symbol");
-                return 0;
-            }
-
-            relocation_value += (unsigned long)entries[index].r_addend;
-        } else {
-            KER_INFO("unsupported ELF relocation");
-            return 0;
-        }
-
-        if (!process_write_user_u64(state->process,
-                                    object->load_bias + entries[index].r_offset,
-                                    relocation_value)) {
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-static int process_apply_object_relocations(struct process_elf_load_state *state,
-                                            const struct process_elf_object *object)
-{
-    if (!process_apply_relocation_list(state,
-                                       object,
-                                       object->dynamic.rela_entries,
-                                       object->dynamic.rela_count)) {
-        return 0;
-    }
-
-    if (!process_apply_relocation_list(state,
-                                       object,
-                                       object->dynamic.jmprel_entries,
-                                       object->dynamic.jmprel_count)) {
-        return 0;
-    }
-
-    return 1;
-}
-
 static void process_release_loaded_images(struct process_elf_load_state *state)
 {
     unsigned long index;
@@ -887,20 +341,6 @@ static void process_capture_loaded_images(struct process *process, struct proces
             }
         }
     }
-}
-
-static int process_find_loaded_object(const struct process_elf_load_state *state,
-                                      const char *name)
-{
-    unsigned long index;
-
-    for (index = 0UL; index < state->object_count; index++) {
-        if (process_streq(state->objects[index].name, name)) {
-            return 1;
-        }
-    }
-
-    return 0;
 }
 
 static int process_load_file_image(const char *path,
@@ -990,12 +430,25 @@ static int process_register_loaded_object(struct process_elf_load_state *state,
         }
     }
 
+    if (state->object_count == 0UL) {
+        state->main_phdr_va = object->load_bias + ehdr->e_phoff;
+        state->main_phent = (unsigned long)ehdr->e_phentsize;
+        state->main_phnum = (unsigned long)ehdr->e_phnum;
+        state->main_entry = object->load_bias + ehdr->e_entry;
+    }
+
     if (set_entry != 0) {
         if (ehdr->e_entry < object->image_start || ehdr->e_entry >= object->image_end) {
             return 0;
         }
 
         state->process->entry_va = object->load_bias + ehdr->e_entry;
+        
+        /* If this is NOT the first object, it's the interpreter */
+        if (state->object_count > 0UL) {
+            state->interp_load_bias = object->load_bias;
+            state->interp_entry = state->process->entry_va;
+        }
     }
 
     for (index = 0UL; index < object->phnum; index++) {
@@ -1005,21 +458,6 @@ static int process_register_loaded_object(struct process_elf_load_state *state,
                                      &object->phdrs[index],
                                      object->load_bias)) {
             return 0;
-        }
-    }
-
-    if (!process_parse_dynamic_info(object)) {
-        return 0;
-    }
-
-    if (object->dynamic.soname_offset != ~0UL) {
-        const char *soname;
-
-        soname = process_object_dynamic_string(object, object->dynamic.soname_offset);
-        if (soname != (const char *)0) {
-            if (!process_copy_string(object->name, soname, PROCESS_ELF_NAME_MAX)) {
-                return 0;
-            }
         }
     }
 
@@ -1034,47 +472,6 @@ static int process_register_loaded_object(struct process_elf_load_state *state,
     }
 
     state->object_count++;
-    return 1;
-}
-
-static int process_load_needed_objects(struct process_elf_load_state *state)
-{
-    unsigned long object_index;
-
-    for (object_index = 0UL; object_index < state->object_count; object_index++) {
-        const struct process_elf_object *object;
-        unsigned long need_index;
-
-        object = &state->objects[object_index];
-        for (need_index = 0UL; need_index < object->dynamic.needed_count; need_index++) {
-            unsigned char *image;
-            unsigned long image_size;
-            char path[PROCESS_ELF_NAME_MAX];
-            const char *needed_name;
-
-            needed_name = process_object_dynamic_string(object, object->dynamic.needed_offsets[need_index]);
-            if (needed_name == (const char *)0) {
-                return 0;
-            }
-            if (process_find_loaded_object(state, needed_name)) {
-                continue;
-            }
-
-            if (!process_make_library_path(path, needed_name)) {
-                return 0;
-            }
-
-            if (!process_load_file_image(path, &image, &image_size)) {
-                return 0;
-            }
-
-            if (!process_register_loaded_object(state, needed_name, image, image, image_size, 0)) {
-                kfree(image);
-                return 0;
-            }
-        }
-    }
-
     return 1;
 }
 
@@ -1105,8 +502,15 @@ static int process_map_elf_segment(struct process *process,
                                    const struct elf64_phdr *phdr,
                                    unsigned long load_bias)
 {
+    unsigned long vaddr_start;
+    unsigned long vaddr_end;
+    unsigned long aligned_vaddr;
+    unsigned long aligned_vaddr_end;
+    unsigned long offset_diff;
     unsigned long segment_start;
     unsigned long segment_end;
+    unsigned long segment_offset;
+    unsigned long segment_filesz;
     unsigned long flags;
 
     if (phdr->p_type != ELF_PT_LOAD || phdr->p_memsz == 0UL) {
@@ -1121,8 +525,18 @@ static int process_map_elf_segment(struct process *process,
         return 0;
     }
 
-    segment_start = load_bias + phdr->p_vaddr;
-    segment_end = segment_start + phdr->p_memsz;
+    vaddr_start = phdr->p_vaddr;
+    vaddr_end = vaddr_start + phdr->p_memsz;
+    aligned_vaddr = process_align_down(vaddr_start, PAGE_SIZE);
+    aligned_vaddr_end = process_align_up(vaddr_end, PAGE_SIZE);
+    
+    offset_diff = vaddr_start - aligned_vaddr;
+    
+    segment_start = load_bias + aligned_vaddr;
+    segment_end = load_bias + aligned_vaddr_end;
+    segment_offset = phdr->p_offset - offset_diff;
+    segment_filesz = phdr->p_filesz + offset_diff;
+
     if (segment_start < USER_CODE_BASE || segment_end > USER_HEAP_LIMIT || segment_end <= segment_start) {
         return 0;
     }
@@ -1131,7 +545,7 @@ static int process_map_elf_segment(struct process *process,
 
     return process_add_region(process, segment_start, segment_end,
                              VM_TYPE_ELF, flags,
-                             image, phdr->p_offset, phdr->p_filesz);
+                             image, segment_offset, segment_filesz);
 }
 
 static struct process *process_create_flat_binary(const unsigned char *code, unsigned long code_size)
@@ -1201,26 +615,137 @@ static struct process *process_create_flat_binary(const unsigned char *code, uns
 struct process *process_create_from_buffer(const unsigned char *code, unsigned long code_size)
 {
     if (process_is_elf_image(code, code_size)) {
-        return process_create_from_elf(code, code_size);
+        return process_create_from_elf(code, code_size, (const char *)0);
     }
 
     return process_create_flat_binary(code, code_size);
 }
 
-struct process *process_create_from_elf(const unsigned char *image, unsigned long image_size)
+static void process_populate_arg_stack(struct process *process, const char *path, const struct process_elf_load_state *state)
+{
+    unsigned long stack_page_va;
+    unsigned char kstack[1024];
+    unsigned long ksp = 1024;
+    unsigned long path_len = 0;
+    unsigned long path_va;
+    unsigned long user_sp;
+
+    /* Write to the top-most page of the stack. Ensure it's mapped. */
+    stack_page_va = (process->stack_top - 1) & ~0xFFFUL;
+    if (!mmu_handle_process_page_fault(process, stack_page_va, 0x90000004UL)) {
+        return;
+    }
+
+    /* 1. Copy strings to top of stack */
+    if (path) {
+        while (path[path_len] != '\0') path_len++;
+    }
+    ksp -= (path_len + 1);
+    path_va = process->stack_top - (1024UL - ksp);
+    if (path) {
+        for (unsigned long i = 0UL; i <= path_len; i++) kstack[ksp + i] = (unsigned char)path[i];
+    } else {
+        kstack[ksp] = 0U;
+    }
+
+    const char *env_str = "LD_LIBRARY_PATH=/lib";
+    unsigned long env_len = 0;
+    while (env_str[env_len]) env_len++;
+    ksp -= (env_len + 1);
+    unsigned long env_va = process->stack_top - (1024UL - ksp);
+    for (unsigned long i = 0UL; i <= env_len; i++) kstack[ksp + i] = (unsigned char)env_str[i];
+
+    /* Align ksp for pointers */
+    ksp &= ~15UL;
+    
+    /* 2. Auxv (End with AT_NULL) */
+    ksp -= 2UL * sizeof(unsigned long); /* AT_NULL */
+    ((unsigned long *)(kstack + ksp))[0] = (unsigned long)0; // AT_NULL
+    ((unsigned long *)(kstack + ksp))[1] = 0UL;
+    
+    ksp -= 2UL * sizeof(unsigned long); /* AT_PAGESZ */
+    ((unsigned long *)(kstack + ksp))[0] = (unsigned long)AT_PAGESZ;
+    ((unsigned long *)(kstack + ksp))[1] = 4096UL;
+
+    ksp -= 2UL * sizeof(unsigned long); /* AT_EXECFN */
+    ((unsigned long *)(kstack + ksp))[0] = (unsigned long)AT_EXECFN;
+    ((unsigned long *)(kstack + ksp))[1] = path_va;
+
+    ksp -= 2UL * sizeof(unsigned long); /* AT_PHDR */
+    ((unsigned long *)(kstack + ksp))[0] = (unsigned long)AT_PHDR;
+    ((unsigned long *)(kstack + ksp))[1] = state->main_phdr_va;
+
+    ksp -= 2UL * sizeof(unsigned long); /* AT_PHNUM */
+    ((unsigned long *)(kstack + ksp))[0] = (unsigned long)AT_PHNUM;
+    ((unsigned long *)(kstack + ksp))[1] = state->main_phnum;
+
+    ksp -= 2UL * sizeof(unsigned long); /* AT_PHENT */
+    ((unsigned long *)(kstack + ksp))[0] = (unsigned long)AT_PHENT;
+    ((unsigned long *)(kstack + ksp))[1] = state->main_phent;
+
+    ksp -= 2UL * sizeof(unsigned long); /* AT_BASE */
+    ((unsigned long *)(kstack + ksp))[0] = (unsigned long)AT_BASE;
+    ((unsigned long *)(kstack + ksp))[1] = state->interp_load_bias;
+
+    ksp -= 2UL * sizeof(unsigned long); /* AT_ENTRY */
+    ((unsigned long *)(kstack + ksp))[0] = (unsigned long)AT_ENTRY;
+    ((unsigned long *)(kstack + ksp))[1] = state->main_entry;
+
+    /* 3. Envp (End with NULL) */
+    ksp -= sizeof(unsigned long); /* NULL terminator */
+    ((unsigned long *)(kstack + ksp))[0] = 0UL;
+    ksp -= sizeof(unsigned long); /* envp[0] */
+    ((unsigned long *)(kstack + ksp))[0] = env_va;
+
+    /* 4. Argv (End with NULL) */
+    ksp -= sizeof(unsigned long); /* NULL terminator */
+    ((unsigned long *)(kstack + ksp))[0] = 0UL;
+    ksp -= sizeof(unsigned long); /* argv[0] */
+    ((unsigned long *)(kstack + ksp))[0] = path_va;
+
+    /* 5. Argc */
+    ksp -= sizeof(unsigned long);
+    ((unsigned long *)(kstack + ksp))[0] = 1UL; // argc = 1
+
+    /* Align SP to 16-byte boundary as required by AArch64 ABI */
+    ksp &= ~15UL;
+    
+    /* Copy to user stack */
+    user_sp = process->stack_top - (1024UL - ksp);
+    mmu_copy_to_user(process->mm, user_sp, kstack + ksp, 1024UL - ksp);
+    
+    process->stack_top = user_sp;
+}
+
+struct process *process_create_from_elf(const unsigned char *image, unsigned long image_size, const char *path)
 {
     struct process *process;
     struct process_elf_load_state load_state;
     unsigned long index;
     unsigned long heap_start;
+    const struct elf64_ehdr *ehdr;
+    const struct elf64_phdr *phdrs;
+    const char *interp_path = (const char *)0;
 
     if (!process_is_elf_image(image, image_size)) {
         return (struct process *)0;
     }
 
-    if (!process_validate_elf_header((const struct elf64_ehdr *)image, image_size)) {
+    ehdr = (const struct elf64_ehdr *)image;
+    if (!process_validate_elf_header(ehdr, image_size)) {
         KER_INFO("invalid ELF image");
         return (struct process *)0;
+    }
+
+    /* Check for PT_INTERP */
+    phdrs = (const struct elf64_phdr *)(image + ehdr->e_phoff);
+    for (index = 0; index < (unsigned long)ehdr->e_phnum; index++) {
+        if (phdrs[index].p_type == ELF_PT_INTERP) {
+            if (phdrs[index].p_offset + phdrs[index].p_filesz <= image_size) {
+                interp_path = (const char *)(image + phdrs[index].p_offset);
+            }
+            break;
+        }
     }
 
     process = (struct process *)kmalloc(sizeof(struct process));
@@ -1237,6 +762,9 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
     process_zero_bytes(&load_state, sizeof(load_state));
     load_state.process = process;
 
+    /* Reset load base for PIE binaries in this process */
+    process_next_elf_load_base = USER_CODE_BASE;
+
     process->entry_va = 0UL;
     process->stack_top = USER_STACK_TOP;
     process->heap_start = 0UL;
@@ -1245,20 +773,31 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
     process->heap_mapped_end = 0UL;
     process->region_count = 0U;
     process->owned_image_count = 0U;
+    
+    // Copy path for later use
+    if (path) {
+        process_copy_string(process->name, path, PROCESS_ELF_NAME_MAX);
+    }
 
-    if (!process_register_loaded_object(&load_state, "<main>", (unsigned char *)image, image, image_size, 1)) {
+    if (!process_register_loaded_object(&load_state, "<main>", (unsigned char *)image, image, image_size, (interp_path == (const char *)0))) {
         process_destroy(process);
         return (struct process *)0;
     }
-    if (!process_load_needed_objects(&load_state)) {
-        process_release_loaded_images(&load_state);
-        process_destroy(process);
-        return (struct process *)0;
-    }
 
-    for (index = 0UL; index < load_state.object_count; index++) {
-        if (!process_apply_object_relocations(&load_state, &load_state.objects[index])) {
-            process_release_loaded_images(&load_state);
+    /* Handle Interpreter if present */
+    if (interp_path != (const char *)0) {
+        unsigned char *interp_image;
+        unsigned long interp_size;
+        
+        /* For this OS, we usually expect /lib/ld.so */
+        if (process_load_file_image(interp_path, &interp_image, &interp_size)) {
+            if (!process_register_loaded_object(&load_state, interp_path, interp_image, interp_image, interp_size, 1)) {
+                kfree(interp_image);
+                process_destroy(process);
+                return (struct process *)0;
+            }
+        } else {
+            KER_INFO("failed to load interpreter");
             process_destroy(process);
             return (struct process *)0;
         }
@@ -1292,6 +831,9 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
                       MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
                       MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN,
                       (unsigned char *)0, 0, 0);
+
+    /* Initialize user stack with arguments and auxv */
+    process_populate_arg_stack(process, path, &load_state);
 
     cpu_invalidate_icache_all();
 

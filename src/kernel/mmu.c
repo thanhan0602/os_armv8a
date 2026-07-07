@@ -69,7 +69,7 @@ void mmu_init(void)
 
     mmu_debug_reset();
 
-    mmu_log_kernel_layout();
+    // mmu_log_kernel_layout();
 
     /* 
      * Setup boot tables. 

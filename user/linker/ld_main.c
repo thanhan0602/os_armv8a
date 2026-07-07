@@ -11,10 +11,66 @@ struct ld_object {
     const char *strtab;
     Elf64_Word *hashtab;     /* traditional SysV hash (unused) */
     Elf64_Word *gnu_hashtab; /* GNU hash (.gnu.hash) */
+    
+    unsigned long init;
+    unsigned long *init_array;
+    unsigned long init_array_sz;
+
+    /* For lazy binding */
+    Elf64_Rela *jmprel;
+    unsigned long pltrelsz;
+    unsigned long pltgot;
 };
+
+extern void ld_plt_resolver(void);
+static unsigned long ld_lookup_symbol(const char *name);
+
+__attribute__((visibility("hidden")))
+unsigned long ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va) {
+    if (!obj || !obj->jmprel) return 0;
+    
+    /* Find the relocation entry that corresponds to this GOT address */
+    Elf64_Rela *rel = 0;
+    for (unsigned long i = 0; i < obj->pltrelsz / sizeof(Elf64_Rela); i++) {
+        if ((unsigned long *)(obj->jmprel[i].r_offset + obj->base) == got_entry_va) {
+            rel = &obj->jmprel[i];
+            break;
+        }
+    }
+
+    if (!rel) return 0;
+
+    unsigned int sym_idx = ELF64_R_SYM(rel->r_info);
+    const char *symname = obj->strtab + obj->symtab[sym_idx].st_name;
+    
+    ld_puts("Lazy resolving: ");
+    ld_puts(symname);
+    ld_puts("\n");
+
+    unsigned long addr = ld_lookup_symbol(symname);
+    if (addr) {
+        /* Update GOT entry patch the address */
+        *got_entry_va = addr + rel->r_addend;
+        return *got_entry_va;
+    }
+
+    ld_puts("Lazy symbol not found: ");
+    ld_puts(symname);
+    ld_puts("\n");
+    return 0;
+}
 
 static struct ld_object g_objects[MAX_OBJECTS];
 static int g_object_count = 0;
+
+/* Symbol lookup cache to avoid expensive string comparisons */
+#define SYMBOL_CACHE_SIZE 128
+struct ld_symbol_cache {
+    const char *name;
+    unsigned long addr;
+};
+static struct ld_symbol_cache g_sym_cache[SYMBOL_CACHE_SIZE];
+static unsigned int g_sym_cache_next = 0;
 
 /*
  * ld_self_relocate thực hiện việc relocate cho chính linker.
@@ -70,11 +126,16 @@ static struct ld_object *ld_load_object(const char *path, unsigned long load_bia
 
     long fd = ld_open(path);
     if (fd < 0) {
-        /* Try /lib/ if it's a simple name */
-        char fullpath[128];
-        ld_strcpy(fullpath, "/lib/");
-        ld_strcpy(fullpath + 5, path);
-        fd = ld_open(fullpath);
+        /* Try search paths: /lib/, /usr/lib/, /bin/ (for now) */
+        const char *search_paths[] = {"/lib/", "/usr/lib/", "/bin/", 0};
+        for (int i = 0; search_paths[i]; i++) {
+            char fullpath[128];
+            ld_strcpy(fullpath, search_paths[i]);
+            ld_strcpy(fullpath + ld_strlen(search_paths[i]), path);
+            fd = ld_open(fullpath);
+            if (fd >= 0) break;
+        }
+        
         if (fd < 0) {
             ld_puts("Failed to open object: ");
             ld_puts(path);
@@ -100,6 +161,13 @@ static struct ld_object *ld_load_object(const char *path, unsigned long load_bia
     obj->symtab = 0;
     obj->strtab = 0;
     obj->hashtab = 0;
+    obj->gnu_hashtab = 0;
+    obj->init = 0;
+    obj->init_array = 0;
+    obj->init_array_sz = 0;
+    obj->jmprel = 0;
+    obj->pltrelsz = 0;
+    obj->pltgot = 0;
 
     for (int i = 0; i < ehdr.e_phnum; i++) {
         if (phdr[i].p_type == ELF_PT_LOAD) {
@@ -110,7 +178,6 @@ static struct ld_object *ld_load_object(const char *path, unsigned long load_bia
 
             unsigned long vaddr = phdr[i].p_vaddr + load_bias;
             unsigned long memsz = phdr[i].p_memsz;
-            unsigned long filesz = phdr[i].p_filesz;
             unsigned long offset = phdr[i].p_offset;
 
             unsigned long align_vaddr = vaddr & ~0xFFFUL;
@@ -138,6 +205,18 @@ static struct ld_object *ld_load_object(const char *path, unsigned long load_bia
                 obj->hashtab = (Elf64_Word *)(d->d_un.d_ptr + load_bias);
             else if (d->d_tag == DT_GNU_HASH)
                 obj->gnu_hashtab = (Elf64_Word *)(d->d_un.d_ptr + load_bias);
+            else if (d->d_tag == DT_INIT)
+                obj->init = d->d_un.d_ptr + load_bias;
+            else if (d->d_tag == DT_INIT_ARRAY)
+                obj->init_array = (unsigned long *)(d->d_un.d_ptr + load_bias);
+            else if (d->d_tag == DT_INIT_ARRAYSZ)
+                obj->init_array_sz = d->d_un.d_val;
+            else if (d->d_tag == DT_PLTGOT)
+                obj->pltgot = d->d_un.d_ptr + load_bias;
+            else if (d->d_tag == DT_JMPREL)
+                obj->jmprel = (Elf64_Rela *)(d->d_un.d_ptr + load_bias);
+            else if (d->d_tag == DT_PLTRELSZ)
+                obj->pltrelsz = d->d_un.d_val;
         }
     }
 
@@ -181,7 +260,7 @@ static unsigned long ld_lookup_gnu_hash(struct ld_object *obj, const char *name)
     unsigned int  nbuckets  = ht[0];
     unsigned int  symoffset = ht[1];
     unsigned int  bloom_sz  = ht[2];
-    /* ht[3] = bloom_shift (skip bloom filter for correctness) */
+    unsigned int  bloom_shift = ht[3];
 
     /* bloom words are 64-bit on AArch64 */
     unsigned long *bloom   = (unsigned long *)&ht[4];
@@ -189,6 +268,12 @@ static unsigned long ld_lookup_gnu_hash(struct ld_object *obj, const char *name)
     unsigned int  *chains  = &buckets[nbuckets];
 
     unsigned int h          = ld_gnu_hash(name);
+
+    /* Phase 1: Bloom Filter check (massive speedup for symbol misses) */
+    unsigned long bloom_word = bloom[(h / 64) % bloom_sz];
+    unsigned long mask = (1UL << (h % 64)) | (1UL << ((h >> bloom_shift) % 64));
+    if ((bloom_word & mask) != mask) return 0;
+
     unsigned int bucket_idx = h % nbuckets;
     unsigned int sym_idx    = buckets[bucket_idx];
 
@@ -210,11 +295,39 @@ static unsigned long ld_lookup_gnu_hash(struct ld_object *obj, const char *name)
 }
 
 static unsigned long ld_lookup_symbol(const char *name) {
+    /* Check cache first */
+    for (int i = 0; i < SYMBOL_CACHE_SIZE; i++) {
+        if (g_sym_cache[i].name && ld_strcmp(g_sym_cache[i].name, name) == 0) {
+            return g_sym_cache[i].addr;
+        }
+    }
+
+    /* Fallback to full lookup */
     for (int i = 0; i < g_object_count; i++) {
         unsigned long addr = ld_lookup_gnu_hash(&g_objects[i], name);
-        if (addr) return addr;
+        if (addr) {
+            /* Update cache (simple round-robin replacement) */
+            g_sym_cache[g_sym_cache_next].name = name;
+            g_sym_cache[g_sym_cache_next].addr = addr;
+            g_sym_cache_next = (g_sym_cache_next + 1) % SYMBOL_CACHE_SIZE;
+            return addr;
+        }
     }
     return 0;
+}
+
+static void ld_call_init(struct ld_object *obj) {
+    if (obj->init) {
+        void (*init_func)(void) = (void (*)(void))obj->init;
+        init_func();
+    }
+    if (obj->init_array && obj->init_array_sz) {
+        unsigned long count = obj->init_array_sz / sizeof(unsigned long);
+        for (unsigned long i = 0; i < count; i++) {
+            void (*init_func)(void) = (void (*)(void))obj->init_array[i];
+            if (init_func) init_func();
+        }
+    }
 }
 
 static void ld_relocate_object(struct ld_object *obj) {
@@ -250,49 +363,71 @@ static void ld_relocate_object(struct ld_object *obj) {
 
             if (type == R_AARCH64_RELATIVE) {
                 *addr = r->r_addend + load_bias;
-            } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT) {
+            } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
                 if (obj->symtab && obj->strtab) {
                     const char *symname = obj->strtab + obj->symtab[sym_idx].st_name;
                     unsigned long symval = ld_lookup_symbol(symname);
                     if (symval) {
                         *addr = symval + r->r_addend;
+                    } else if (type == R_AARCH64_JUMP_SLOT) {
+                        /* 
+                         * For Lazy binding: If symbol is not found yet, 
+                         * we MUST still add the load_bias to the GOT entry 
+                         * because it points to the PLT, which is shifted.
+                         */
+                        *addr += load_bias;
                     } else {
                         ld_puts("Symbol not found: ");
                         ld_puts(symname);
                         ld_puts("\n");
                     }
                 }
-            } else if (type == R_AARCH64_ABS64) {
-                 if (obj->symtab && obj->strtab) {
-                    const char *symname = obj->strtab + obj->symtab[sym_idx].st_name;
-                    unsigned long symval = ld_lookup_symbol(symname);
-                     if (symval) {
-                        *addr = symval + r->r_addend;
-                    }
-                 }
             }
         }
     }
 
     if (jmprel && pltrelsz && relaent) {
-        for (unsigned long i = 0; i < pltrelsz / relaent; i++) {
-            Elf64_Rela *r = (Elf64_Rela *)((unsigned long)jmprel + i * relaent);
-            unsigned int type = ELF64_R_TYPE(r->r_info);
-            unsigned int sym_idx = ELF64_R_SYM(r->r_info);
-            unsigned long *addr = (unsigned long *)(r->r_offset + load_bias);
+        /* Set up Lazy Binding (PLT0 needs help from Linker) */
+        if (obj->pltgot) {
+            unsigned long *got = (unsigned long *)obj->pltgot;
+            got[1] = (unsigned long)obj;
+            got[2] = (unsigned long)ld_plt_resolver;
+        }
 
-            if (type == R_AARCH64_JUMP_SLOT) {
-                if (obj->symtab && obj->strtab) {
-                    const char *symname = obj->strtab + obj->symtab[sym_idx].st_name;
-                    unsigned long symval = ld_lookup_symbol(symname);
-                    if (symval) {
-                        *addr = symval + r->r_addend;
-                    } else {
-                        ld_puts("PLT Symbol not found: ");
-                        ld_puts(symname);
-                        ld_puts("\n");
-                    }
+        /* 
+         * If BIND_NOW is set, we SHOULD resolve these eagerly.
+         * Otherwise, we leave them for the PLT resolver.
+         */
+        int bind_now = 0;
+        for (Elf64_Dyn *d = obj->dynamic; d->d_tag != DT_NULL; d++) {
+            if (d->d_tag == DT_FLAGS && (d->d_un.d_val & DF_BIND_NOW)) bind_now = 1;
+            if (d->d_tag == DT_FLAGS_1 && (d->d_un.d_val & DF_1_NOW)) bind_now = 1;
+        }
+
+        if (bind_now) {
+            for (unsigned long i = 0; i < pltrelsz / relaent; i++) {
+                Elf64_Rela *r = (Elf64_Rela *)((unsigned long)jmprel + i * relaent);
+                unsigned int sym_idx = ELF64_R_SYM(r->r_info);
+                unsigned long *addr = (unsigned long *)(r->r_offset + load_bias);
+                const char *symname = obj->strtab + obj->symtab[sym_idx].st_name;
+                unsigned long symval = ld_lookup_symbol(symname);
+                if (symval) {
+                    *addr = symval + r->r_addend;
                 }
+            }
+        } else {
+            /*
+             * Lazy binding: the initial GOT entry for each PLT slot holds the
+             * *link-time* address of PLT0 (e.g. 0x600). It must be biased by
+             * load_bias so the first call reaches the real PLT0 at
+             * load_bias + 0x600, which then traps into ld_plt_resolver.
+             * Without this, the first call branches to the unbiased address
+             * and faults (EL0 instruction abort at the un-relocated offset).
+             */
+            for (unsigned long i = 0; i < pltrelsz / relaent; i++) {
+                Elf64_Rela *r = (Elf64_Rela *)((unsigned long)jmprel + i * relaent);
+                unsigned long *addr = (unsigned long *)(r->r_offset + load_bias);
+                *addr += load_bias;
             }
         }
     }
@@ -313,23 +448,64 @@ unsigned long ld_load_elf(const char *path, unsigned long *load_bias_out) {
         ld_relocate_object(&g_objects[i]);
     }
 
+    /* Call init routines in reverse order (dependencies first) */
+    for (int i = g_object_count - 1; i >= 0; i--) {
+        ld_call_init(&g_objects[i]);
+    }
+
     return main_obj->entry;
 }
 
 __attribute__((visibility("hidden")))
 void ld_main(void *stack) {
-    (void)stack;
+    long argc = *(long *)stack;
+    char **argv = (char **)((unsigned long *)stack + 1);
+    char **envp = argv + argc + 1;
+    
+    /* Find Auxv and check Env */
+    const char *ld_lib_path = 0;
+    char **p = envp;
+    while (*p) {
+        if (ld_strncmp(*p, "LD_LIBRARY_PATH=", 16) == 0) {
+            ld_lib_path = *p + 16;
+        }
+        p++;
+    }
+    Elf64_auxv_t *auxv = (Elf64_auxv_t *)(p + 1);
+    
+    const char *app_path = 0;
+    for (Elf64_auxv_t *a = auxv; a->a_type != AT_NULL; a++) {
+        if (a->a_type == AT_EXECFN) app_path = (const char *)a->a_val;
+    }
+
     ld_puts("Dynamic Linker started!\n");
+    if (ld_lib_path) {
+        ld_puts("LD_LIBRARY_PATH: ");
+        ld_puts(ld_lib_path);
+        ld_puts("\n");
+    }
+
+    if (app_path && ld_strcmp(app_path, "/lib/ld.so") != 0) {
+        ld_puts("Loading application: ");
+        ld_puts(app_path);
+        ld_puts("\n");
+    } else {
+        if (!app_path) ld_puts("Warning: AT_EXECFN not found, using default.\n");
+        else ld_puts("Linker standalone mode, loading default app.\n");
+        app_path = "/bin/hello.elf";
+    }
 
     /* 
      * In a real OS, ld.so would get the path to the app from the kernel 
-     * via Aux vectors or argv. For this demo, let's load /bin/hello.elf 
+     * via Aux vectors or argv. 
      */
     unsigned long load_bias = 0;
-    unsigned long entry = ld_load_elf("/bin/hello.elf", &load_bias);
+    unsigned long entry = ld_load_elf(app_path, &load_bias);
 
     if (entry == 0) {
-        ld_puts("Failed to load /bin/hello.elf\n");
+        ld_puts("Failed to load: ");
+        ld_puts(app_path);
+        ld_puts("\n");
         ld_exit(1);
     }
 

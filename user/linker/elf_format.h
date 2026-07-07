@@ -28,8 +28,33 @@
 #define DT_SONAME 14L
 #define DT_PLTREL 20L
 #define DT_JMPREL 23L
+#define DT_INIT 12L
+#define DT_FINI 13L
+#define DT_INIT_ARRAY 25L
+#define DT_FINI_ARRAY 26L
+#define DT_INIT_ARRAYSZ 27L
+#define DT_FINI_ARRAYSZ 28L
+#define DT_FLAGS       30L
+#define DT_FLAGS_1     0x6ffffffbL
+#define DF_BIND_NOW    0x00000008L
+#define DF_1_NOW       0x00000001L
 #define DT_RELACOUNT 0x6ffffff9L
 #define DT_GNU_HASH  0x6ffffef5L
+
+#define AT_NULL   0
+#define AT_PHDR   3
+#define AT_PHENT  4
+#define AT_PHNUM  5
+#define AT_PAGESZ 6
+#define AT_BASE   7
+#define AT_FLAGS  8
+#define AT_ENTRY  9
+#define AT_EXECFN 31
+
+typedef struct {
+    unsigned long a_type;
+    unsigned long a_val;
+} Elf64_auxv_t;
 
 #define R_AARCH64_ABS64 257U
 #define R_AARCH64_GLOB_DAT 1025U

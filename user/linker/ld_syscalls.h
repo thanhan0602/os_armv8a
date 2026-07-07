@@ -80,7 +80,19 @@ static inline int ld_strcmp(const char *s1, const char *s2) {
     }
     return *(unsigned char *)s1 - *(unsigned char *)s2;
 }
+static inline int ld_strncmp(const char *s1, const char *s2, unsigned long n) {
+    while (n && *s1 && (*s1 == *s2)) {
+        s1++; s2++; n--;
+    }
+    if (n == 0) return 0;
+    return *(unsigned char *)s1 - *(unsigned char *)s2;
+}
 
+static inline unsigned long ld_strlen(const char *s) {
+    unsigned long len = 0;
+    while (s[len]) len++;
+    return len;
+}
 static inline void ld_strcpy(char *dest, const char *src) {
     while ((*dest++ = *src++));
 }

@@ -19,7 +19,7 @@ LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -static -no-pie -Wl,--build-id
 USER_CFLAGS := -Wall -Wextra -O2 -g -ffreestanding -fno-builtin -fpie -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables -I$(USER_DIR)/include -MMD -MP
 USER_ASFLAGS := -g -ffreestanding -I$(USER_DIR)/include -MMD -MP
 USER_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 -T $(USER_LINKER_SCRIPT)
-USER_DYNAMIC_APP_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie -Wl,--build-id=none -Wl,--no-dynamic-linker -Wl,-z,max-page-size=0x1000 -T $(USER_LINKER_SCRIPT)
+USER_DYNAMIC_APP_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie -Wl,--build-id=none -Wl,--dynamic-linker,/lib/ld.so -Wl,-z,max-page-size=0x1000 -T $(USER_LINKER_SCRIPT)
 
 USER_LIBC_SOURCES := $(shell find $(USER_DIR)/lib/libc -type f -name '*.c')
 USER_LIBC_OBJECTS := $(patsubst $(USER_DIR)/lib/libc/%.c,$(BUILD_DIR)/user/lib/libc/%_c.o,$(USER_LIBC_SOURCES))

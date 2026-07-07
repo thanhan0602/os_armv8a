@@ -2,6 +2,11 @@
 #include <unistd.h>
 #include <string.h>
 
+__attribute__((constructor))
+void libc_init(void) {
+    puts("LIBC: Initialization routine called!\n");
+}
+
 static void reverse(char *s, int len)
 {
     int i = 0, j = len - 1;

@@ -779,8 +779,6 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
     unsigned long page_va;
     void *new_page;
     unsigned long flags;
-    unsigned int ec = (unsigned int)(esr_el1 >> 26) & 0x3F;
-    unsigned int iss = (unsigned int)esr_el1 & 0x1FFFFFF;
 
     if (!mmu_is_enabled()) {
         return 0;
@@ -857,7 +855,11 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
         unsigned int i;
         struct vm_region *region = (struct vm_region *)0;
 
-        for (i = 0; i < p->region_count; i++) {
+        /* Search in reverse so the most recently added region wins.
+         * This gives mmap() regions precedence over the large anonymous
+         * heap region they may overlap (e.g. the dynamic linker mapping
+         * an executable inside the process heap range). */
+        for (i = p->region_count; i-- > 0;) {
             if (far_el1 >= p->regions[i].start && far_el1 < p->regions[i].end) {
                 region = &p->regions[i];
                 break;
@@ -935,22 +937,6 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
     return 1;
 
 cleanup_fatal:
-    {
-        const char *el = (ec == 0x20 || ec == 0x24) ? "EL0" : "EL1";
-        const char *type = "Fault";
-        const char *acc = "unknown";
-
-        if (ec == 0x20 || ec == 0x21) {
-            type = "Instruction Abort";
-            acc = "Fetch";
-        } else if (ec == 0x24 || ec == 0x25) {
-            type = "Data Abort";
-            acc = (iss & (1 << 6)) ? "Write" : "Read";
-        }
-
-        KER_LOGF("[p=%p] %s %s abort (%s L%u): FAR=0x%lx ESR=0x%lx\n",
-                 p, el, acc, type, (unsigned int)(fsc & 0x3), far_el1, esr_el1);
-    }
     return 0;
 }
 

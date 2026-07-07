@@ -3,6 +3,7 @@ ENTRY(_start)
 
 PHDRS
 {
+    interp PT_INTERP;
     text PT_LOAD FLAGS(5); /* R E */
     data PT_LOAD FLAGS(6); /* RW  */
     dynamic PT_DYNAMIC;
@@ -11,6 +12,10 @@ PHDRS
 SECTIONS
 {
     . = 0x0;
+
+    .interp : {
+        *(.interp)
+    } :text :interp
 
     .text ALIGN(0x1000) : {
         *(.text.start)
