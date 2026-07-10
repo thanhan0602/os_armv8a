@@ -136,20 +136,6 @@ static void process_zero_bytes(void *ptr, unsigned long size)
     }
 }
 
-static int process_streq(const char *lhs, const char *rhs)
-{
-    while (*lhs != '\0' && *rhs != '\0') {
-        if (*lhs != *rhs) {
-            return 0;
-        }
-
-        lhs++;
-        rhs++;
-    }
-
-    return *lhs == *rhs;
-}
-
 static int process_copy_string(char *dst, const char *src, unsigned long max_len)
 {
     unsigned long index;
@@ -715,6 +701,7 @@ static void process_populate_arg_stack(struct process *process, const char *path
     mmu_copy_to_user(process->mm, user_sp, kstack + ksp, 1024UL - ksp);
     
     process->stack_top = user_sp;
+    process->user_sp = user_sp;
 }
 
 struct process *process_create_from_elf(const unsigned char *image, unsigned long image_size, const char *path)
@@ -978,3 +965,76 @@ unsigned long process_brk(struct process *process, unsigned long new_break)
     return 0UL;
 }
 #endif
+unsigned long process_execve(const char *filename_va, char *const argv_va[], char *const envp_va[], struct exception_context *ctx)
+{
+    struct task *task = arch_get_current_task();
+    struct process *new_process;
+    unsigned char *image_buffer;
+    unsigned long image_size;
+    char filename[128];
+    unsigned long i;
+
+    /* 1. Copy filename from user space */
+    for (i = 0; i < sizeof(filename) - 1; i++) {
+        char c;
+        if (!mmu_copy_from_user(task->mm, &c, (unsigned long)filename_va + i, 1)) return (unsigned long)-1;
+        filename[i] = c;
+        if (c == '\0') break;
+    }
+    filename[sizeof(filename) - 1] = '\0';
+
+    KER_LOGF("[process] execve: %s\n", filename);
+
+    /* 2. Load the new ELF image into kernel memory */
+    if (!process_load_file_image(filename, &image_buffer, &image_size)) {
+        KER_LOGF("[process] execve: failed to load %s\n", filename);
+        return (unsigned long)-1;
+    }
+
+    /* 3. Create a new process object (this maps segments into a NEW mm_context) */
+    new_process = process_create_from_elf(image_buffer, image_size, filename);
+    kfree(image_buffer); /* process_create_from_elf captures needed buffers */
+
+    if (!new_process) {
+        KER_LOGF("[process] execve: failed to parse ELF %s\n", filename);
+        return (unsigned long)-1;
+    }
+
+    /* 
+     * 4. Replace the current task's process.
+     * In a real OS, we would carefully migrate files, signals, etc.
+     * Here we do a clean swap.
+     */
+    struct mm_context *old_mm = task->mm;
+    struct process *old_process = task->process;
+
+    /* Swap in the new process/address space. The page-fault handler uses
+     * task->process (regions + mm), so both must be updated atomically here. */
+    task->mm = new_process->mm;
+    task->process = new_process;
+
+    /* Switch to the new address space immediately */
+    mmu_context_switch(task->mm);
+
+    /* 5. Update the exception context to start at the new entry point */
+    ctx->elr_el1 = new_process->entry_va;
+    ctx->sp_el0 = new_process->user_sp;
+    
+    /* Zeros registers for the new program */
+    (void)argv_va;
+    (void)envp_va;
+    for (i = 0; i < 31; i++) ctx->gpr[i] = 0;
+
+    /* Destroy old address space. Detach its mm first so process_destroy
+     * does not double-free the mm we may still reference, then free the
+     * old process struct (regions, owned ELF images). */
+    if (old_process != (struct process *)0) {
+        old_process->mm = old_mm;
+        process_destroy(old_process);
+    } else {
+        mmu_context_destroy(old_mm);
+    }
+
+    /* execve does not return on success */
+    return 0;
+}

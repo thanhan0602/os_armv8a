@@ -393,6 +393,9 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
     case SYS_FORK:
         ret = process_fork(ctx);
         break;
+    case SYS_EXECVE:
+        ret = process_execve((const char *)ctx->gpr[0], (char *const *)ctx->gpr[1], (char *const *)ctx->gpr[2], ctx);
+        break;
     case SYS_WAIT4:
         ret = sys_wait4(ctx->gpr[0], ctx->gpr[1]);
         break;

@@ -72,6 +72,33 @@ static void mmu_tlbi_asid(unsigned int asid)
     mmu_invalidate_tlb_asid(asid);
 }
 
+static void *mmu_alloc_sub_table(struct mm_context *mm, const char *name)
+{
+    void *new_page = page_alloc();
+    if (!new_page) return (void *)0;
+
+    if (!mmu_context_add_page(mm, (unsigned long)va_to_pa(new_page))) {
+        page_free(new_page);
+        return (void *)0;
+    }
+
+    unsigned long *tbl = (unsigned long *)pa_to_va(va_to_pa(new_page));
+    for (int i = 0; i < 512; i++) tbl[i] = 0UL;
+
+    if (name) mmu_debug_record_table_page((unsigned long)va_to_pa(new_page), name);
+    return new_page;
+}
+
+static void mmu_cow_log(unsigned long va, const char *msg, unsigned int ref)
+{
+    struct task *curr = sched_current();
+    if (curr) {
+        KER_LOGF("[mmu] [%s:%lu] CoW: VA=%lx %s (ref=%u)\n", curr->name, curr->id, va, msg, ref);
+    } else {
+        KER_LOGF("[mmu] CoW: VA=%lx %s (ref=%u)\n", va, msg, ref);
+    }
+}
+
 static void mmu_asid_set(unsigned int asid)
 {
     asid_bitmap[asid / 64] |= (1UL << (asid % 64));
@@ -259,20 +286,6 @@ static int mmu_user_access_allowed(unsigned long entry, int write)
     return ap_bits == MMU_USER_PAGE_AP_RW || ap_bits == MMU_USER_PAGE_AP_RO;
 }
 
-#include <kernel/process.h>
-#include <kernel/sched.h>
-#include <kernel/mmu_debug.h>
-
-/* Forward declaration for fault handling */
-int mmu_handle_process_page_fault(struct process *process, unsigned long fault_addr, unsigned long esr);
-
-static int mmu_resolve_user_page(const struct mm_context *mm,
-                                 unsigned long va,
-                                 unsigned long *pa_out,
-                                 unsigned long *entry_out);
-
-static int mmu_user_access_allowed(unsigned long entry, int write);
-
 static int mmu_copy_user_range(const struct mm_context *mm,
                                unsigned char *kernel_buffer,
                                unsigned long user_va,
@@ -408,11 +421,11 @@ static void mmu_clone_walk(struct mm_context *mm, unsigned long *src_tbl, unsign
 {
     for (int i = 0; i < 512; i++) {
         unsigned long entry = src_tbl[i];
-        if (!(entry & 0x1)) continue;
+        if (!(entry & MMU_DESC_VALID)) continue;
 
-        if (level < 3 && (entry & 0x2)) {
+        if (level < 3 && (entry & MMU_DESC_TYPE_MASK) == MMU_DESC_TABLE) {
             /* Table entry */
-            unsigned long *next_src = (unsigned long *)pa_to_va(entry & MMU_L3_PAGE_ADDR_MASK);
+            unsigned long *next_src = (unsigned long *)pa_to_va(entry & MMU_DESC_ADDR_MASK);
             unsigned long next_dst_pa = (unsigned long)page_alloc();
             if (!next_dst_pa) continue;
             
@@ -517,113 +530,81 @@ void mmu_context_switch(struct mm_context *mm)
     }
 
     if (mm == (struct mm_context *)0) {
-        ttbr0_val = (unsigned long)ttbr0_runtime_empty_root;
+        ttbr0_val = (unsigned long)va_to_pa(ttbr0_runtime_empty_root);
     } else {
         ttbr0_val = mm->root_pa | ((unsigned long)mm->asid << 48);
     }
 
     mmu_set_ttbr0(ttbr0_val);
+    mmu_invalidate_tlb_all();
+}
+
+static void mmu_split_block(struct mm_context *mm, unsigned long *entry_ptr, unsigned long level)
+{
+    unsigned long entry = *entry_ptr;
+    unsigned long block_pa = entry & MMU_DESC_ADDR_MASK;
+    unsigned long block_attrs = entry & ~MMU_DESC_ADDR_MASK;
+    unsigned long step = (level == 1) ? MMU_L2_BLOCK_SIZE : PAGE_SIZE;
+    unsigned long next_type = (level == 1) ? MMU_DESC_BLOCK : MMU_DESC_PAGE;
+
+    void *new_page = mmu_alloc_sub_table(mm, (level == 1) ? "split-l2" : "split-l3");
+    if (!new_page) return;
+
+    unsigned long *new_tbl = (unsigned long *)pa_to_va(new_page);
+    for (int i = 0; i < 512; i++) {
+        new_tbl[i] = (block_pa + ((unsigned long)i * step)) | block_attrs | next_type;
+    }
+
+    *entry_ptr = (unsigned long)va_to_pa(new_page) | MMU_DESC_TABLE;
 }
 
 static unsigned long *mmu_find_pte(struct mm_context *mm, unsigned long va, int create)
 {
     unsigned long *l0, *l1, *l2, *l3;
     unsigned long idx;
-    void *new_page;
-    unsigned int i;
 
     if (!mm) return (unsigned long *)0;
 
     l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
     idx = L0_INDEX_FOR(va);
-    if ((l0[idx] & 0x1) == 0) {
+    if (!(l0[idx] & MMU_DESC_VALID)) {
         if (!create) return (unsigned long *)0;
-        new_page = page_alloc();
+        void *new_page = mmu_alloc_sub_table(mm, "l1");
         if (!new_page) return (unsigned long *)0;
-        if (!mmu_context_add_page(mm, (unsigned long)new_page)) { page_free(new_page); return (unsigned long *)0; }
-        
-        /* Zero the new sub-table */
-        for (i = 0; i < 512; i++) {
-            ((unsigned long *)pa_to_va(new_page))[i] = 0UL;
-        }
-
-        l0[idx] = (unsigned long)new_page | 0x3UL;
+        l0[idx] = (unsigned long)va_to_pa(new_page) | MMU_DESC_TABLE;
     }
     
-    l1 = (unsigned long *)pa_to_va((void *)(l0[idx] & 0x0000FFFFFFFFF000UL));
+    l1 = (unsigned long *)pa_to_va((void *)(l0[idx] & MMU_DESC_ADDR_MASK));
     idx = L1_INDEX_FOR(va);
 
-    /* Check if L1 entry is valid and if it's a block mapping we need to split (1 GiB) */
-    if ((l1[idx] & MMU_DESC_VALID) != 0 && (l1[idx] & MMU_DESC_TYPE_MASK) == MMU_DESC_BLOCK) {
+    if ((l1[idx] & MMU_DESC_VALID) && (l1[idx] & MMU_DESC_TYPE_MASK) == MMU_DESC_BLOCK) {
         if (!create) return (unsigned long *)0;
-        
-        unsigned long block_pa = l1[idx] & MMU_L1_BLOCK_ADDR_MASK;
-        unsigned long block_attrs = l1[idx] & ~MMU_L1_BLOCK_ADDR_MASK;
-        
-        new_page = page_alloc();
-        if (!new_page) return (unsigned long *)0;
-        if (!mmu_context_add_page(mm, (unsigned long)new_page)) { page_free(new_page); return (unsigned long *)0; }
-        
-        unsigned long *l2_new = (unsigned long *)pa_to_va(new_page);
-        for (i = 0; i < 512; i++) {
-            l2_new[i] = (block_pa + (i * MMU_L2_BLOCK_SIZE)) | block_attrs | MMU_DESC_BLOCK;
-        }
-        
-        l1[idx] = (unsigned long)new_page | MMU_DESC_TABLE;
+        mmu_split_block(mm, &l1[idx], 1);
     }
 
-    if ((l1[idx] & 0x1) == 0) {
+    if (!(l1[idx] & MMU_DESC_VALID)) {
         if (!create) return (unsigned long *)0;
-        new_page = page_alloc();
+        void *new_page = mmu_alloc_sub_table(mm, "l2");
         if (!new_page) return (unsigned long *)0;
-        if (!mmu_context_add_page(mm, (unsigned long)new_page)) { page_free(new_page); return (unsigned long *)0; }
-        
-        /* Zero the new sub-table */
-        for (i = 0; i < 512; i++) {
-            ((unsigned long *)pa_to_va(new_page))[i] = 0UL;
-        }
-
-        l1[idx] = (unsigned long)new_page | 0x3UL;
+        l1[idx] = (unsigned long)va_to_pa(new_page) | MMU_DESC_TABLE;
     }
 
-    l2 = (unsigned long *)pa_to_va((void *)(l1[idx] & 0x0000FFFFFFFFF000UL));
+    l2 = (unsigned long *)pa_to_va((void *)(l1[idx] & MMU_DESC_ADDR_MASK));
     idx = L2_INDEX_FOR(va);
 
-    /* Check if L2 entry is valid and if it's a block mapping we need to split */
-    if ((l2[idx] & MMU_DESC_VALID) != 0 && (l2[idx] & MMU_DESC_TYPE_MASK) == MMU_DESC_BLOCK) {
+    if ((l2[idx] & MMU_DESC_VALID) && (l2[idx] & MMU_DESC_TYPE_MASK) == MMU_DESC_BLOCK) {
         if (!create) return (unsigned long *)0;
-        
-        unsigned long block_pa = l2[idx] & MMU_L2_BLOCK_ADDR_MASK;
-        unsigned long block_attrs = l2[idx] & ~MMU_L2_BLOCK_ADDR_MASK;
-        
-        new_page = page_alloc();
-        if (!new_page) return (unsigned long *)0;
-        if (!mmu_context_add_page(mm, (unsigned long)new_page)) { page_free(new_page); return (unsigned long *)0; }
-        
-        unsigned long *l3_new = (unsigned long *)pa_to_va(new_page);
-        for (i = 0; i < 512; i++) {
-            l3_new[i] = (block_pa + (i * PAGE_SIZE)) | block_attrs | MMU_DESC_PAGE;
-        }
-        
-        l2[idx] = (unsigned long)new_page | MMU_DESC_TABLE;
-        /* Note: Invalidation might be needed here, but usually mmu_map_user_page calls it after */
+        mmu_split_block(mm, &l2[idx], 2);
     }
 
-    if ((l2[idx] & 0x1) == 0) {
+    if (!(l2[idx] & MMU_DESC_VALID)) {
         if (!create) return (unsigned long *)0;
-        new_page = page_alloc();
+        void *new_page = mmu_alloc_sub_table(mm, "l3");
         if (!new_page) return (unsigned long *)0;
-        if (!mmu_context_add_page(mm, (unsigned long)new_page)) { page_free(new_page); return (unsigned long *)0; }
-        
-        /* Zero the new sub-table */
-        for (i = 0; i < 512; i++) {
-            ((unsigned long *)pa_to_va(new_page))[i] = 0UL;
-        }
-
-        l2[idx] = (unsigned long)new_page | 0x3UL;
+        l2[idx] = (unsigned long)va_to_pa(new_page) | MMU_DESC_TABLE;
     }
 
-    l3 = (unsigned long *)pa_to_va((void *)(l2[idx] & 0x0000FFFFFFFFF000UL));
+    l3 = (unsigned long *)pa_to_va((void *)(l2[idx] & MMU_DESC_ADDR_MASK));
     return l3;
 }
 
@@ -651,6 +632,54 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
     return 1;
 }
 
+static void mmu_try_merge_table(struct mm_context *mm, unsigned long va, int level)
+{
+    unsigned long *l0, *l1, *l2;
+    unsigned long *table;
+    unsigned long block_size = (level == 2) ? MMU_L1_BLOCK_SIZE : MMU_L2_BLOCK_SIZE;
+    unsigned long sub_step = (level == 2) ? MMU_L2_BLOCK_SIZE : PAGE_SIZE;
+    unsigned long sub_type = (level == 2) ? MMU_DESC_BLOCK : MMU_DESC_PAGE;
+
+    l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
+    l1 = (unsigned long *)pa_to_va((void *)(l0[L0_INDEX_FOR(va)] & MMU_DESC_ADDR_MASK));
+    if (level == 2) {
+        table = l1;
+    } else {
+        l2 = (unsigned long *)pa_to_va((void *)(l1[L1_INDEX_FOR(va)] & MMU_DESC_ADDR_MASK));
+        table = (level == 3) ? (unsigned long *)pa_to_va((void *)(l2[L2_INDEX_FOR(va)] & MMU_DESC_ADDR_MASK)) : l2;
+    }
+
+    /* Check if all 512 entries are identical and contiguous */
+    unsigned long base_pa = 0;
+    unsigned long base_attrs = 0;
+    for (int i = 0; i < 512; i++) {
+        if (!(table[i] & MMU_DESC_VALID) || (table[i] & MMU_DESC_TYPE_MASK) != sub_type) return;
+        unsigned long cur_pa = table[i] & MMU_DESC_ADDR_MASK;
+        unsigned long cur_attrs = table[i] & ~MMU_DESC_ADDR_MASK;
+        if (i == 0) {
+            base_pa = cur_pa;
+            base_attrs = cur_attrs;
+            if (base_pa & (block_size - 1)) return;
+        } else if (cur_pa != base_pa + (i * sub_step) || cur_attrs != base_attrs) {
+            return;
+        }
+    }
+
+    /* All entries match! Merge them. */
+    unsigned long *parent_table = (level == 2) ? l0 : ((level == 3) ? (unsigned long *)pa_to_va((void *)(l1[L1_INDEX_FOR(va)] & MMU_DESC_ADDR_MASK)) : l1);
+    unsigned long idx = (level == 2) ? L0_INDEX_FOR(va) : ((level == 3) ? L2_INDEX_FOR(va) : L1_INDEX_FOR(va));
+    unsigned long table_pa = parent_table[idx] & MMU_DESC_ADDR_MASK;
+
+    parent_table[idx] = base_pa | (base_attrs & ~MMU_DESC_TYPE_MASK) | MMU_DESC_BLOCK;
+
+    mmu_context_remove_page(mm, table_pa);
+    page_free((void *)table_pa);
+    mmu_invalidate_tlb_va(mm->asid, va & ~(block_size - 1));
+
+    /* Recurse up if we just merged a table */
+    if (level > 2) mmu_try_merge_table(mm, va, level - 1);
+}
+
 int mmu_unmap_user_page(struct mm_context *mm, unsigned long va)
 {
     unsigned long *l3;
@@ -668,106 +697,8 @@ int mmu_unmap_user_page(struct mm_context *mm, unsigned long va)
 
     mmu_invalidate_tlb_va(mm->asid, va);
 
-    /* Check if we can merge L3 back to L2 block */
-    int i;
-    unsigned long base_pa = 0;
-    unsigned long base_attrs = 0;
-    int can_merge = 1;
-
-    for (i = 0; i < 512; i++) {
-        if ((l3[i] & MMU_DESC_VALID) == 0) {
-            can_merge = 0;
-            break;
-        }
-        if ((l3[i] & MMU_DESC_TYPE_MASK) != MMU_DESC_PAGE) {
-            can_merge = 0;
-            break;
-        }
-        unsigned long current_pa = l3[i] & MMU_L3_PAGE_ADDR_MASK;
-        unsigned long current_attrs = l3[i] & ~MMU_L3_PAGE_ADDR_MASK;
-        
-        if (i == 0) {
-            base_pa = current_pa;
-            base_attrs = current_attrs;
-            if ((base_pa & (MMU_L2_BLOCK_SIZE - 1)) != 0) {
-                can_merge = 0;
-                break;
-            }
-        } else {
-            if (current_pa != base_pa + (i * PAGE_SIZE) || current_attrs != base_attrs) {
-                can_merge = 0;
-                break;
-            }
-        }
-    }
-
-    if (can_merge) {
-        unsigned long *l0, *l1, *l2;
-        l0 = (unsigned long *)pa_to_va((void *)mm->root_pa);
-        l1 = (unsigned long *)pa_to_va((void *)(l0[L0_INDEX_FOR(va)] & MMU_DESC_ADDR_MASK));
-        l2 = (unsigned long *)pa_to_va((void *)(l1[L1_INDEX_FOR(va)] & MMU_DESC_ADDR_MASK));
-        
-        unsigned long l2_idx = L2_INDEX_FOR(va);
-        unsigned long l3_pa = l2[l2_idx] & MMU_DESC_ADDR_MASK;
-        
-        /* Replace L3 table with L2 block */
-        l2[l2_idx] = base_pa | (base_attrs & ~MMU_DESC_TYPE_MASK) | MMU_DESC_BLOCK;
-        
-        /* Free L3 table page */
-        mmu_context_remove_page(mm, l3_pa);
-        page_free((void *)l3_pa);
-        
-        /* Invalidate the whole 2MB range in TLB if necessary, or let the caller handle it */
-        /* For safety, invalidate the block base */
-        mmu_invalidate_tlb_va(mm->asid, va & ~(MMU_L2_BLOCK_SIZE - 1));
-
-        /* Now try to merge L2 into L1 */
-        int can_merge_l1 = 1;
-        unsigned long base_pa_l1 = 0;
-        unsigned long base_attrs_l1 = 0;
-
-        for (i = 0; i < 512; i++) {
-            if ((l2[i] & MMU_DESC_VALID) == 0) {
-                can_merge_l1 = 0;
-                break;
-            }
-            if ((l2[i] & MMU_DESC_TYPE_MASK) != MMU_DESC_BLOCK) {
-                can_merge_l1 = 0;
-                break;
-            }
-            unsigned long current_pa = l2[i] & MMU_L2_BLOCK_ADDR_MASK;
-            unsigned long current_attrs = l2[i] & ~MMU_L2_BLOCK_ADDR_MASK;
-
-            if (i == 0) {
-                base_pa_l1 = current_pa;
-                base_attrs_l1 = current_attrs;
-                if ((base_pa_l1 & (MMU_L1_BLOCK_SIZE - 1)) != 0) {
-                    can_merge_l1 = 0;
-                    break;
-                }
-            } else {
-                if (current_pa != base_pa_l1 + (i * MMU_L2_BLOCK_SIZE) || current_attrs != base_attrs_l1) {
-                    can_merge_l1 = 0;
-                    break;
-                }
-            }
-        }
-
-        if (can_merge_l1) {
-            unsigned long l1_idx = L1_INDEX_FOR(va);
-            unsigned long l2_pa = l1[l1_idx] & MMU_DESC_ADDR_MASK;
-
-            /* Replace L2 table with L1 block */
-            l1[l1_idx] = base_pa_l1 | (base_attrs_l1 & ~MMU_DESC_TYPE_MASK) | MMU_DESC_BLOCK;
-
-            /* Free L2 table page */
-            mmu_context_remove_page(mm, l2_pa);
-            page_free((void *)l2_pa);
-
-            /* Invalidate the whole 1GB range in TLB */
-            mmu_invalidate_tlb_va(mm->asid, va & ~(MMU_L1_BLOCK_SIZE - 1));
-        }
-    }
+    /* Try to merge L3->L2 then L2->L1 */
+    mmu_try_merge_table(mm, va, 3);
 
     return 1;
 }
@@ -810,26 +741,17 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
             (entry & MMU_DESC_SOFTWARE_COW) != 0UL) {
             
             old_pa = entry & MMU_L3_PAGE_ADDR_MASK;
-            page_va = far_el1 & ~0xFFFUL;
+            page_va = far_el1 & ~(PAGE_SIZE - 1UL);
 
             if (page_ref_get(old_pa) == 1U) {
                 *cow_entry_ptr = (*cow_entry_ptr & ~MMU_AP_RO & ~MMU_DESC_SOFTWARE_COW) | MMU_AP_RW;
                 mmu_invalidate_tlb_va(p->mm->asid, page_va);
-                struct task *curr = sched_current();
-                if (curr) {
-                    KER_LOGF("[mmu] [%s:%lu] CoW: VA=%lx upgraded to RW (ref=1)\n", curr->name, curr->id, page_va);
-                } else {
-                    KER_LOGF("[mmu] CoW: VA=%lx upgraded to RW (ref=1)\n", page_va);
-                }
+                mmu_cow_log(page_va, "upgraded to RW (ref=1)", 1);
                 return 1;
             }
 
-            struct task *curr = sched_current();
-            if (curr) {
-                KER_LOGF("[mmu] [%s:%lu] CoW: VA=%lx copying (ref=%u)\n", curr->name, curr->id, page_va, page_ref_get(old_pa));
-            } else {
-                KER_LOGF("[mmu] CoW: VA=%lx copying (ref=%u)\n", page_va, page_ref_get(old_pa));
-            }
+            mmu_cow_log(page_va, "copying", page_ref_get(old_pa));
+
             copy_page = page_alloc();
             if (copy_page == (void *)0) return 0;
 
@@ -837,8 +759,8 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
             unsigned char *dst = (unsigned char *)pa_to_va(copy_page);
             for (unsigned long i = 0; i < PAGE_SIZE; i++) dst[i] = src[i];
 
-            *cow_entry_ptr = ((unsigned long)va_to_pa(copy_page) & MMU_L3_PAGE_ADDR_MASK) | 
-                         (entry & ~MMU_L3_PAGE_ADDR_MASK & ~MMU_AP_RO & ~MMU_DESC_SOFTWARE_COW) | MMU_AP_RW;
+            *cow_entry_ptr = ((unsigned long)va_to_pa(copy_page) & MMU_DESC_ADDR_MASK) | 
+                         (entry & ~MMU_DESC_ADDR_MASK & ~MMU_AP_RO & ~MMU_DESC_SOFTWARE_COW) | MMU_AP_RW;
 
             if (!mmu_context_add_page(p->mm, (unsigned long)va_to_pa(copy_page))) {}
             page_ref_dec(old_pa);
@@ -867,7 +789,7 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
         }
 
         if (region) {
-            page_va = far_el1 & ~0xFFFUL;
+            page_va = far_el1 & ~(PAGE_SIZE - 1UL);
             new_page = page_alloc();
             if (!new_page) return 0;
 
@@ -905,10 +827,10 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
 
         /* Fallback for automatic stack growth or legacy heap if not in regions */
         if (far_el1 >= USER_HEAP_BASE && far_el1 < p->brk) {
-             page_va = far_el1 & ~0xFFFUL;
+             page_va = far_el1 & ~(PAGE_SIZE - 1UL);
         } else if (far_el1 >= (USER_STACK_TOP - 0x100000) && far_el1 < USER_STACK_TOP) {
              /* Reasonable stack range (1MB from top) */
-             page_va = far_el1 & ~0xFFFUL;
+             page_va = far_el1 & ~(PAGE_SIZE - 1UL);
         } else {
              goto cleanup_fatal;
         }
@@ -955,13 +877,13 @@ int mmu_unmap_user_range(struct mm_context *mm, unsigned long va, unsigned long 
 {
     if (!mm || len == 0) return 1;
 
-    unsigned long start = va & ~0xFFFUL;
-    unsigned long end = (va + len + 0xFFFUL) & ~0xFFFUL;
+    unsigned long start = va & ~(PAGE_SIZE - 1UL);
+    unsigned long end = (va + len + (PAGE_SIZE - 1UL)) & ~(PAGE_SIZE - 1UL);
 
     for (unsigned long curr = start; curr < end; curr += PAGE_SIZE) {
         unsigned long *pte = mmu_find_pte(mm, curr, 0);
-        if (pte && (*pte & 0x1)) {
-            unsigned long pa = *pte & 0x0000FFFFFFFFF000UL;
+        if (pte && (*pte & MMU_DESC_VALID)) {
+            unsigned long pa = *pte & MMU_DESC_ADDR_MASK;
             *pte = 0;
             page_ref_dec(pa);
             mmu_invalidate_tlb_va(mm->asid, curr);

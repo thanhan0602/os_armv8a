@@ -35,7 +35,6 @@ struct boot_service {
 };
 
 static const struct boot_service boot_services[] = {
-    {"/lib/ld.so",          "ld.so",    1},
     {"/bin/hello.elf",      "user-a",   1},
     {"/bin/fault.elf",      "user-b",   1},
     {"/bin/test_cow.elf",   "user-cow", 1},

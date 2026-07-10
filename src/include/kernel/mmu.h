@@ -106,11 +106,8 @@ void mmu_install_empty_ttbr0_root(void);
  */
 /*
  * Maximum number of physical pages an mm_context can track.
- * For the current two-mapping layout (code page + stack page):
- *   L0=1, L1=1, L2=1, L3=1 per mmu_map_user_page call (up to 4 sub-tables)
- *   2 calls × 4 levels = 8 sub-table pages worst-case (many shared in practice)
- *   + 2 user content pages (code, stack) = 10 total.
- * 16 gives comfortable headroom for future extra mappings.
+ * Currently 256 allows for large mappings (hundreds of code/stack pages) 
+ * plus their intermediate page table pages.
  */
 #define MM_MAX_TRACKED_PAGES 256
 

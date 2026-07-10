@@ -3,18 +3,24 @@ ENTRY(_start)
 
 PHDRS
 {
-    interp PT_INTERP;
-    text PT_LOAD FLAGS(5); /* R E */
-    data PT_LOAD FLAGS(6); /* RW  */
-    dynamic PT_DYNAMIC;
+    phdr     PT_PHDR PHDRS;    /* ELF PHDR table - extends first PT_LOAD to offset 0 */
+    interp   PT_INTERP;
+    text     PT_LOAD FLAGS(5) FILEHDR PHDRS; /* R E - covers ELF header + PHDRs */
+    data     PT_LOAD FLAGS(6); /* RW  */
+    dynamic  PT_DYNAMIC;
 }
 
 SECTIONS
 {
-    . = 0x0;
+    /*
+     * SIZEOF_HEADERS places the first section after the ELF header + PHDR table.
+     * Combined with PT_PHDR PHDRS before the first PT_LOAD, the linker extends
+     * the text PT_LOAD to file offset 0, making AT_PHDR accessible at runtime.
+     */
+    . = SIZEOF_HEADERS;
 
     .interp : {
-        *(.interp)
+        KEEP(*(.interp))
     } :text :interp
 
     .text ALIGN(0x1000) : {

@@ -9,9 +9,28 @@
 #define ELF_EM_AARCH64 183U
 #define ELF_PT_LOAD 1U
 #define ELF_PT_DYNAMIC 2U
+#define ELF_PT_INTERP 3U
+#define ELF_PT_PHDR 6U
 #define ELF_PF_X 0x1U
 #define ELF_PF_W 0x2U
 #define ELF_PF_R 0x4U
+
+/* mmap protection flags (must match kernel syscall ABI) */
+#define LD_PROT_READ  0x1
+#define LD_PROT_WRITE 0x2
+#define LD_PROT_EXEC  0x4
+
+/* ELF identification indices and expected values (e_ident[]) */
+#define ELF_EI_MAG0    0
+#define ELF_EI_MAG1    1
+#define ELF_EI_MAG2    2
+#define ELF_EI_MAG3    3
+#define ELF_EI_CLASS   4
+#define ELF_EI_DATA    5
+#define ELF_MAG0       0x7fU
+#define ELF_MAG1       'E'
+#define ELF_MAG2       'L'
+#define ELF_MAG3       'F'
 
 #define DT_NULL 0L
 #define DT_NEEDED 1L

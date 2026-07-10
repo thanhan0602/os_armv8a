@@ -8,6 +8,7 @@ int getpid(void);
 int getcpu(void);
 void *sbrk(long increment);
 int fork(void);
+int execve(const char *filename, char *const argv[], char *const envp[]);
 int wait(int *status);
 unsigned int sleep(unsigned int seconds);
 

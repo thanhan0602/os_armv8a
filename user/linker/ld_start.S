@@ -50,16 +50,42 @@ ld_plt_resolver:
      * We must resolve the symbol, patch GOT[n], restore the argument
      * registers, unwind the PLT0 frame and tail-call the real function.
      */
-    /* Preserve argument / indirect-result registers across the C call. */
+    /* 
+     * Save argument / indirect-result registers (x0-x8) and x9.
+     * These MUST be preserved because we are a resolver called via a PLT stub
+     * that behaves like a transparent branch. AArch64 ABI requires x0-x8
+     * to be preserved if they contain function arguments.
+     *
+     * Total saved: 5 pairs * 16 bytes = 80 bytes.
+     *
+     * Stack structure after this:
+     *   sp + 80:  Saved GOT entry address (from PLT0)
+     *   sp + 88:  Saved original LR (from PLT0)
+     *   sp + 64:  Saved x8, x9
+     *   sp + 48:  Saved x6, x7
+     *   sp + 32:  Saved x4, x5
+     *   sp + 16:  Saved x2, x3
+     *   sp + 00:  Saved x0, x1
+     */
     stp x0, x1, [sp, #-16]!
     stp x2, x3, [sp, #-16]!
     stp x4, x5, [sp, #-16]!
     stp x6, x7, [sp, #-16]!
     stp x8, x9, [sp, #-16]!
 
-    /* Arguments for ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va) */
-    ldr x0, [x16, #-8]     /* x0 = obj = GOT[1] */
-    ldr x1, [sp, #80]      /* x1 = &GOT[n] (saved by PLT0 above our 5 saved pairs) */
+    /* 
+     * Arguments for ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va)
+     *
+     * In AArch64 PLT0 (on entry to ld_plt_resolver):
+     *   stp x16, x30, [sp, #-16]!  <-- App's PLT0 pushed x16 (GOT entry VA) and LR
+     * 
+     * Since we just pushed 80 bytes of register state, the original PLT0 
+     * frame is now at [sp, #80].
+     *   [sp, #80] = x16 (vaddr of the GOT entry being resolved)
+     *   [sp, #88] = x30 (return address in the application)
+     */
+    ldr x0, [x16, #-8]     /* x0 = obj = GOT[1] (Linker-internal data) */
+    ldr x1, [sp, #80]      /* x1 = &GOT[n] (saved by PLT0) */
 
     bl ld_lazy_resolve
 
@@ -73,7 +99,12 @@ ld_plt_resolver:
     ldp x2, x3, [sp], #16
     ldp x0, x1, [sp], #16
 
-    /* Unwind the PLT0 frame: restore caller's x30 and drop [&GOT[n], x30] */
+    /* 
+     * Unwind the PLT0 frame.
+     * PLT0 pushed [x16, x30]. x30 is the original LR of the caller.
+     * We restore x30 from [sp, #8] (the second slot of the pair).
+     * Then we drop the 16 bytes.
+     */
     ldr x30, [sp, #8]
     add sp, sp, #16
 

@@ -68,7 +68,7 @@ void sched_init(void)
     switch_count = 0;
     
     /* Zero out all tasks */
-    for (int i = 0; i < MAX_TASKS; i++) {
+    for (unsigned long i = 0; i < MAX_TASKS; i++) {
         sched_clear_task(&tasks[i]);
     }
 
@@ -92,7 +92,7 @@ void sched_init(void)
         /* Circular list setup: 0->1->2->3->0 */
         idle->next = &tasks[(i + 1) % 4];
 
-        for (int j = 0; j < MAX_FILES_PER_TASK; j++) {
+        for (unsigned int j = 0; j < MAX_FILES_PER_TASK; j++) {
             idle->files[j] = (struct file *)0;
         }
     }

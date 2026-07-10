@@ -27,7 +27,7 @@ USER_LIBC_A := $(BUILD_DIR)/user/lib/libc.a
 USER_LIBC_SO := $(BUILD_DIR)/user/lib/libc.so
 USER_LINKER_SO := $(BUILD_DIR)/user/lib/ld.so
 
-USER_BUILTIN_APPS := hello fault ipc_recv ipc_send test_cow test_str cpu_stress simple
+USER_BUILTIN_APPS := hello fault ipc_recv ipc_send test_cow test_str cpu_stress simple test_exec
 USER_EXTERNAL_APPS := ticker shared_client
 USER_BUILTIN_LIBS := c
 USER_LINKER_OBJECTS := $(BUILD_DIR)/user/linker/ld_start_s.o $(BUILD_DIR)/user/linker/ld_main_c.o

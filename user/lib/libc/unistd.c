@@ -51,6 +51,11 @@ int fork(void)
     return (int)user_fork();
 }
 
+int execve(const char *filename, char *const argv[], char *const envp[])
+{
+    return (int)user_execve(filename, argv, envp);
+}
+
 int wait(int *status)
 {
     return (int)user_wait4(-1, status);

@@ -9,6 +9,7 @@
 #define USER_SYS_BRK    214UL
 #define USER_SYS_MUNMAP 215UL
 #define USER_SYS_FORK   220UL
+#define USER_SYS_EXECVE 221UL
 #define USER_SYS_WAIT4  260UL
 #define USER_SYS_NANOSLEEP 101UL
 #define USER_SYS_IPC_SEND  451UL
@@ -120,6 +121,11 @@ static inline long user_fork(void)
 static inline long user_wait4(long pid, int *status)
 {
     return user_syscall2(USER_SYS_WAIT4, (unsigned long)pid, (unsigned long)status);
+}
+
+static inline long user_execve(const char *filename, char *const argv[], char *const envp[])
+{
+    return user_syscall3(USER_SYS_EXECVE, (unsigned long)filename, (unsigned long)argv, (unsigned long)envp);
 }
 
 static inline long user_ipc_send(unsigned long channel_id, const void *buf, unsigned long len)

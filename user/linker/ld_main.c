@@ -2,6 +2,23 @@
 #include "ld_syscalls.h"
 
 #define MAX_OBJECTS 16
+
+/* Load-address policy for dependency libraries and the fallback main object. */
+#define LD_MAIN_LOAD_BASE   0x4000000UL
+#define LD_LIB_LOAD_BASE    0x5000000UL
+#define LD_LIB_LOAD_STRIDE  0x1000000UL
+
+/* Hard limits used for bounds checking untrusted ELF input. */
+#define LD_MAX_PHNUM        16
+#define LD_PATH_MAX         128
+#define LD_PAGE_MASK        0xFFFUL
+
+static int g_debug = 0;
+
+static void ld_log(const char *msg) {
+    if (g_debug) ld_puts(msg);
+}
+
 struct ld_object {
     char name[64];
     unsigned long base;
@@ -11,12 +28,17 @@ struct ld_object {
     const char *strtab;
     Elf64_Word *hashtab;     /* traditional SysV hash (unused) */
     Elf64_Word *gnu_hashtab; /* GNU hash (.gnu.hash) */
-    
+
     unsigned long init;
     unsigned long *init_array;
     unsigned long init_array_sz;
 
-    /* For lazy binding */
+    /* General relocations (.rela.dyn) */
+    Elf64_Rela *rela;
+    unsigned long relasz;
+    unsigned long relaent;
+
+    /* For lazy binding (.rela.plt) */
     Elf64_Rela *jmprel;
     unsigned long pltrelsz;
     unsigned long pltgot;
@@ -24,6 +46,76 @@ struct ld_object {
 
 extern void ld_plt_resolver(void);
 static unsigned long ld_lookup_symbol(const char *name);
+static struct ld_object *ld_load_object(const char *path, unsigned long load_bias);
+
+/*
+ * Parse an object's _DYNAMIC array and fill every table pointer in the struct.
+ * Assumes obj->dynamic and obj->base are already set. All pointers are biased
+ * by obj->base so they are directly usable at runtime.
+ *
+ * This is the single source of truth for DT_* handling: both the mmap-based
+ * loader (ld_load_object) and the already-mapped loader
+ * (ld_init_object_from_phdr) call it, so a new DT_ tag only needs adding here.
+ */
+static void ld_parse_dynamic(struct ld_object *obj) {
+    unsigned long bias = obj->base;
+
+    obj->symtab = 0;
+    obj->strtab = 0;
+    obj->hashtab = 0;
+    obj->gnu_hashtab = 0;
+    obj->init = 0;
+    obj->init_array = 0;
+    obj->init_array_sz = 0;
+    obj->rela = 0;
+    obj->relasz = 0;
+    obj->relaent = sizeof(Elf64_Rela);
+    obj->jmprel = 0;
+    obj->pltrelsz = 0;
+    obj->pltgot = 0;
+
+    if (!obj->dynamic) {
+        return;
+    }
+
+    for (Elf64_Dyn *d = obj->dynamic; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+        case DT_SYMTAB:        obj->symtab = (Elf64_Sym *)(d->d_un.d_ptr + bias); break;
+        case DT_STRTAB:        obj->strtab = (const char *)(d->d_un.d_ptr + bias); break;
+        case DT_HASH:          obj->hashtab = (Elf64_Word *)(d->d_un.d_ptr + bias); break;
+        case DT_GNU_HASH:      obj->gnu_hashtab = (Elf64_Word *)(d->d_un.d_ptr + bias); break;
+        case DT_INIT:          obj->init = d->d_un.d_ptr + bias; break;
+        case DT_INIT_ARRAY:    obj->init_array = (unsigned long *)(d->d_un.d_ptr + bias); break;
+        case DT_INIT_ARRAYSZ:  obj->init_array_sz = d->d_un.d_val; break;
+        case DT_RELA:          obj->rela = (Elf64_Rela *)(d->d_un.d_ptr + bias); break;
+        case DT_RELASZ:        obj->relasz = d->d_un.d_val; break;
+        case DT_RELAENT:       obj->relaent = d->d_un.d_val; break;
+        case DT_PLTGOT:        obj->pltgot = d->d_un.d_ptr + bias; break;
+        case DT_JMPREL:        obj->jmprel = (Elf64_Rela *)(d->d_un.d_ptr + bias); break;
+        case DT_PLTRELSZ:      obj->pltrelsz = d->d_un.d_val; break;
+        default: break;
+        }
+    }
+}
+
+/*
+ * Load every DT_NEEDED dependency of an object. Separated from parsing so the
+ * parser stays free of side effects (and recursion into the loader).
+ */
+static void ld_load_needed(struct ld_object *obj) {
+    if (!obj->dynamic || !obj->strtab) {
+        return;
+    }
+
+    static unsigned long next_bias = LD_LIB_LOAD_BASE;
+    for (Elf64_Dyn *d = obj->dynamic; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_NEEDED) {
+            const char *libname = obj->strtab + d->d_un.d_val;
+            ld_load_object(libname, next_bias);
+            next_bias += LD_LIB_LOAD_STRIDE;
+        }
+    }
+}
 
 __attribute__((visibility("hidden")))
 unsigned long ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va) {
@@ -43,9 +135,9 @@ unsigned long ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va
     unsigned int sym_idx = ELF64_R_SYM(rel->r_info);
     const char *symname = obj->strtab + obj->symtab[sym_idx].st_name;
     
-    ld_puts("Lazy resolving: ");
-    ld_puts(symname);
-    ld_puts("\n");
+    ld_log("Lazy resolving: ");
+    ld_log(symname);
+    ld_log("\n");
 
     unsigned long addr = ld_lookup_symbol(symname);
     if (addr) {
@@ -54,9 +146,15 @@ unsigned long ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va
         return *got_entry_va;
     }
 
+    /*
+     * Unresolved lazy symbol. Returning 0 here would make the PLT resolver
+     * branch to address 0 and take an opaque instruction abort. Abort loudly
+     * instead so the failure is attributable to the missing symbol.
+     */
     ld_puts("Lazy symbol not found: ");
     ld_puts(symname);
     ld_puts("\n");
+    ld_exit(127);
     return 0;
 }
 
@@ -116,129 +214,139 @@ static struct ld_object *ld_find_object(const char *name) {
     return 0;
 }
 
+/*
+ * Validate an ELF header read from an untrusted file. Returns 1 if the object
+ * is a 64-bit little-endian AArch64 ELF whose program-header table we can hold.
+ */
+static int ld_validate_ehdr(const Elf64_Ehdr *ehdr) {
+    if (ehdr->e_ident[ELF_EI_MAG0] != ELF_MAG0 ||
+        ehdr->e_ident[ELF_EI_MAG1] != ELF_MAG1 ||
+        ehdr->e_ident[ELF_EI_MAG2] != ELF_MAG2 ||
+        ehdr->e_ident[ELF_EI_MAG3] != ELF_MAG3) {
+        return 0;
+    }
+    if (ehdr->e_ident[ELF_EI_CLASS] != ELF_CLASS_64 ||
+        ehdr->e_ident[ELF_EI_DATA] != ELF_DATA_LE) {
+        return 0;
+    }
+    if (ehdr->e_machine != ELF_EM_AARCH64) {
+        return 0;
+    }
+    if (ehdr->e_phnum == 0 || ehdr->e_phnum > LD_MAX_PHNUM) {
+        return 0;
+    }
+    if (ehdr->e_phentsize != sizeof(Elf64_Phdr)) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Open a shared object by name, searching the standard library paths. */
+static long ld_open_object(const char *path) {
+    long fd = ld_open(path);
+    if (fd >= 0) {
+        return fd;
+    }
+
+    const char *search_paths[] = {"/lib/", "/usr/lib/", "/bin/", 0};
+    for (int i = 0; search_paths[i]; i++) {
+        char fullpath[LD_PATH_MAX];
+        unsigned long plen = ld_strlen(search_paths[i]);
+        unsigned long nlen = ld_strlen(path);
+        if (plen + nlen + 1 > LD_PATH_MAX) {
+            continue; /* would overflow fullpath */
+        }
+        ld_strcpy(fullpath, search_paths[i]);
+        ld_strcpy(fullpath + plen, path);
+        fd = ld_open(fullpath);
+        if (fd >= 0) {
+            return fd;
+        }
+    }
+    return -1;
+}
+
 static struct ld_object *ld_load_object(const char *path, unsigned long load_bias) {
     struct ld_object *existing = ld_find_object(path);
     if (existing) return existing;
+
+    ld_log("Loading object: ");
+    ld_log(path);
+    ld_log("\n");
 
     if (g_object_count >= MAX_OBJECTS) return 0;
     struct ld_object *obj = &g_objects[g_object_count++];
     ld_strcpy(obj->name, path);
 
-    long fd = ld_open(path);
+    long fd = ld_open_object(path);
     if (fd < 0) {
-        /* Try search paths: /lib/, /usr/lib/, /bin/ (for now) */
-        const char *search_paths[] = {"/lib/", "/usr/lib/", "/bin/", 0};
-        for (int i = 0; search_paths[i]; i++) {
-            char fullpath[128];
-            ld_strcpy(fullpath, search_paths[i]);
-            ld_strcpy(fullpath + ld_strlen(search_paths[i]), path);
-            fd = ld_open(fullpath);
-            if (fd >= 0) break;
-        }
-        
-        if (fd < 0) {
-            ld_puts("Failed to open object: ");
-            ld_puts(path);
-            ld_puts("\n");
-            g_object_count--;
-            return 0;
-        }
+        ld_puts("Failed to open object: ");
+        ld_puts(path);
+        ld_puts("\n");
+        g_object_count--;
+        return 0;
     }
 
     Elf64_Ehdr ehdr;
-    if (ld_read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) return 0;
+    if (ld_read(fd, &ehdr, sizeof(ehdr)) != (long)sizeof(ehdr) ||
+        !ld_validate_ehdr(&ehdr)) {
+        ld_puts("Invalid ELF object: ");
+        ld_puts(path);
+        ld_puts("\n");
+        g_object_count--;
+        return 0;
+    }
 
-    Elf64_Phdr phdr[16];
+    Elf64_Phdr phdr[LD_MAX_PHNUM];
     if (ehdr.e_phoff != sizeof(ehdr)) {
         char dummy[1024];
         ld_read(fd, dummy, ehdr.e_phoff - sizeof(ehdr));
     }
-    ld_read(fd, phdr, ehdr.e_phnum * ehdr.e_phentsize);
+    unsigned long phdr_bytes = (unsigned long)ehdr.e_phnum * ehdr.e_phentsize;
+    if (ld_read(fd, phdr, phdr_bytes) != (long)phdr_bytes) {
+        ld_puts("Failed to read program headers: ");
+        ld_puts(path);
+        ld_puts("\n");
+        g_object_count--;
+        return 0;
+    }
 
     obj->base = load_bias;
     obj->entry = ehdr.e_entry + load_bias;
     obj->dynamic = 0;
-    obj->symtab = 0;
-    obj->strtab = 0;
-    obj->hashtab = 0;
-    obj->gnu_hashtab = 0;
-    obj->init = 0;
-    obj->init_array = 0;
-    obj->init_array_sz = 0;
-    obj->jmprel = 0;
-    obj->pltrelsz = 0;
-    obj->pltgot = 0;
 
     for (int i = 0; i < ehdr.e_phnum; i++) {
         if (phdr[i].p_type == ELF_PT_LOAD) {
             int prot = 0;
-            if (phdr[i].p_flags & ELF_PF_R) prot |= 1;
-            if (phdr[i].p_flags & ELF_PF_W) prot |= 2;
-            if (phdr[i].p_flags & ELF_PF_X) prot |= 4;
+            if (phdr[i].p_flags & ELF_PF_R) prot |= LD_PROT_READ;
+            if (phdr[i].p_flags & ELF_PF_W) prot |= LD_PROT_WRITE;
+            if (phdr[i].p_flags & ELF_PF_X) prot |= LD_PROT_EXEC;
 
             unsigned long vaddr = phdr[i].p_vaddr + load_bias;
             unsigned long memsz = phdr[i].p_memsz;
             unsigned long offset = phdr[i].p_offset;
 
-            unsigned long align_vaddr = vaddr & ~0xFFFUL;
-            unsigned long align_offset = offset & ~0xFFFUL;
+            unsigned long align_vaddr = vaddr & ~LD_PAGE_MASK;
+            unsigned long align_offset = offset & ~LD_PAGE_MASK;
             unsigned long diff = vaddr - align_vaddr;
-            unsigned long align_memsz = (memsz + diff + 0xFFFUL) & ~0xFFFUL;
+            unsigned long align_memsz = (memsz + diff + LD_PAGE_MASK) & ~LD_PAGE_MASK;
 
-            ld_mmap((void *)align_vaddr, align_memsz, prot, 0, fd, align_offset);
-            
-            /* If it's a WRITE segment, zero out the padding if memsz > filesz */
-            // For now, mmap should handle zeroing if it's fresh pages, but we should be careful.
+            void *mapped = ld_mmap((void *)align_vaddr, align_memsz, prot, 0, fd, align_offset);
+            if (mapped == (void *)-1 || mapped == 0) {
+                ld_puts("mmap failed for segment in: ");
+                ld_puts(path);
+                ld_puts("\n");
+                g_object_count--;
+                return 0;
+            }
         } else if (phdr[i].p_type == ELF_PT_DYNAMIC) {
             obj->dynamic = (Elf64_Dyn *)(phdr[i].p_vaddr + load_bias);
         }
     }
 
-    /* Parse dynamic section for symbols */
-    if (obj->dynamic) {
-        for (Elf64_Dyn *d = obj->dynamic; d->d_tag != DT_NULL; d++) {
-            if (d->d_tag == DT_SYMTAB)
-                obj->symtab = (Elf64_Sym *)(d->d_un.d_ptr + load_bias);
-            else if (d->d_tag == DT_STRTAB)
-                obj->strtab = (const char *)(d->d_un.d_ptr + load_bias);
-            else if (d->d_tag == DT_HASH)
-                obj->hashtab = (Elf64_Word *)(d->d_un.d_ptr + load_bias);
-            else if (d->d_tag == DT_GNU_HASH)
-                obj->gnu_hashtab = (Elf64_Word *)(d->d_un.d_ptr + load_bias);
-            else if (d->d_tag == DT_INIT)
-                obj->init = d->d_un.d_ptr + load_bias;
-            else if (d->d_tag == DT_INIT_ARRAY)
-                obj->init_array = (unsigned long *)(d->d_un.d_ptr + load_bias);
-            else if (d->d_tag == DT_INIT_ARRAYSZ)
-                obj->init_array_sz = d->d_un.d_val;
-            else if (d->d_tag == DT_PLTGOT)
-                obj->pltgot = d->d_un.d_ptr + load_bias;
-            else if (d->d_tag == DT_JMPREL)
-                obj->jmprel = (Elf64_Rela *)(d->d_un.d_ptr + load_bias);
-            else if (d->d_tag == DT_PLTRELSZ)
-                obj->pltrelsz = d->d_un.d_val;
-        }
-    }
-
-    /* Load dependencies */
-    if (obj->dynamic) {
-        const char *strtab = 0;
-        for (Elf64_Dyn *d = obj->dynamic; d->d_tag != DT_NULL; d++) {
-            if (d->d_tag == DT_STRTAB) strtab = (const char *)(d->d_un.d_ptr + load_bias);
-        }
-
-        if (strtab) {
-            for (Elf64_Dyn *d = obj->dynamic; d->d_tag != DT_NULL; d++) {
-                if (d->d_tag == DT_NEEDED) {
-                    const char *libname = strtab + d->d_un.d_val;
-                    /* Load library at a different bias. For simplicity, just increment bias */
-                    static unsigned long next_bias = 0x5000000;
-                    ld_load_object(libname, next_bias);
-                    next_bias += 0x1000000;
-                }
-            }
-        }
-    }
+    /* Fill all DT_* table pointers, then load dependencies. */
+    ld_parse_dynamic(obj);
+    ld_load_needed(obj);
 
     return obj;
 }
@@ -334,25 +442,11 @@ static void ld_relocate_object(struct ld_object *obj) {
     if (!obj->dynamic) return;
 
     unsigned long load_bias = obj->base;
-    Elf64_Rela *rela = 0;
-    unsigned long relasz = 0;
-    unsigned long relaent = 24; /* default RELA entry size; overridden by DT_RELAENT */
-    Elf64_Rela *jmprel = 0;
-    unsigned long pltrelsz = 0;
-
-    for (Elf64_Dyn *d = obj->dynamic; d->d_tag != DT_NULL; d++) {
-        if (d->d_tag == DT_RELA) {
-            rela = (Elf64_Rela *)(d->d_un.d_ptr + load_bias);
-        } else if (d->d_tag == DT_RELASZ) {
-            relasz = d->d_un.d_val;
-        } else if (d->d_tag == DT_RELAENT) {
-            relaent = d->d_un.d_val;
-        } else if (d->d_tag == DT_JMPREL) {
-            jmprel = (Elf64_Rela *)(d->d_un.d_ptr + load_bias);
-        } else if (d->d_tag == DT_PLTRELSZ) {
-            pltrelsz = d->d_un.d_val;
-        }
-    }
+    Elf64_Rela *rela = obj->rela;
+    unsigned long relasz = obj->relasz;
+    unsigned long relaent = obj->relaent ? obj->relaent : sizeof(Elf64_Rela);
+    Elf64_Rela *jmprel = obj->jmprel;
+    unsigned long pltrelsz = obj->pltrelsz;
 
     if (rela && relasz && relaent) {
         for (unsigned long i = 0; i < relasz / relaent; i++) {
@@ -433,12 +527,49 @@ static void ld_relocate_object(struct ld_object *obj) {
     }
 }
 
+static void ld_log_hex(unsigned long val) {
+    if (!g_debug) return;
+    char buf[17];
+    char *digits = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) {
+        buf[i] = digits[val & 0xf];
+        val >>= 4;
+    }
+    buf[16] = 0;
+    ld_puts("0x");
+    ld_puts(buf);
+}
+
+static struct ld_object *ld_init_object_from_phdr(const char *name, Elf64_Phdr *phdr, int phnum, unsigned long load_bias) {
+    if (g_object_count >= MAX_OBJECTS) return 0;
+    if (phnum <= 0 || phnum > LD_MAX_PHNUM) return 0;
+
+    struct ld_object *obj = &g_objects[g_object_count++];
+    ld_strcpy(obj->name, name);
+
+    obj->base = load_bias;
+    obj->dynamic = 0;
+
+    /* Segments are already mapped (by the kernel or a prior mmap); just locate
+     * the dynamic section so ld_parse_dynamic() can fill the table pointers. */
+    for (int i = 0; i < phnum; i++) {
+        if (phdr[i].p_type == ELF_PT_DYNAMIC) {
+            obj->dynamic = (Elf64_Dyn *)(phdr[i].p_vaddr + load_bias);
+        }
+    }
+
+    ld_parse_dynamic(obj);
+    ld_load_needed(obj);
+
+    return obj;
+}
+
 __attribute__((visibility("hidden")))
 unsigned long ld_load_elf(const char *path, unsigned long *load_bias_out) {
     /* Reset state */
     g_object_count = 0;
 
-    struct ld_object *main_obj = ld_load_object(path, 0x4000000);
+    struct ld_object *main_obj = ld_load_object(path, LD_MAIN_LOAD_BASE);
     if (!main_obj) return 0;
 
     *load_bias_out = main_obj->base;
@@ -462,61 +593,132 @@ void ld_main(void *stack) {
     char **argv = (char **)((unsigned long *)stack + 1);
     char **envp = argv + argc + 1;
     
-    /* Find Auxv and check Env */
-    const char *ld_lib_path = 0;
+    /* Find Auxv and check environment */
     char **p = envp;
     while (*p) {
-        if (ld_strncmp(*p, "LD_LIBRARY_PATH=", 16) == 0) {
-            ld_lib_path = *p + 16;
+        if (ld_strncmp(*p, "LD_DEBUG=", 9) == 0) {
+            g_debug = 1;
         }
         p++;
     }
     Elf64_auxv_t *auxv = (Elf64_auxv_t *)(p + 1);
     
     const char *app_path = 0;
+    Elf64_Phdr *app_phdr = 0;
+    int app_phnum = 0;
+    unsigned long app_entry = 0;
+    unsigned long interp_base = 0;
+
     for (Elf64_auxv_t *a = auxv; a->a_type != AT_NULL; a++) {
         if (a->a_type == AT_EXECFN) app_path = (const char *)a->a_val;
+        if (a->a_type == AT_PHDR) app_phdr = (Elf64_Phdr *)a->a_val;
+        if (a->a_type == AT_PHNUM) app_phnum = (int)a->a_val;
+        if (a->a_type == AT_ENTRY) app_entry = a->a_val;
+        if (a->a_type == AT_BASE) interp_base = a->a_val;
     }
 
-    ld_puts("Dynamic Linker started!\n");
-    if (ld_lib_path) {
-        ld_puts("LD_LIBRARY_PATH: ");
-        ld_puts(ld_lib_path);
-        ld_puts("\n");
-    }
+    ld_log("Dynamic Linker started!\n");
 
-    if (app_path && ld_strcmp(app_path, "/lib/ld.so") != 0) {
-        ld_puts("Loading application: ");
-        ld_puts(app_path);
-        ld_puts("\n");
-    } else {
-        if (!app_path) ld_puts("Warning: AT_EXECFN not found, using default.\n");
-        else ld_puts("Linker standalone mode, loading default app.\n");
-        app_path = "/bin/hello.elf";
-    }
+    unsigned long entry_point = 0;
 
-    /* 
-     * In a real OS, ld.so would get the path to the app from the kernel 
-     * via Aux vectors or argv. 
+    /*
+     * Linux-style: AT_BASE != 0 means the kernel loaded us as an interpreter
+     * for another ELF. The app's segments are already mapped. We just need to:
+     *   1. Find the app's load_bias via AT_PHDR
+     *   2. Load dependencies (DT_NEEDED) via mmap
+     *   3. Perform relocations
+     *   4. Jump to AT_ENTRY
      */
-    unsigned long load_bias = 0;
-    unsigned long entry = ld_load_elf(app_path, &load_bias);
+    if (interp_base != 0 && app_phdr && app_phnum > 0 && app_entry != 0) {
+        /* 
+         * Compute app's load_bias from AT_PHDR.
+         * With the PT_PHDR segment (SIZEOF_HEADERS layout), AT_PHDR points
+         * to the PHDR table at link-time vaddr 0x40 within the ELF file.
+         */
+        unsigned long app_load_bias = 0;
 
-    if (entry == 0) {
-        ld_puts("Failed to load: ");
-        ld_puts(app_path);
-        ld_puts("\n");
+        /* Method 1: Find PT_PHDR segment - p_vaddr is its link-time address */
+        for (int i = 0; i < app_phnum; i++) {
+            if (app_phdr[i].p_type == ELF_PT_PHDR) {
+                app_load_bias = (unsigned long)app_phdr - app_phdr[i].p_vaddr;
+                break;
+            }
+        }
+
+        /* Method 2: The PHDR table is always at e_phoff=0x40 from the ELF header.
+         * Since the ELF header is at vaddr 0, AT_PHDR = load_bias + 0x40.
+         * So load_bias = AT_PHDR_va - 0x40.
+         */
+        if (app_load_bias == 0) {
+            Elf64_Ehdr *ehdr = (Elf64_Ehdr *)((unsigned long)app_phdr - 64);
+            if (ehdr->e_ident[0] == 0x7f && ehdr->e_ident[1] == 'E') {
+                app_load_bias = (unsigned long)ehdr;
+            }
+        }
+
+        ld_log("App: ");
+        if (app_path) ld_log(app_path);
+        ld_log(" bias=");
+        ld_log_hex(app_load_bias);
+        ld_log(" interp=");
+        ld_log_hex(interp_base);
+        ld_log("\n");
+
+        /* Initialize object list */
+        g_object_count = 0;
+
+        /* Register main app (already mapped by kernel) */
+        struct ld_object *main_obj = ld_init_object_from_phdr(
+            app_path ? app_path : "main", app_phdr, app_phnum, app_load_bias);
+
+        if (main_obj) {
+            /* Register ld.so itself (for symbol lookup by the app/libs) */
+            Elf64_Ehdr *interp_ehdr = (Elf64_Ehdr *)interp_base;
+            Elf64_Phdr *interp_phdr = (Elf64_Phdr *)(interp_base + interp_ehdr->e_phoff);
+            ld_init_object_from_phdr("ld.so", interp_phdr, interp_ehdr->e_phnum, interp_base);
+
+            /* Relocate all objects (app + its DT_NEEDED libs) */
+            for (int i = 0; i < g_object_count; i++) {
+                ld_relocate_object(&g_objects[i]);
+            }
+
+            /* Call init routines (dependencies first, then app) */
+            for (int i = g_object_count - 1; i >= 0; i--) {
+                ld_call_init(&g_objects[i]);
+            }
+
+            entry_point = app_entry;
+        }
+    } else {
+        /*
+         * Fallback / standalone mode:
+         * - AT_BASE == 0: ld.so was invoked directly (not as interpreter)
+         * - No auxv: older kernel or static load
+         * Manually load the app from the filesystem.
+         */
+        if (!app_path || ld_strcmp(app_path, "/lib/ld.so") == 0) {
+            ld_log("Standalone mode, loading default app.\n");
+            app_path = "/bin/hello.elf";
+        }
+        ld_log("Loading: ");
+        ld_log(app_path);
+        ld_log("\n");
+        unsigned long bias = 0;
+        entry_point = ld_load_elf(app_path, &bias);
+    }
+
+    if (entry_point == 0) {
+        ld_puts("Failed to load application.\n");
         ld_exit(1);
     }
 
-    ld_puts("App loaded successfully! Jumping to entry point...\n");
+    ld_log("Jumping to entry...\n");
 
-    /* Jump to entry point */
-    /* We need to pass the original stack to the app */
+    /* Restore original stack pointer and jump to app entry */
     asm volatile (
         "mov sp, %1\n"
         "br %0\n"
-        : : "r"(entry), "r"(stack) : "memory"
+        : : "r"(entry_point), "r"(stack) : "memory"
     );
 
     while(1);
