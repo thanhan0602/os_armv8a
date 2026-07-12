@@ -16,6 +16,7 @@
 - [Process](document/handoff_process.md)
 - [Timer](document/handoff_timer.md)
 - [Filesystem](document/handoff_fs.md)
+- [Mutex](document/handoff_mutex.md)
 
 ## Mục tiêu của repo
 
@@ -98,6 +99,12 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
   - runtime verify mới nhất: `receive /ext/ticker.elf 8496` nhận file ELF ngoài thành công, `read /ext/ticker.elf 32` trả ELF header hợp lệ, `load /ext/ticker.elf ticker` spawn task user chạy `[user-ticker] tick`, và `unload 2` reap task sạch (`ps` chỉ còn idle)
   - user ELF hiện đã chuyển sang `ET_DYN`/PIE thay vì `ET_EXEC`; loader chọn load bias theo từng process trong user image window, nên app không còn phụ thuộc vào VMA link cứng như `0x10000`
   - `process_create_from_elf()` hiện map PT_LOAD tại `load_bias + p_vaddr`, cộng `load_bias` vào `e_entry`, và nếu có `R_AARCH64_RELATIVE` trong `PT_DYNAMIC` thì áp relocation tối thiểu trong kernel trước khi task chạy
+- **Stage 14 (Synchronization & Mutex)** — hoàn thành và verify trên QEMU:
+  - Thêm `struct mutex` trong [src/kernel/mutex.c](src/kernel/mutex.c) hỗ trợ sleep-based blocking.
+  - Hỗ trợ SMP-safe mutex bằng cách dùng spinlock bảo vệ wait-queue nội bộ.
+  - Thêm syscall `SYS_MUTEX_LOCK` (500) và `SYS_MUTEX_UNLOCK` (501).
+  - Cung cấp `pthread.h` trong [user/include/pthread.h](user/include/pthread.h) với API `pthread_mutex_lock` và `pthread_mutex_unlock`.
+  - Verification suite trong [src/kernel/mutex_test.c](src/kernel/mutex_test.c) pass trên cả 4 cores.
   - heap của ELF process không còn cố định ở `0x00040000`; `brk(0)` giờ bắt đầu ngay sau image đã map, có một page guard giữa image và heap
 - **Stage 14 (Lazy Loading & Copy-on-Write)** — hoàn thành và verify trên QEMU:
   - Chuyển đổi từ mô hình nạp code "eager" (copy toàn bộ vào RAM ngay khi nạp) sang "Lazy Loading" (Demand Paging).

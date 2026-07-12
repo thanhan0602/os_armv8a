@@ -55,6 +55,7 @@ struct task {
     unsigned long parent_id;
     int exit_status;
     struct task *next;
+    struct task *wait_next;
     struct file *files[MAX_FILES_PER_TASK];
 };
 

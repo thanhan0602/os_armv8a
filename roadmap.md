@@ -279,6 +279,12 @@ Current behavior:
 - The receiver sleeps inside `SYS_IPC_RECV` until the sender posts a message, then resumes and exits cleanly
 - Both IPC demo tasks now exit without the post-wakeup EL0 stack corruption that existed before `SP_EL0` was preserved across task switches
 
+Implemented (third increment — blocking Mutex):
+- Added `struct mutex` in `src/include/kernel/mutex.h` and `src/kernel/mutex.c`
+- Implemented `mutex_lock` and `mutex_unlock` with wait-queue support using `task->wait_next`
+- Mutex operations are SMP-safe using internal spinlocks and `irqsave/irqrestore`
+- Verified by spawning multiple kernel tasks on different cores competing for a shared variable with deliberate delays
+
 ### Stage 12: Filesystem And Program Loading
 
 Status: completed
@@ -426,7 +432,50 @@ Current behavior:
 - Shell runs on CPU 0 but can interact with tasks on other cores.
 - Preemptive multitasking works across all cores using independent timers.
 
-### Stage 17: Swap to Disk & Advanced VFS (Next Steps)
+### Stage 17: Process Lifecycle & Execve
+
+Status: completed
+
+Goals:
+- Implement `execve` syscall for process image replacement
+- Support reloading ELF images into an existing task context
+- Ensure architectural consistency during address space transitions
+
+Implemented:
+- **Execve Syscall:** Added `SYS_EXECVE=221` and `process_execve` in `src/kernel/process.c`. This replaces the current task's memory space, parses a new ELF, and sets up a fresh stack/entry point.
+- **Architectural Safety:** Fixed a critical bug where `task->process` wasn't updated alongside `task->mm`, causing kernel panic in the page fault handler during transitions.
+- **MMU Refactor:** Unified table allocation (`mmu_alloc_sub_table`) and fixed a descriptor bug where kernel VAs were incorrectly stored in place of PAs.
+- **Runtime Verified:** `test_exec.elf` successfully loads `/bin/hello.elf` via syscall, prints its message, and terminates without corrupting the kernel.
+
+### Stage 18: Enhanced User Runtime & Linker
+
+Status: in-progress
+
+Goals:
+- Move ELF loading and symbol resolution to user-space (`ld.so`)
+- Support environment variables and `LD_DEBUG`
+- Document and implement AArch64-specific PLT resolution
+
+Implemented:
+- **Linker Debugging:** Added `LD_DEBUG` environment support in the dynamic linker (`user/linker/ld_main.c`) for tracing symbol resolution.
+- **ABI Documentation:** Documented the 80-byte stack frame requirements for the AArch64 PLT resolver to preserve all volatile registers (x0-x9).
+
+### Stage 19: Synchronization & Pthread API
+
+Status: completed
+
+Goals:
+- Implement sleep-based Mutexes to replace spinlocks for long-duration critical sections
+- Support SMP-safe locking with wait-queues and task blocking
+- Provide a POSIX-like `pthread` API for user-space synchronization
+
+Implemented:
+- **Blocking Mutex:** Added `struct mutex` in [src/include/kernel/mutex.h](src/include/kernel/mutex.h) and implementation in [src/kernel/mutex.c](src/kernel/mutex.c). Uses a linked-list wait queue (`task->wait_next`) to manage sleeping tasks.
+- **Syscall Interface:** Added `SYS_MUTEX_LOCK` (500) and `SYS_MUTEX_UNLOCK` (501) in [src/include/kernel/syscall.h](src/include/kernel/syscall.h).
+- **User-space API:** Created [user/include/pthread.h](user/include/pthread.h) providing `pthread_mutex_lock` and `pthread_mutex_unlock`.
+- **SMP Safety:** Mutex internals are protected by spinlocks with IRQ disabling, ensuring correctness across multiple CPU cores.
+
+### Stage 20: Swap to Disk & Advanced VFS (Next Steps)
 
 Status: planned
 

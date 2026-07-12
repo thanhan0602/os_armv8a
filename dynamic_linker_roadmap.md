@@ -53,6 +53,7 @@ Chúng ta sẽ thực hiện theo lộ trình từ đơn giản đến phức t�
     - Tách logic xử lý ELF từ `src/kernel/process.c` ra một ứng dụng user-space mới mang tên `ld.so`.
     - Kernel chỉ cần nạp `ld.so` và truyền thông tin về app chính qua stack (AUX Vectors).
     - `ld.so` thực hiện nạp thư viện và relocation ở quyền người dùng.
+- **Tiến độ**: Đã triển khai khung sườn cho `ld_main.c` và cơ chế `LD_DEBUG` để trace quá trình resolution.
 
 ### Bước 5: Lazy Binding (PLT Resolution)
 - **Mục tiêu**: Tối ưu hóa tốc độ khởi động bằng cách chỉ resolve hàm khi được gọi lần đầu.
@@ -60,6 +61,7 @@ Chúng ta sẽ thực hiện theo lộ trình từ đơn giản đến phức t�
     - Hiện thực `_dl_runtime_resolve` bằng Assembly.
     - Cài đặt địa chỉ của hàm resolver này vào GOT[2].
     - Khi một hàm PLT được gọi lần đầu, nó sẽ nhảy vào resolver để tìm địa chỉ thật và cập nhật GOT.
+- **Cập nhật kỹ thuật**: Đã xác định và tài liệu hóa Stack Frame (80 bytes) cần thiết để bảo toàn các thanh ghi tham số và trả về (x0-x9) trong quá trình nhảy vào resolver.
 
 ### Bước 6: API cho lập trình viên (dlopen, dlsym)
 - **Mục tiêu**: Cho phép ứng dụng nạp thư viện khi đang chạy.

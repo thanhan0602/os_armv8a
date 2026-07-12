@@ -17,6 +17,7 @@
 #include <kernel/spinlock.h>
 #include <kernel/timer.h>
 #include <kernel/vm.h>
+#include <kernel/mutex.h>
 #include <arch/arm/cpu.h>
 
 #include <arch/arm/psci.h>
@@ -35,10 +36,11 @@ struct boot_service {
 };
 
 static const struct boot_service boot_services[] = {
-    {"/bin/hello.elf",      "user-a",   1},
-    {"/bin/fault.elf",      "user-b",   1},
-    {"/bin/test_cow.elf",   "user-cow", 1},
-    {"/bin/cpu_stress.elf", "stress",   4},
+    {"/bin/test_lazy.elf",  "test-lazy", 1},
+    // {"/bin/hello.elf",      "user-a",   1},
+    // {"/bin/fault.elf",      "user-b",   1},
+    // {"/bin/test_cow.elf",   "user-cow", 1},
+    // {"/bin/cpu_stress.elf", "stress",   4},
     {(const char *)0, (const char *)0, 0}
 };
 

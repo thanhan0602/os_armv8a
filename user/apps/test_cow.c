@@ -6,8 +6,8 @@
 static unsigned long shared_data = 0x12345678;
 
 int main(void) {
-    printf("[cow:%d] --- CoW Test Start ---\n", getpid());
-    printf("[cow:%d] Initial shared_data = 0x%lx at 0x%lx\n", getpid(), shared_data, (unsigned long)&shared_data);
+    // printf("[cow:%d] --- CoW Test Start ---\n", getpid());
+    // printf("[cow:%d] Initial shared_data = 0x%lx at 0x%lx\n", getpid(), shared_data, (unsigned long)&shared_data);
 
     long pid = fork();
 
@@ -16,18 +16,18 @@ int main(void) {
         exit(1);
     } else if (pid == 0) {
         /* Child */
-        printf("[cow:%d] Child: Updating shared_data to 0xdeadbeef\n", getpid());
+        // printf("[cow:%d] Child: Updating shared_data to 0xdeadbeef\n", getpid());
         shared_data = 0xdeadbeef;
-        printf("[cow:%d] Child: shared_data = 0x%lx\n", getpid(), shared_data);
+        // printf("[cow:%d] Child: shared_data = 0x%lx\n", getpid(), shared_data);
         exit(0);
     } else {
         /* Parent */
-        printf("[cow:%d] Parent: Waiting for child PID=%ld\n", getpid(), pid);
+        // printf("[cow:%d] Parent: Waiting for child PID=%ld\n", getpid(), pid);
         
         int status = -1;
         long waited_pid = wait(&status);
         
-        printf("[cow:%d] Parent: Child %ld exited with status %d\n", getpid(), waited_pid, status);
+        printf("[cow:%d] Parent: Child PID=%ld CoW test finished\n", getpid(), waited_pid);
 
         printf("[cow:%d] Parent: Checking shared_data...\n", getpid());
         printf("[cow:%d] Parent: shared_data = 0x%lx\n", getpid(), shared_data);

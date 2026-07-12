@@ -19,9 +19,9 @@
                     "ignoreFailures": true
                 },
                 {
-                    "description": "Load kernel symbols at TTBR1 high VA",
-                    "text": "add-symbol-file ${workspaceFolder}/build/kernel8.elf -o 0xFFFF000000000000",
-                    "ignoreFailures": false
+                    "description": "Load kernel symbols at physical address (for early boot)",
+                    "text": "add-symbol-file ${workspaceFolder}/build/kernel8.elf 0x40080000",
+                    "ignoreFailures": true
                 }
             ],
             "preLaunchTask": "Start QEMU Debug"

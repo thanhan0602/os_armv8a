@@ -14,6 +14,11 @@
 #define USER_SYS_NANOSLEEP 101UL
 #define USER_SYS_IPC_SEND  451UL
 #define USER_SYS_IPC_RECV  452UL
+#define USER_SYS_MUTEX_INIT    502UL
+#define USER_SYS_MUTEX_DESTROY 503UL
+#define USER_SYS_MUTEX_LOCK   500UL
+#define USER_SYS_MUTEX_UNLOCK 501UL
+#define USER_SYS_MUTEX_TRYLOCK 504UL
 
 #define USER_IPC_MESSAGE_MAX  64UL
 
@@ -97,6 +102,31 @@ static inline long user_exit(unsigned long code)
 static inline unsigned long user_brk(unsigned long new_break)
 {
     return (unsigned long)user_syscall1(USER_SYS_BRK, new_break);
+}
+
+static inline void user_mutex_lock(int mutex_id)
+{
+    user_syscall1(USER_SYS_MUTEX_LOCK, (unsigned long)mutex_id);
+}
+
+static inline void user_mutex_unlock(int mutex_id)
+{
+    user_syscall1(USER_SYS_MUTEX_UNLOCK, (unsigned long)mutex_id);
+}
+
+static inline int user_mutex_trylock(int mutex_id)
+{
+    return (int)user_syscall1(USER_SYS_MUTEX_TRYLOCK, (unsigned long)mutex_id);
+}
+
+static inline int user_mutex_init(void)
+{
+    return (int)user_syscall0(USER_SYS_MUTEX_INIT);
+}
+
+static inline void user_mutex_destroy(int mutex_id)
+{
+    user_syscall1(USER_SYS_MUTEX_DESTROY, (unsigned long)mutex_id);
 }
 
 static inline long user_munmap(void *addr, unsigned long len)

@@ -4,7 +4,7 @@
 int main(void)
 {
     for (;;) {
-        printf("[user-ticker] tick\n");
+        // printf("[user-ticker] tick\n");
         yield();
     }
 }

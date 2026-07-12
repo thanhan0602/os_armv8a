@@ -634,7 +634,7 @@ static void process_populate_arg_stack(struct process *process, const char *path
         kstack[ksp] = 0U;
     }
 
-    const char *env_str = "LD_LIBRARY_PATH=/lib";
+    const char *env_str = "LD_DEBUG=1";
     unsigned long env_len = 0;
     while (env_str[env_len]) env_len++;
     ksp -= (env_len + 1);

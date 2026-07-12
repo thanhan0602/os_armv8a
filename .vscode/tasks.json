@@ -32,7 +32,7 @@
             ],
             "options": {
                 "env": {
-                    "QEMU_BIN": "/home/a/qemu/build/qemu-system-aarch64"
+                    "QEMU_BIN": "/home/a/qemu/build"
                 }
             },
             "problemMatcher": {
@@ -85,7 +85,7 @@
             "label": "Inspector: Start QEMU with Monitor",
             "type": "shell",
             "isBackground": true,
-            "command": "/home/a/qemu/build/qemu-system-aarch64",
+            "command": "${env:QEMU_BIN}/qemu-system-aarch64",
             "args": [
                 "-machine", "virt,gic-version=2",
                 "-cpu", "max",

@@ -23,7 +23,11 @@
 #define SYS_NANOSLEEP 101UL
 #define SYS_IPC_SEND  451UL
 #define SYS_IPC_RECV  452UL
-
+#define SYS_MUTEX_INIT    502UL
+#define SYS_MUTEX_DESTROY 503UL
+#define SYS_MUTEX_LOCK   500UL
+#define SYS_MUTEX_UNLOCK 501UL
+#define SYS_MUTEX_TRYLOCK 504UL
 /*
  * Dispatch a syscall from EL0.
  *

@@ -19,7 +19,7 @@ LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -static -no-pie -Wl,--build-id
 USER_CFLAGS := -Wall -Wextra -O2 -g -ffreestanding -fno-builtin -fpie -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables -I$(USER_DIR)/include -MMD -MP
 USER_ASFLAGS := -g -ffreestanding -I$(USER_DIR)/include -MMD -MP
 USER_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 -T $(USER_LINKER_SCRIPT)
-USER_DYNAMIC_APP_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie -Wl,--build-id=none -Wl,--dynamic-linker,/lib/ld.so -Wl,-z,max-page-size=0x1000 -T $(USER_LINKER_SCRIPT)
+USER_DYNAMIC_APP_LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie -Wl,--build-id=none -Wl,--dynamic-linker,/lib/ld.so -Wl,-z,max-page-size=0x1000 -Wl,-z,lazy -T $(USER_LINKER_SCRIPT)
 
 USER_LIBC_SOURCES := $(shell find $(USER_DIR)/lib/libc -type f -name '*.c')
 USER_LIBC_OBJECTS := $(patsubst $(USER_DIR)/lib/libc/%.c,$(BUILD_DIR)/user/lib/libc/%_c.o,$(USER_LIBC_SOURCES))
@@ -27,10 +27,11 @@ USER_LIBC_A := $(BUILD_DIR)/user/lib/libc.a
 USER_LIBC_SO := $(BUILD_DIR)/user/lib/libc.so
 USER_LINKER_SO := $(BUILD_DIR)/user/lib/ld.so
 
-USER_BUILTIN_APPS := hello fault ipc_recv ipc_send test_cow test_str cpu_stress simple test_exec
+USER_BUILTIN_APPS := hello fault ipc_recv ipc_send test_cow test_str cpu_stress simple test_exec test_lazy test_mutex test_pthread
 USER_EXTERNAL_APPS := ticker shared_client
 USER_BUILTIN_LIBS := c
-USER_LINKER_OBJECTS := $(BUILD_DIR)/user/linker/ld_start_s.o $(BUILD_DIR)/user/linker/ld_main_c.o
+USER_LINKER_OBJECTS := $(BUILD_DIR)/user/linker/ld_start_s.o \
+                       $(BUILD_DIR)/user/linker/ld_main_c.o
 USER_COMMON_OBJECT := $(BUILD_DIR)/user/common/start_s.o
 USER_BUILTIN_ELFS := $(addprefix $(BUILD_DIR)/user/builtin/,$(addsuffix .elf,$(USER_BUILTIN_APPS)))
 USER_EXTERNAL_ELFS := $(addprefix $(BUILD_DIR)/user/external/,$(addsuffix .elf,$(USER_EXTERNAL_APPS)))

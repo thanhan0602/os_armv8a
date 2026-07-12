@@ -8,6 +8,7 @@
 #include <kernel/fs.h>
 #include <kernel/ramfs.h>
 #include <kernel/heap.h>
+#include <kernel/mutex.h>
 #include <arch/arm/cpu.h>
 
 /*
@@ -405,6 +406,33 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
     case SYS_IPC_RECV:
         ret = sys_ipc_recv(ctx->gpr[0], ctx->gpr[1], ctx->gpr[2]);
         break;
+    case SYS_MUTEX_INIT:
+        ret = (unsigned long)mutex_pool_alloc();
+        break;
+    case SYS_MUTEX_DESTROY:
+        mutex_pool_free((int)ctx->gpr[0]);
+        ret = 0UL;
+        break;
+    case SYS_MUTEX_LOCK:
+    {
+        struct mutex *m = mutex_pool_get((int)ctx->gpr[0]);
+        if (m) mutex_lock(m);
+        ret = 0UL;
+        break;
+    }
+    case SYS_MUTEX_UNLOCK:
+    {
+        struct mutex *m = mutex_pool_get((int)ctx->gpr[0]);
+        if (m) mutex_unlock(m);
+        ret = 0UL;
+        break;
+    }
+    case SYS_MUTEX_TRYLOCK:
+    {
+        struct mutex *m = mutex_pool_get((int)ctx->gpr[0]);
+        ret = m ? (unsigned long)mutex_trylock(m) : 0UL;
+        break;
+    }
     case SYS_NANOSLEEP:
         ret = sys_nanosleep(ctx->gpr[0]);
         break;

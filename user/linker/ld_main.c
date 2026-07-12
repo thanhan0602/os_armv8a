@@ -457,25 +457,25 @@ static void ld_relocate_object(struct ld_object *obj) {
 
             if (type == R_AARCH64_RELATIVE) {
                 *addr = r->r_addend + load_bias;
-            } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
+            } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_ABS64) {
                 if (obj->symtab && obj->strtab) {
                     const char *symname = obj->strtab + obj->symtab[sym_idx].st_name;
                     unsigned long symval = ld_lookup_symbol(symname);
                     if (symval) {
                         *addr = symval + r->r_addend;
-                    } else if (type == R_AARCH64_JUMP_SLOT) {
-                        /* 
-                         * For Lazy binding: If symbol is not found yet, 
-                         * we MUST still add the load_bias to the GOT entry 
-                         * because it points to the PLT, which is shifted.
-                         */
-                        *addr += load_bias;
                     } else {
                         ld_puts("Symbol not found: ");
                         ld_puts(symname);
                         ld_puts("\n");
                     }
                 }
+            } else if (type == R_AARCH64_JUMP_SLOT) {
+                /* 
+                 * For Lazy binding: We MUST add the load_bias to the GOT entry 
+                 * because it points to the PLT stub, which is shifted.
+                 * This is done for all JUMP_SLOTs initially.
+                 */
+                *addr += load_bias;
             }
         }
     }
@@ -589,13 +589,14 @@ unsigned long ld_load_elf(const char *path, unsigned long *load_bias_out) {
 
 __attribute__((visibility("hidden")))
 void ld_main(void *stack) {
-    long argc = *(long *)stack;
+    g_debug = 1; // Force debug for now to confirm it works
+    long argc = *(unsigned long *)stack;
     char **argv = (char **)((unsigned long *)stack + 1);
     char **envp = argv + argc + 1;
     
     /* Find Auxv and check environment */
     char **p = envp;
-    while (*p) {
+    while (p && *p) {
         if (ld_strncmp(*p, "LD_DEBUG=", 9) == 0) {
             g_debug = 1;
         }
