@@ -2,6 +2,7 @@
 #define KERNEL_PROCESS_H
 
 #include <kernel/vm.h>
+#include <kernel/spinlock.h>
 
 #define PROCESS_VM_REGIONS_MAX 16
 
@@ -10,6 +11,14 @@ enum vm_type {
     VM_TYPE_ELF,
     VM_TYPE_HEAP,
 };
+
+/* Clone flags (subset of Linux) */
+#define CLONE_VM        0x00000100
+#define CLONE_FS        0x00000200
+#define CLONE_FILES     0x00000400
+#define CLONE_SIGHAND   0x00000800
+#define CLONE_THREAD    0x00010000
+#define CLONE_SETTLS    0x00080000
 
 struct vm_region {
     unsigned long start;
@@ -41,14 +50,17 @@ struct process {
     unsigned int owned_image_count;
 
     unsigned long user_sp;
+    struct spinlock lock;
+    unsigned int ref_count;   /* number of tasks (threads) sharing this process */
 };
 
-struct process *process_create_from_buffer(const unsigned char *code, unsigned long code_size);
-struct process *process_create_from_elf(const unsigned char *image, unsigned long image_size, const char *path);
 struct process *process_create_from_image(char *code_start, char *code_end);
+struct process *process_create_from_elf(const unsigned char *image, unsigned long image_size, const char *path);
 void process_destroy(struct process *process);
 unsigned long process_brk(struct process *process, unsigned long new_break);
+unsigned long process_clone(unsigned long flags, unsigned long stack, unsigned long tls, struct exception_context *ctx);
 unsigned long process_fork(struct exception_context *ctx);
+unsigned long process_thread_create(struct exception_context *ctx);
 unsigned long process_execve(const char *filename, char *const argv[], char *const envp[], struct exception_context *ctx);
 int process_add_region(struct process *process,
                       unsigned long start, unsigned long end,

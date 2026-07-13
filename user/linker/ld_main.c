@@ -14,6 +14,8 @@
 #define LD_PAGE_MASK        0xFFFUL
 
 static int g_debug = 0;
+static int g_ld_lock = -1;
+static unsigned long ld_lookup_symbol_internal(const char *name);
 
 static void ld_log(const char *msg) {
     if (g_debug) ld_puts(msg);
@@ -119,7 +121,18 @@ static void ld_load_needed(struct ld_object *obj) {
 
 __attribute__((visibility("hidden")))
 unsigned long ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va) {
-    if (!obj || !obj->jmprel) return 0;
+    if (g_ld_lock != -1) ld_mutex_lock(g_ld_lock);
+    
+    /* Double-check if already resolved by another thread while we were waiting for the lock */
+    /* Only do this if we can know what the original value was. 
+     * Usually it points back to PLT0 or a specific resolver stub.
+     * But we can just redo the resolution, it's fairly safe as it's idempotent.
+     */
+
+    if (!obj || !obj->jmprel) {
+        if (g_ld_lock != -1) ld_mutex_unlock(g_ld_lock);
+        return 0;
+    }
     
     /* Find the relocation entry that corresponds to this GOT address */
     Elf64_Rela *rel = 0;
@@ -130,7 +143,10 @@ unsigned long ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va
         }
     }
 
-    if (!rel) return 0;
+    if (!rel) {
+        if (g_ld_lock != -1) ld_mutex_unlock(g_ld_lock);
+        return 0;
+    }
 
     unsigned int sym_idx = ELF64_R_SYM(rel->r_info);
     const char *symname = obj->strtab + obj->symtab[sym_idx].st_name;
@@ -139,10 +155,11 @@ unsigned long ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va
     ld_log(symname);
     ld_log("\n");
 
-    unsigned long addr = ld_lookup_symbol(symname);
+    unsigned long addr = ld_lookup_symbol_internal(symname);
     if (addr) {
         /* Update GOT entry patch the address */
         *got_entry_va = addr + rel->r_addend;
+        if (g_ld_lock != -1) ld_mutex_unlock(g_ld_lock);
         return *got_entry_va;
     }
 
@@ -155,6 +172,7 @@ unsigned long ld_lazy_resolve(struct ld_object *obj, unsigned long *got_entry_va
     ld_puts(symname);
     ld_puts("\n");
     ld_exit(127);
+    if (g_ld_lock != -1) ld_mutex_unlock(g_ld_lock);
     return 0;
 }
 
@@ -402,7 +420,7 @@ static unsigned long ld_lookup_gnu_hash(struct ld_object *obj, const char *name)
     return 0;
 }
 
-static unsigned long ld_lookup_symbol(const char *name) {
+static unsigned long ld_lookup_symbol_internal(const char *name) {
     /* Check cache first */
     for (int i = 0; i < SYMBOL_CACHE_SIZE; i++) {
         if (g_sym_cache[i].name && ld_strcmp(g_sym_cache[i].name, name) == 0) {
@@ -422,6 +440,13 @@ static unsigned long ld_lookup_symbol(const char *name) {
         }
     }
     return 0;
+}
+
+static unsigned long ld_lookup_symbol(const char *name) {
+    if (g_ld_lock != -1) ld_mutex_lock(g_ld_lock);
+    unsigned long addr = ld_lookup_symbol_internal(name);
+    if (g_ld_lock != -1) ld_mutex_unlock(g_ld_lock);
+    return addr;
 }
 
 static void ld_call_init(struct ld_object *obj) {
@@ -590,6 +615,7 @@ unsigned long ld_load_elf(const char *path, unsigned long *load_bias_out) {
 __attribute__((visibility("hidden")))
 void ld_main(void *stack) {
     g_debug = 1; // Force debug for now to confirm it works
+    g_ld_lock = ld_mutex_init();
     long argc = *(unsigned long *)stack;
     char **argv = (char **)((unsigned long *)stack + 1);
     char **envp = argv + argc + 1;

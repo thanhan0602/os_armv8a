@@ -23,6 +23,9 @@ switch_context:
     stp x29, x30, [x0, #80]
     mov x9, sp
     str x9, [x0, #96]
+    /* Save EL0 thread pointer (TLS) — user code may have modified it */
+    mrs x9, tpidr_el0
+    str x9, [x0, #104]
 
     /* Restore callee-saved regs from new context (x1) */
     ldp x19, x20, [x1, #0]
@@ -33,6 +36,9 @@ switch_context:
     ldp x29, x30, [x1, #80]
     ldr x9, [x1, #96]
     mov sp, x9
+    /* Restore EL0 thread pointer (TLS) for the incoming task */
+    ldr x9, [x1, #104]
+    msr tpidr_el0, x9
 
     ret
 
@@ -80,11 +86,10 @@ el0_entry_trampoline:
     bl sched_new_task_kickoff
     msr     elr_el1, x19        /* EL0 program counter */
     msr     sp_el0,  x20        /* EL0 stack pointer */
-    mov     x0,  xzr
-    msr     spsr_el1, x0        /* EL0t mode, DAIF=0 (all interrupts enabled) */
+    mov     x0,      x21        /* EL0 entry argument if thread, else 0 */
+    msr     spsr_el1, xzr       /* EL0t mode, DAIF=0 (all interrupts enabled) */
     isb
     /* Zero all caller-visible registers so user code starts clean. */
-    mov     x0,  xzr
     mov     x1,  xzr
     mov     x2,  xzr
     mov     x3,  xzr

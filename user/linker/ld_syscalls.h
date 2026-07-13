@@ -73,6 +73,22 @@ static inline void ld_exit(int code) {
     );
 }
 
+static inline int ld_mutex_init(void) {
+    long ret;
+    asm volatile ("mov x8, #502\n svc #0\n mov %0, x0\n" : "=r"(ret) :: "x0", "x8");
+    return (int)ret;
+}
+static inline int ld_mutex_lock(int id) {
+    long ret;
+    asm volatile ("mov x0, %1\n mov x8, #500\n svc #0\n mov %0, x0\n" : "=r"(ret) : "r"((long)id) : "x0", "x8");
+    return (int)ret;
+}
+static inline int ld_mutex_unlock(int id) {
+    long ret;
+    asm volatile ("mov x0, %1\n mov x8, #501\n svc #0\n mov %0, x0\n" : "=r"(ret) : "r"((long)id) : "x0", "x8");
+    return (int)ret;
+}
+
 static inline int ld_strcmp(const char *s1, const char *s2) {
     while (*s1 && (*s1 == *s2)) {
         s1++;

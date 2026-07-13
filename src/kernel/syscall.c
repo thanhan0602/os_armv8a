@@ -9,6 +9,7 @@
 #include <kernel/ramfs.h>
 #include <kernel/heap.h>
 #include <kernel/mutex.h>
+#include <kernel/spinlock.h>
 #include <arch/arm/cpu.h>
 
 /*
@@ -172,8 +173,12 @@ static unsigned long sys_mmap(unsigned long addr, unsigned long len,
     if (start == 0) {
         /* Find a free spot. For now, just use somewhere high in heap area */
         static unsigned long next_mmap_addr = 0x7000000000UL;
+        static struct spinlock mmap_lock = SPINLOCK_INITIALIZER;
+        
+        unsigned long irq_flags = spin_lock_irqsave(&mmap_lock);
         start = next_mmap_addr;
         next_mmap_addr += (len + 0xFFFUL) & ~0xFFFUL;
+        spin_unlock_irqrestore(&mmap_lock, irq_flags);
     }
 
     unsigned long mmu_flags = MMU_USER_PAGE_NORMAL | MMU_USER_PAGE_AF;
@@ -358,6 +363,7 @@ static unsigned long sys_nanosleep(unsigned long seconds)
 void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
 {
     unsigned long ret;
+    // KER_LOGF("[syscall] nr=%lu x0=%lx x1=%lx x2=%lx x8=%lu\n", nr, ctx->gpr[0], ctx->gpr[1], ctx->gpr[2], nr);
 
     switch (nr) {
     case SYS_WRITE:
@@ -393,6 +399,13 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
         break;
     case SYS_FORK:
         ret = process_fork(ctx);
+        break;
+    case SYS_CLONE:
+        ret = process_clone(ctx->gpr[0], ctx->gpr[1], ctx->gpr[3], ctx);
+        break;
+    case SYS_THREAD_CREATE:
+        /* Keep for backward compatibility */
+        ret = process_thread_create(ctx);
         break;
     case SYS_EXECVE:
         ret = process_execve((const char *)ctx->gpr[0], (char *const *)ctx->gpr[1], (char *const *)ctx->gpr[2], ctx);

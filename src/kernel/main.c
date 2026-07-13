@@ -36,7 +36,8 @@ struct boot_service {
 };
 
 static const struct boot_service boot_services[] = {
-    {"/bin/test_lazy.elf",  "test-lazy", 1},
+    // {"/bin/test_lazy.elf",  "test-lazy", 1},
+    {"/bin/test_pthread.elf", "pthread",   1},
     // {"/bin/hello.elf",      "user-a",   1},
     // {"/bin/fault.elf",      "user-b",   1},
     // {"/bin/test_cow.elf",   "user-cow", 1},
@@ -195,6 +196,7 @@ void secondary_main(void)
     
     while (1) {
         schedule();
+        cpu_wfe();
     }
 }
 
@@ -233,6 +235,9 @@ void kernel_main(void)
     fs_init();
     ipc_init();
 
+    /* Enable interrupts on CPU 0 */
+    arch_local_irq_enable();
+
 #ifdef CONFIG_KERNEL_VIRTUAL
     kernel_start_user_services();
 #endif
@@ -244,6 +249,7 @@ void kernel_main(void)
         boot_heartbeat++;
         if (!shell_poll()) {
             schedule();
+            cpu_wfe();
         }
     }
 }

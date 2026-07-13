@@ -11,8 +11,6 @@
 
 extern char exception_vector_table[];
 
-#define EXCEPTION_CONTEXT_SIZE 800UL
-
 static const char *exception_vector_name(unsigned long vector_id)
 {
     /*
@@ -205,6 +203,31 @@ int exception_handle_sync(unsigned long vector_id,
         }
     }
 
+    /*
+     * Any other synchronous exception taken from a lower EL (vectors 8-15
+     * cover AArch64/AArch32 lower-EL entries) is an unrecoverable user-mode
+     * fault we do not specifically handle (e.g. illegal/undefined
+     * instruction, EC=0 "unknown").  Terminate the offending task and
+     * reschedule instead of parking the CPU, which would lose the core and
+     * hang any thread waiting to join it.
+     */
+    if (vector_id >= 8UL) {
+        struct task *curr = sched_current();
+        if (curr) {
+            KER_LOGF("[fault] [%s:%lu] EL0 unhandled sync exception "
+                     "EC=%lx ELR=%lx ESR=%lx\n",
+                     curr->name, curr->id, ec, elr_el1, esr_el1);
+        } else {
+            KER_LOGF("[fault] EL0 unhandled sync exception EC=%lx ELR=%lx ESR=%lx\n",
+                     ec, elr_el1, esr_el1);
+        }
+        KER_INFO("[fault] killing user task");
+        task_exit();
+        while (1) {
+            schedule();
+        }
+    }
+
     exception_dump(vector_id, esr_el1, elr_el1, spsr_el1, far_el1, context);
 
     /* Distinguish nested EL1 aborts so they are visible in the log. */
@@ -228,6 +251,7 @@ void exception_handle_irq(unsigned long vector_id,
                           unsigned long far_el1,
                           const struct exception_context *context)
 {
+    unsigned int iar;
     unsigned int intid;
 
     (void)esr_el1;
@@ -236,7 +260,18 @@ void exception_handle_irq(unsigned long vector_id,
     (void)far_el1;
     (void)context;
 
-    intid = gicv2_acknowledge_irq();
+    /*
+     * The Interrupt Acknowledge Register returns the full IAR value: the
+     * interrupt ID in bits [9:0] and, for SGIs (IPIs), the source CPU ID in
+     * bits [12:10].  Mask off the source field before testing the ID,
+     * otherwise an IPI from CPU 1/2/3 (IAR = 0x400/0x800/0xC00) is wrongly
+     * treated as spurious (>= 1020) and returned without EOI, leaving the
+     * SGI active and blocking all further interrupts (including the timer).
+     * The End-Of-Interrupt write must use the full IAR value so the SGI is
+     * correctly deactivated for the right source CPU.
+     */
+    iar = gicv2_acknowledge_irq();
+    intid = iar & 0x3FFU;
     if (intid >= 1020U) {
         return;
     }
@@ -249,7 +284,7 @@ void exception_handle_irq(unsigned long vector_id,
         KER_LOGF("[irq] unexpected intid=%u\n", intid);
     }
 
-    gicv2_end_of_interrupt(intid);
+    gicv2_end_of_interrupt(iar);
 
     schedule();
 }

@@ -18,6 +18,8 @@
 #define SYS_MUNMAP  215UL
 #define SYS_MMAP    222UL
 #define SYS_FORK    220UL
+#define SYS_CLONE   224UL
+#define SYS_THREAD_CREATE 223UL
 #define SYS_EXECVE  221UL
 #define SYS_WAIT4   260UL
 #define SYS_NANOSLEEP 101UL

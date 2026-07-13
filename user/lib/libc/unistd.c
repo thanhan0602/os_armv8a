@@ -68,7 +68,7 @@ long ipc_send(unsigned long channel_id, const void *buf, unsigned long len)
 
 long ipc_recv(unsigned long channel_id, void *buf, unsigned long capacity)
 {
-    return user_ipc_recv(channel_id, buf, capacity);
+    unsigned long tid_out; return user_ipc_recv(&tid_out, buf, capacity);
 }
 
 unsigned int sleep(unsigned int seconds)

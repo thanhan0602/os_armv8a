@@ -27,6 +27,7 @@ struct task_context {
     unsigned long x29;
     unsigned long x30;
     unsigned long sp;
+    unsigned long tpidr_el0;   /* EL0 thread pointer (TLS), swapped on context switch */
 };
 
 #define TASK_STATE_RUNNING  0UL
@@ -34,6 +35,8 @@ struct task_context {
 #define TASK_STATE_BLOCKED  2UL
 #define TASK_STATE_DEAD     3UL
 #define TASK_STATE_ZOMBIE   4UL
+
+#define TASK_NO_CPU         0xffffffffU
 
 #define TASK_GUARD_PAGES    1UL
 #define TASK_STACK_PAGES    4UL

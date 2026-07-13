@@ -471,9 +471,11 @@ Goals:
 
 Implemented:
 - **Blocking Mutex:** Added `struct mutex` in [src/include/kernel/mutex.h](src/include/kernel/mutex.h) and implementation in [src/kernel/mutex.c](src/kernel/mutex.c). Uses a linked-list wait queue (`task->wait_next`) to manage sleeping tasks.
-- **Syscall Interface:** Added `SYS_MUTEX_LOCK` (500) and `SYS_MUTEX_UNLOCK` (501) in [src/include/kernel/syscall.h](src/include/kernel/syscall.h).
-- **User-space API:** Created [user/include/pthread.h](user/include/pthread.h) providing `pthread_mutex_lock` and `pthread_mutex_unlock`.
-- **SMP Safety:** Mutex internals are protected by spinlocks with IRQ disabling, ensuring correctness across multiple CPU cores.
+- **Syscall Interface:** Added `SYS_MUTEX_LOCK` (500), `SYS_MUTEX_UNLOCK` (501), mutex trylock/init/destroy support, and standard `SYS_CLONE` (224) in [src/include/kernel/syscall.h](src/include/kernel/syscall.h).
+- **User-space API:** Created [user/include/pthread.h](user/include/pthread.h) providing `pthread_create`, `pthread_join`, `pthread_yield`, and pthread mutex operations.
+- **TLS and clone ABI:** `CLONE_VM | CLONE_THREAD | CLONE_SETTLS` shares the process address space and installs per-thread `TPIDR_EL0`; `switch_context` saves/restores the thread pointer.
+- **SMP Safety:** Mutex internals are protected by spinlocks with IRQ disabling, scheduler wakeups send reschedule IPIs, and GICv2 SGI handling now masks IAR[9:0] for dispatch while writing the full IAR to EOIR.
+- **Runtime verification:** `test_pthread.elf` completed cleanly on 4-core QEMU in repeated stress runs with idle `wfe` re-enabled.
 
 ### Stage 20: Swap to Disk & Advanced VFS (Next Steps)
 

@@ -133,6 +133,7 @@ struct task *task_create(task_fn_t entry, const char *name)
     sp &= ~0xFUL;
 
     t->id = next_task_id;
+    t->current_cpu = TASK_NO_CPU;
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
@@ -202,6 +203,7 @@ struct task *task_create_user(struct process *process,
     sp &= ~0xFUL;
 
     t->id = next_task_id;
+    t->current_cpu = TASK_NO_CPU;
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
@@ -227,6 +229,7 @@ struct task *task_create_user(struct process *process,
     t->context.x29 = 0;
     t->context.x30 = (unsigned long)el0_entry_trampoline;
     t->context.sp = sp;
+    t->context.tpidr_el0 = 0;
 
     struct task *curr = arch_get_current_task();
     t->next = curr->next;
@@ -256,7 +259,7 @@ static void sched_reap_dead(void)
     t = curr->next;
 
     while (t != curr) {
-        if (t->state == TASK_STATE_DEAD) {
+        if (t->state == TASK_STATE_DEAD && t->current_cpu == TASK_NO_CPU) {
             prev->next = t->next;
 
             ipc_detach_task(t);
@@ -294,6 +297,7 @@ void sched_new_task_kickoff(void)
 void sched_tick(void)
 {
     unsigned long flags = spin_lock_irqsave(&sched_lock);
+    int woken = 0;
 
     for (unsigned long i = 0; i < MAX_TASKS; i++) {
         struct task *t = &tasks[i];
@@ -301,17 +305,31 @@ void sched_tick(void)
             t->sleep_ticks--;
             if (t->sleep_ticks == 0) {
                 t->state = TASK_STATE_READY;
+                woken = 1;
             }
         }
     }
 
     spin_unlock_irqrestore(&sched_lock, flags);
+
+    if (woken) {
+        /* Send IPI to other cores to inform them a new task is READY */
+        unsigned int current_cpu = arch_get_cpu_id();
+        unsigned int target_mask = 0;
+        for (unsigned int i = 0; i < 4; i++) {
+            if (i != current_cpu) {
+                target_mask |= (1 << (unsigned char)i);
+            }
+        }
+        gicv2_send_ipi(target_mask, 0);
+    }
 }
 
 void schedule(void)
 {
     struct task *prev;
     struct task *next;
+    unsigned int cpu_id = arch_get_cpu_id();
     
     unsigned long flags = spin_lock_irqsave(&sched_lock);
 
@@ -320,24 +338,53 @@ void schedule(void)
     prev = arch_get_current_task();
     next = prev->next;
 
-    /* Round-robin: find next ready task, skip dead ones */
+    /* Round-robin: find next ready task */
     while (next != prev) {
         if (next->state == TASK_STATE_READY) {
-            break;
+            /* 
+             * Task 0-3 are idle tasks for CPU 0-3.
+             * Only allow a CPU to pick its own idle task.
+             */
+            if (next->id < 4) {
+                if (next->id == cpu_id) {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
         next = next->next;
     }
 
+    /* 
+     * If we didn't search and find a DIFFERENT ready task:
+     * Check if the current task can keep running or if we must switch to idle.
+     */
     if (next == prev) {
-        spin_unlock_irqrestore(&sched_lock, flags);
-        return;
+        /* If current is READY/RUNNING and is not a pinned idle task of another CPU, just keep it. */
+        if (prev->state == TASK_STATE_RUNNING || prev->state == TASK_STATE_READY) {
+            if (prev->id >= 4 || prev->id == cpu_id) {
+                spin_unlock_irqrestore(&sched_lock, flags);
+                return;
+            }
+        }
+        
+        /* Current task blocked or belongs to another CPU. Switch to our idle task. */
+        next = &tasks[cpu_id];
+        if (next == prev) {
+            spin_unlock_irqrestore(&sched_lock, flags);
+            return;
+        }
     }
 
     if (prev->state == TASK_STATE_RUNNING) {
         prev->state = TASK_STATE_READY;
     }
+    if (prev->id >= 4UL) {
+        prev->current_cpu = TASK_NO_CPU;
+    }
     next->state = TASK_STATE_RUNNING;
-    next->current_cpu = arch_get_cpu_id();
+    next->current_cpu = cpu_id;
     
     /* 
     KER_LOGF("[sched] CPU %u: %s -> %s\n", arch_get_cpu_id(), prev->name, next->name);
@@ -352,8 +399,8 @@ void schedule(void)
 
     /* 
      * IMPORTANT: We hold the spinlock across switch_context!
-     * The task we switch to will release the lock.
-     * This is a standard pattern in SMP schedulers.
+     * The task we switch to will release the lock in spin_unlock_irqrestore below
+     * OR in sched_new_task_kickoff for new tasks.
      */
     switch_context(&prev->context, &next->context);
     
@@ -375,6 +422,16 @@ void task_exit(void)
         struct task *t = &tasks[i];
         if (t->name && t->id == curr->parent_id && t->state == TASK_STATE_BLOCKED) {
             t->state = TASK_STATE_READY;
+            
+            /* Send IPI to other cores */
+            unsigned int current_cpu = arch_get_cpu_id();
+            unsigned int target_mask = 0;
+            for (unsigned int j = 0; j < 4; j++) {
+                if (j != current_cpu) {
+                    target_mask |= (1 << (unsigned char)j);
+                }
+            }
+            gicv2_send_ipi(target_mask, 0);
             break;
         }
     }
@@ -431,26 +488,34 @@ unsigned long sched_wait4(long pid, unsigned long status_ptr)
 
     for (;;) {
         int found_child = 0;
+        unsigned long flags = spin_lock_irqsave(&sched_lock);
+
         for (unsigned long i = 0; i < MAX_TASKS; i++) {
             struct task *t = &tasks[i];
             if (t->name && t->parent_id == curr->id && (pid <= 0 || (long)t->id == pid)) {
                 found_child = 1;
                 if (t->state == TASK_STATE_ZOMBIE) {
                     unsigned long child_id = t->id;
+                    int status = t->exit_status;
+                    t->state = TASK_STATE_DEAD; /* Mark for reaping by schedule() */
+                    spin_unlock_irqrestore(&sched_lock, flags);
+
                     if (status_ptr != 0) {
-                        int status = t->exit_status;
                         extern int mmu_copy_to_user(const struct mm_context *mm, unsigned long va, const void *src, unsigned long len);
                         mmu_copy_to_user(curr->mm, status_ptr, &status, sizeof(int));
                     }
-                    t->state = TASK_STATE_DEAD; /* Mark for reaping by schedule() */
                     return child_id;
                 }
             }
         }
 
-        if (!found_child) return (unsigned long)-1;
+        if (!found_child) {
+            spin_unlock_irqrestore(&sched_lock, flags);
+            return (unsigned long)-1;
+        }
 
         curr->state = TASK_STATE_BLOCKED;
+        spin_unlock_irqrestore(&sched_lock, flags);
         schedule();
     }
 }

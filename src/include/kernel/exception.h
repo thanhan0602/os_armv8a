@@ -1,6 +1,8 @@
 #ifndef KERNEL_EXCEPTION_H
 #define KERNEL_EXCEPTION_H
 
+#define EXCEPTION_CONTEXT_SIZE 800UL
+
 struct exception_context {
     unsigned long gpr[31];   /* x0-x30 */
     unsigned long elr_el1;   /* ELR_EL1 at time of exception (was reserved0) */

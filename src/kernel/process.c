@@ -467,7 +467,9 @@ int process_add_region(struct process *process,
                       const unsigned char *image, unsigned long offset,
                       unsigned long filesz)
 {
+    unsigned long irq_flags = spin_lock_irqsave(&process->lock);
     if (process->region_count >= PROCESS_VM_REGIONS_MAX) {
+        spin_unlock_irqrestore(&process->lock, irq_flags);
         return 0;
     }
 
@@ -479,6 +481,7 @@ int process_add_region(struct process *process,
     region->elf_image = image;
     region->elf_offset = offset;
     region->file_size = filesz;
+    spin_unlock_irqrestore(&process->lock, irq_flags);
     return 1;
 }
 
@@ -559,6 +562,8 @@ static struct process *process_create_flat_binary(const unsigned char *code, uns
         kfree(process);
         return (struct process *)0;
     }
+    spinlock_init(&process->lock);
+    process->ref_count = 1U;
 
     process->entry_va = USER_CODE_BASE;
     process->stack_top = USER_STACK_TOP;
@@ -745,6 +750,8 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
         kfree(process);
         return (struct process *)0;
     }
+    spinlock_init(&process->lock);
+    process->ref_count = 1U;
 
     process_zero_bytes(&load_state, sizeof(load_state));
     load_state.process = process;
@@ -846,6 +853,16 @@ void process_destroy(struct process *process)
         return;
     }
 
+    /* Reference counting: threads (CLONE_THREAD) share one process struct
+     * and its mm_context. Only the last reference frees the resources. */
+    unsigned long irq_flags = spin_lock_irqsave(&process->lock);
+    if (process->ref_count > 1U) {
+        process->ref_count--;
+        spin_unlock_irqrestore(&process->lock, irq_flags);
+        return;
+    }
+    spin_unlock_irqrestore(&process->lock, irq_flags);
+
     if (process->mm != (struct mm_context *)0) {
         mmu_context_destroy(process->mm);
         process->mm = (struct mm_context *)0;
@@ -868,82 +885,134 @@ unsigned long process_brk(struct process *process, unsigned long new_break)
         return 0UL;
     }
 
+    unsigned long irq_flags = spin_lock_irqsave(&process->lock);
     if (new_break == 0UL) {
-        return process->brk;
+        unsigned long current_brk = process->brk;
+        spin_unlock_irqrestore(&process->lock, irq_flags);
+        return current_brk;
     }
 
     if (new_break < process->heap_start || new_break > process->heap_limit) {
-        return process->brk;
+        unsigned long current_brk = process->brk;
+        spin_unlock_irqrestore(&process->lock, irq_flags);
+        return current_brk;
     }
 
     process->brk = new_break;
-    return process->brk;
+    unsigned long result = process->brk;
+    spin_unlock_irqrestore(&process->lock, irq_flags);
+    return result;
 }
 
-unsigned long process_fork(struct exception_context *ctx)
+unsigned long process_clone(unsigned long flags, unsigned long stack, unsigned long tls, struct exception_context *ctx)
 {
     struct task *parent_task = sched_current();
     if (!parent_task) return (unsigned long)-1;
 
-    /* 1. Allocate process structure for child */
-    struct process *child_proc = (struct process *)kmalloc(sizeof(struct process));
-    if (!child_proc) return (unsigned long)-1;
+    struct process *child_proc;
+    struct task *child_task;
 
-    /* 2. Copy process state */
-    child_proc->entry_va = parent_task->process->entry_va;
-    child_proc->stack_top = parent_task->process->stack_top;
-    child_proc->heap_start = parent_task->process->heap_start;
-    child_proc->brk = parent_task->process->brk;
-    child_proc->heap_limit = parent_task->process->heap_limit;
-    child_proc->heap_mapped_end = parent_task->process->heap_mapped_end;
-    child_proc->region_count = parent_task->process->region_count;
-    for (unsigned int i = 0; i < parent_task->process->region_count; i++) {
-        child_proc->regions[i] = parent_task->process->regions[i];
+    if (flags & CLONE_THREAD) {
+        /* Thread creation within SAME process (shared address space).
+         * Bump the reference count so the shared process/mm is not freed
+         * until the last thread exits. */
+        child_proc = parent_task->process;
+        unsigned long p_flags = spin_lock_irqsave(&child_proc->lock);
+        child_proc->ref_count++;
+        spin_unlock_irqrestore(&child_proc->lock, p_flags);
+
+        child_task = task_create_user(child_proc, parent_task->name);
+        if (!child_task) {
+            p_flags = spin_lock_irqsave(&child_proc->lock);
+            child_proc->ref_count--;
+            spin_unlock_irqrestore(&child_proc->lock, p_flags);
+            return (unsigned long)-1;
+        }
+    } else {
+        /* Full process fork with CoW */
+        child_proc = (struct process *)kmalloc(sizeof(struct process));
+        if (!child_proc) return (unsigned long)-1;
+        spinlock_init(&child_proc->lock);
+        child_proc->ref_count = 1U;
+
+        child_proc->entry_va = parent_task->process->entry_va;
+        child_proc->stack_top = parent_task->process->stack_top;
+        child_proc->heap_start = parent_task->process->heap_start;
+        child_proc->brk = parent_task->process->brk;
+        child_proc->heap_limit = parent_task->process->heap_limit;
+        child_proc->heap_mapped_end = parent_task->process->heap_mapped_end;
+        child_proc->region_count = parent_task->process->region_count;
+        for (unsigned int i = 0; i < parent_task->process->region_count; i++) {
+            child_proc->regions[i] = parent_task->process->regions[i];
+        }
+
+        child_proc->mm = mmu_context_clone(parent_task->mm);
+        if (!child_proc->mm) {
+            kfree(child_proc);
+            return (unsigned long)-1;
+        }
+
+        child_task = task_create_user(child_proc, parent_task->name);
+        if (!child_task) {
+            mmu_context_destroy(child_proc->mm);
+            kfree(child_proc);
+            return (unsigned long)-1;
+        }
     }
 
-    /* 3. Clone MMU context (CoW happens here internally) */
-    child_proc->mm = mmu_context_clone(parent_task->mm);
-    if (!child_proc->mm) {
-        kfree(child_proc);
-        return (unsigned long)-1;
-    }
+    child_task->parent_id = parent_task->id;
 
-    /* 4. Create new task (allocates slot and kernel stack) */
-    struct task *child_task = task_create_user(child_proc, parent_task->name);
-    if (child_task) {
-        child_task->parent_id = parent_task->id;
-    }
-
-    /* 5. Copy kernel stack content to clone the exception context and call stack */
-    /* Find the offset of the exception context from the parent's stack base */
-    unsigned long stack_offset = (unsigned long)ctx - (unsigned long)parent_task->stack_base;
-    
-    /* Copy the entire kernel stack */
-    unsigned char *src_stack = (unsigned char *)parent_task->stack_base;
+    /*
+     * The child does not need the parent's live syscall/C stack frames. It
+     * enters through fork_child_exit, which only restores one saved exception
+     * frame and erets to EL0.  Copy only that frame to a clean location at the
+     * top of the child's kernel stack; copying the whole active kernel stack is
+     * racy under SMP because transient IRQ/syscall frames can be copied too.
+     */
     unsigned char *dst_stack = (unsigned char *)child_task->stack_base;
-    for (unsigned long i = 0; i < child_task->stack_size; i++) {
-        dst_stack[i] = src_stack[i];
+    unsigned long child_frame =
+        (unsigned long)(dst_stack + child_task->stack_size - EXCEPTION_CONTEXT_SIZE);
+
+    for (unsigned long i = 0; i < EXCEPTION_CONTEXT_SIZE; i++) {
+        ((unsigned char *)child_frame)[i] = ((unsigned char *)ctx)[i];
     }
 
-    /* 6. Adjust child's kernel SP and return address */
-    /* The child should resume at fork_child_exit, which pops the context
-     * from its own stack and eret to user mode. */
+    /* Resume at fork_child_exit in switch.S */
     child_task->context.x30 = (unsigned long)fork_child_exit;
-    child_task->context.sp = (unsigned long)child_task->stack_base + stack_offset;
+    child_task->context.sp = child_frame;
 
-    /* 7. Fix the child's return value in its cloned exception context */
-    struct exception_context *child_ctx = (struct exception_context *)(dst_stack + stack_offset);
-    child_ctx->gpr[0] = 0;
+    /* Register child context */
+    struct exception_context *child_ctx = (struct exception_context *)child_frame;
+    child_ctx->gpr[0] = 0; /* Child returns 0 from clone() */
+    
+    if (stack != 0) {
+        child_ctx->sp_el0 = stack;
+    }
+
+    if (flags & CLONE_SETTLS) {
+        /* TPIDR_EL0 holds the EL0 thread pointer (TLS) on AArch64.
+         * It is swapped per-task by switch_context via task_context.tpidr_el0. */
+        child_task->context.tpidr_el0 = tls;
+    }
+
+    /*
+     * Ensure all writes to the child's task context and copied kernel stack
+     * (including the exception frame restore_context will pop) are globally
+     * visible before the task is made runnable.  Without this barrier another
+     * core may observe the READY state (published via sched_wake_task) while
+     * the context/stack writes are still in-flight, and switch to a task with
+     * a half-initialised context — causing a jump to a garbage PC.
+     */
+    __asm__ volatile("dsb ish" ::: "memory");
 
     sched_wake_task(child_task);
 
-    KER_LOGF("[process] fork: parent PID=%lu, child PID=%lu, offset=0x%lx, ctx=0x%lx\n", 
-             parent_task->id, child_task->id, stack_offset, (unsigned long)ctx);
-    KER_LOGF("          child_elr=0x%lx, child_spsr=0x%lx, child_sp_el0=0x%lx\n",
-             child_ctx->elr_el1, child_ctx->spsr_el1, child_ctx->sp_el0);
-
-    /* 8. Parent returns child PID */
     return (unsigned long)child_task->id;
+}
+
+unsigned long process_fork(struct exception_context *ctx)
+{
+    return process_clone(0, 0, 0, ctx);
 }
 #else
 struct process *process_create_from_image(char *code_start, char *code_end)
@@ -1038,3 +1107,25 @@ unsigned long process_execve(const char *filename_va, char *const argv_va[], cha
     /* execve does not return on success */
     return 0;
 }
+
+unsigned long process_thread_create(struct exception_context *ctx)
+{
+    unsigned long entry = ctx->gpr[0];
+    unsigned long arg = ctx->gpr[1];
+    unsigned long user_sp = ctx->gpr[2];
+    
+    /* Legacy wrapper for our custom thread_create syscall */
+    struct task *parent_task = sched_current();
+    struct task *thread_task = task_create_user(parent_task->process, parent_task->name);
+    if (!thread_task) return (unsigned long)-1;
+
+    thread_task->parent_id = parent_task->id;
+    thread_task->context.x19 = entry;
+    thread_task->context.x20 = user_sp;
+    thread_task->context.x21 = arg;
+    thread_task->context.x30 = (unsigned long)el0_entry_trampoline;
+
+    sched_wake_task(thread_task);
+    return (unsigned long)thread_task->id;
+}
+

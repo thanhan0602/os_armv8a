@@ -106,6 +106,13 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
   - Cung cấp `pthread.h` trong [user/include/pthread.h](user/include/pthread.h) với API `pthread_mutex_lock` và `pthread_mutex_unlock`.
   - Verification suite trong [src/kernel/mutex_test.c](src/kernel/mutex_test.c) pass trên cả 4 cores.
   - heap của ELF process không còn cố định ở `0x00040000`; `brk(0)` giờ bắt đầu ngay sau image đã map, có một page guard giữa image và heap
+- **Stage 19 (pthread/clone SMP stability)** — hoàn thành và verify trên QEMU:
+  - `SYS_CLONE` (224) hiện hỗ trợ `CLONE_VM`, `CLONE_THREAD`, và `CLONE_SETTLS`; user `pthread_create()` dùng trampoline assembly kiểu glibc để child bắt đầu trên stack riêng.
+  - `TPIDR_EL0` được lưu/khôi phục trong `switch_context`, cho phép TLS/errno riêng từng thread.
+  - GICv2 SGI/IPI fix: IRQ handler mask `IAR[9:0]` để lấy intid nhưng ghi full IAR vào EOIR, tránh SGI từ CPU khác bị coi là spurious và chặn timer IRQ.
+  - `process_clone()` chỉ copy saved `exception_context` vào frame sạch trên child kernel stack, không copy toàn bộ live kernel stack của parent.
+  - `sched_reap_dead()` chỉ free stack task DEAD khi task đã rời CPU (`TASK_NO_CPU`), tránh free stack đang còn chạy trong `task_exit()`/`schedule()`.
+  - Runtime verify mới nhất: `test_pthread.elf` pass 20/20 lần trên QEMU 4-core với idle `wfe` bật lại, không fault/panic/hang.
 - **Stage 14 (Lazy Loading & Copy-on-Write)** — hoàn thành và verify trên QEMU:
   - Chuyển đổi từ mô hình nạp code "eager" (copy toàn bộ vào RAM ngay khi nạp) sang "Lazy Loading" (Demand Paging).
   - Thêm `struct vm_region` để quản lý các vùng nhớ ảo (ELF segments, Stack, Heap).

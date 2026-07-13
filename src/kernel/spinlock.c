@@ -52,9 +52,8 @@ void spin_lock(struct spinlock *lock)
 
     while (!spin_try_lock(lock)) {
         while (lock->value != 0U) {
-            cpu_wait();
+            cpu_relax();
         }
-        cpu_relax();
     }
 }
 
@@ -65,7 +64,6 @@ void spin_unlock(struct spinlock *lock)
     }
 
     __asm__ volatile("stlr wzr, [%0]" : : "r"(&lock->value) : "memory");
-    cpu_wake();
 }
 
 unsigned long spin_lock_irqsave(struct spinlock *lock)
