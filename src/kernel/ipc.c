@@ -38,6 +38,7 @@ void ipc_init(void)
 long ipc_send(unsigned long channel_id, const unsigned char *data, unsigned long len)
 {
     struct ipc_channel *channel;
+    struct task *waiting_receiver = (struct task *)0;
     unsigned long flags;
     unsigned long index;
 
@@ -60,11 +61,16 @@ long ipc_send(unsigned long channel_id, const unsigned char *data, unsigned long
     channel->has_message = 1UL;
 
     if (channel->waiting_receiver != (struct task *)0) {
-        sched_wake_task(channel->waiting_receiver);
+        waiting_receiver = channel->waiting_receiver;
         channel->waiting_receiver = (struct task *)0;
     }
 
     spin_unlock_irqrestore(&channel->lock, flags);
+
+    /* Never acquire sched_lock while holding channel->lock. */
+    if (waiting_receiver != (struct task *)0) {
+        sched_unpark_task(waiting_receiver);
+    }
     return (long)len;
 }
 
@@ -107,8 +113,14 @@ long ipc_receive(unsigned long channel_id,
     }
 
     channel->waiting_receiver = task;
-    sched_block_task(task);
     spin_unlock_irqrestore(&channel->lock, flags);
+
+    /*
+     * The sender may remove and unpark this waiter between the channel unlock
+     * and this call. sched_park_task() consumes that pending wakeup token and
+     * therefore cannot lose the notification.
+     */
+    (void)sched_park_task(task);
     return IPC_RESULT_BLOCKED;
 }
 

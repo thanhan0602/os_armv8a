@@ -124,12 +124,23 @@ struct mm_context {
      * different CPUs and fault, map, unmap, or resolve CoW concurrently.
      */
     struct spinlock lock;
+    /*
+     * Lifetime fields are protected by the MMU lifecycle lock in
+     * mmu_vmsa.c. refs counts logical owners. dying prevents a context with
+     * no owners from being installed on another CPU. active_cpu_mask records
+     * CPUs whose TTBR0 currently references this context.
+     */
+    unsigned int refs;
+    unsigned int dying;
+    unsigned int active_cpu_mask;
     unsigned long pages[MM_MAX_TRACKED_PAGES]; /* PAs of all owned pages (sub-tables + user data) */
     unsigned int  page_count;                  /* number of valid entries in pages[] */
 };
 
 struct mm_context *mmu_context_create(void);
 struct mm_context *mmu_context_clone(struct mm_context *src);
+int mmu_context_get(struct mm_context *mm);
+void mmu_context_put(struct mm_context *mm);
 void mmu_context_destroy(struct mm_context *mm);
 void mmu_context_switch(struct mm_context *mm);
 /*

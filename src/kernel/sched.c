@@ -3,6 +3,7 @@
 #include <kernel/log.h>
 #include <kernel/ipc.h>
 #include <kernel/mmu.h>
+#include <kernel/mutex.h>
 #include <kernel/page_alloc.h>
 #include <kernel/process.h>
 #include <kernel/vm.h>
@@ -34,6 +35,9 @@ static const char *sched_state_name(unsigned long state)
     }
     if (state == TASK_STATE_ZOMBIE) {
         return "zombie";
+    }
+    if (state == TASK_STATE_REAPING) {
+        return "reaping";
     }
 
     return "unknown";
@@ -251,41 +255,67 @@ struct task *task_create_user(struct process *process,
  */
 static void sched_reap_dead(void)
 {
-    struct task *prev;
-    struct task *t;
-    struct task *curr = arch_get_current_task();
-
-    prev = curr;
-    t = curr->next;
-
-    while (t != curr) {
-        if (t->state == TASK_STATE_DEAD && t->current_cpu == TASK_NO_CPU) {
-            prev->next = t->next;
-
-            ipc_detach_task(t);
-
-            if (t->stack_base != (void *)0) {
-                page_free_contiguous(
-                    (void *)va_to_pa(t->stack_base),
-                    TASK_TOTAL_PAGES);
-                t->stack_base = (void *)0;
-            }
-
+    for (;;) {
+        struct task *victim = (struct task *)0;
+        struct task *prev;
+        struct task *t;
+        void *stack_base;
 #ifdef CONFIG_KERNEL_VIRTUAL
-            if (t->process != (struct process *)0) {
-                process_destroy(t->process);
-                t->process = (struct process *)0;
-                t->mm = (struct mm_context *)0;
-            }
+        struct process *process;
 #endif
+        unsigned long flags = spin_lock_irqsave(&sched_lock);
 
-            sched_clear_task(t);
-
-            t = prev->next;
-        } else {
+        /*
+         * Detach one dead task while holding only sched_lock. Cleanup is
+         * deliberately performed after dropping sched_lock so IPC, mutex,
+         * process, MM and allocator locks can never form a reverse edge back
+         * into the scheduler.
+         */
+        prev = &tasks[0];
+        t = prev->next;
+        while (t != &tasks[0]) {
+            if (t->state == TASK_STATE_DEAD &&
+                t->current_cpu == TASK_NO_CPU) {
+                prev->next = t->next;
+                t->state = TASK_STATE_REAPING;
+                victim = t;
+                break;
+            }
             prev = t;
             t = t->next;
         }
+
+        if (victim == (struct task *)0) {
+            spin_unlock_irqrestore(&sched_lock, flags);
+            return;
+        }
+
+        stack_base = victim->stack_base;
+        victim->stack_base = (void *)0;
+#ifdef CONFIG_KERNEL_VIRTUAL
+        process = victim->process;
+        victim->process = (struct process *)0;
+        victim->mm = (struct mm_context *)0;
+#endif
+        spin_unlock_irqrestore(&sched_lock, flags);
+
+        ipc_detach_task(victim);
+        mutex_detach_task(victim);
+
+        if (stack_base != (void *)0) {
+            page_free_contiguous((void *)va_to_pa(stack_base),
+                                 TASK_TOTAL_PAGES);
+        }
+
+#ifdef CONFIG_KERNEL_VIRTUAL
+        if (process != (struct process *)0) {
+            process_destroy(process);
+        }
+#endif
+
+        flags = spin_lock_irqsave(&sched_lock);
+        sched_clear_task(victim);
+        spin_unlock_irqrestore(&sched_lock, flags);
     }
 }
 
@@ -331,11 +361,22 @@ void schedule(void)
     struct task *next;
     unsigned int cpu_id = arch_get_cpu_id();
     
-    unsigned long flags = spin_lock_irqsave(&sched_lock);
-
+    /* Reaping performs subsystem cleanup without sched_lock held. */
     sched_reap_dead();
 
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
+
     prev = arch_get_current_task();
+
+    /*
+     * A remote kill only sets kill_pending while the task is RUNNING. The
+     * target CPU consumes it here, after entering the scheduler on its own
+     * stack, and only then makes the task eligible for reaping.
+     */
+    if (prev->id >= 4UL && prev->kill_pending != 0U) {
+        prev->kill_pending = 0U;
+        prev->state = TASK_STATE_DEAD;
+    }
     next = prev->next;
 
     /* Round-robin: find next ready task */
@@ -452,24 +493,39 @@ struct task *sched_current(void)
 
 void sched_block_task(struct task *task)
 {
-    if (task == (struct task *)0 || task->id < 4UL || task->state == TASK_STATE_DEAD) {
+    if (task == (struct task *)0) {
         return;
     }
 
     unsigned long flags = spin_lock_irqsave(&sched_lock);
-    task->state = TASK_STATE_BLOCKED;
+    if (task->id >= 4UL &&
+        task->state != TASK_STATE_DEAD &&
+        task->state != TASK_STATE_ZOMBIE &&
+        task->state != TASK_STATE_REAPING &&
+        task->kill_pending == 0U) {
+        task->state = TASK_STATE_BLOCKED;
+    }
     spin_unlock_irqrestore(&sched_lock, flags);
 }
 
 void sched_wake_task(struct task *task)
 {
-    if (task == (struct task *)0 || task->state != TASK_STATE_BLOCKED) {
+    int woken = 0;
+
+    if (task == (struct task *)0) {
         return;
     }
 
     unsigned long flags = spin_lock_irqsave(&sched_lock);
-    task->state = TASK_STATE_READY;
+    if (task->state == TASK_STATE_BLOCKED && task->kill_pending == 0U) {
+        task->state = TASK_STATE_READY;
+        woken = 1;
+    }
     spin_unlock_irqrestore(&sched_lock, flags);
+
+    if (!woken) {
+        return;
+    }
 
     /* Send IPI to all other cores to trigger schedule() */
     unsigned int current_cpu = arch_get_cpu_id();
@@ -480,6 +536,109 @@ void sched_wake_task(struct task *task)
         }
     }
     gicv2_send_ipi(target_mask, 0);
+}
+
+/*
+ * Park/unpark form a one-bit wakeup handshake for subsystem wait queues.
+ * A producer may unpark before the consumer reaches sched_park_task(); the
+ * pending token is then consumed instead of blocking. This lets IPC and
+ * mutex code publish/remove waiters under their own locks without calling
+ * into the scheduler while those locks are held.
+ */
+int sched_park_task(struct task *task)
+{
+    unsigned long flags;
+    int blocked = 0;
+
+    if (task == (struct task *)0 || task->id < 4UL) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    if (task->state != TASK_STATE_DEAD &&
+        task->state != TASK_STATE_ZOMBIE &&
+        task->state != TASK_STATE_REAPING &&
+        task->kill_pending == 0U) {
+        if (task->wake_pending != 0U) {
+            task->wake_pending = 0U;
+        } else {
+            task->state = TASK_STATE_BLOCKED;
+            blocked = 1;
+        }
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return blocked;
+}
+
+void sched_unpark_task(struct task *task)
+{
+    unsigned long flags;
+    int woken = 0;
+
+    if (task == (struct task *)0) {
+        return;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    if (task->state == TASK_STATE_BLOCKED && task->kill_pending == 0U) {
+        task->state = TASK_STATE_READY;
+        woken = 1;
+    } else if (task->state != TASK_STATE_DEAD &&
+               task->state != TASK_STATE_ZOMBIE &&
+               task->state != TASK_STATE_REAPING &&
+               task->kill_pending == 0U) {
+        task->wake_pending = 1U;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+
+    if (woken) {
+        unsigned int current_cpu = arch_get_cpu_id();
+        unsigned int target_mask = 0U;
+        for (unsigned int i = 0U; i < 4U; i++) {
+            if (i != current_cpu) {
+                target_mask |= (1U << i);
+            }
+        }
+        gicv2_send_ipi(target_mask, 0U);
+    }
+}
+
+int sched_sleep_current(unsigned long ticks)
+{
+    struct task *task = sched_current();
+    unsigned long flags;
+
+    if (task == (struct task *)0 || task->id < 4UL) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    if (task->state == TASK_STATE_DEAD ||
+        task->state == TASK_STATE_ZOMBIE ||
+        task->state == TASK_STATE_REAPING ||
+        task->kill_pending != 0U) {
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return 0;
+    }
+
+    task->sleep_ticks = ticks;
+    task->state = (ticks == 0UL) ? TASK_STATE_READY : TASK_STATE_BLOCKED;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return 1;
+}
+
+void sched_set_current_exit_status(int status)
+{
+    struct task *task = sched_current();
+    unsigned long flags;
+
+    if (task == (struct task *)0) {
+        return;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    task->exit_status = status;
+    spin_unlock_irqrestore(&sched_lock, flags);
 }
 
 unsigned long sched_wait4(long pid, unsigned long status_ptr)
@@ -551,6 +710,9 @@ void sched_dump_tasks(void)
 int sched_kill_task(unsigned long task_id)
 {
     unsigned long index;
+    unsigned int target_cpu = TASK_NO_CPU;
+    int killed = 0;
+    unsigned long flags = spin_lock_irqsave(&sched_lock);
 
     for (index = 0UL; index < MAX_TASKS; index++) {
         struct task *task;
@@ -560,14 +722,31 @@ int sched_kill_task(unsigned long task_id)
             continue;
         }
 
-        if (task == sched_current() || task->id < 4UL || task->state == TASK_STATE_DEAD) {
-            return 0;
+        if (task == sched_current() || task->id < 4UL ||
+            task->state == TASK_STATE_DEAD ||
+            task->state == TASK_STATE_ZOMBIE ||
+            task->state == TASK_STATE_REAPING) {
+            break;
         }
 
-        ipc_detach_task(task);
-        task->state = TASK_STATE_DEAD;
-        return 1;
+        if (task->state == TASK_STATE_RUNNING &&
+            task->current_cpu != TASK_NO_CPU) {
+            task->kill_pending = 1U;
+            target_cpu = task->current_cpu;
+        } else {
+            task->state = TASK_STATE_DEAD;
+            task->sleep_ticks = 0UL;
+            task->wake_pending = 0U;
+        }
+        killed = 1;
+        break;
     }
 
-    return 0;
+    spin_unlock_irqrestore(&sched_lock, flags);
+
+    if (killed && target_cpu != TASK_NO_CPU) {
+        gicv2_send_ipi(1U << target_cpu, 0U);
+    }
+
+    return killed;
 }

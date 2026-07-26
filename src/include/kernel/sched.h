@@ -35,6 +35,7 @@ struct task_context {
 #define TASK_STATE_BLOCKED  2UL
 #define TASK_STATE_DEAD     3UL
 #define TASK_STATE_ZOMBIE   4UL
+#define TASK_STATE_REAPING  5UL
 
 #define TASK_NO_CPU         0xffffffffU
 
@@ -51,6 +52,8 @@ struct task {
     void *stack_base;
     unsigned long stack_size;
     unsigned long sleep_ticks;
+    unsigned int kill_pending;
+    unsigned int wake_pending;
     unsigned int current_cpu;
     const char *name;
     struct mm_context *mm;
@@ -82,6 +85,10 @@ void task_exit(void);
 struct task *sched_current(void);
 void sched_block_task(struct task *task);
 void sched_wake_task(struct task *task);
+int sched_park_task(struct task *task);
+void sched_unpark_task(struct task *task);
+int sched_sleep_current(unsigned long ticks);
+void sched_set_current_exit_status(int status);
 unsigned long sched_wait4(long pid, unsigned long status_ptr);
 void sched_dump_tasks(void);
 int sched_kill_task(unsigned long task_id);

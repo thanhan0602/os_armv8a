@@ -21,8 +21,25 @@
 - Context switch luôn save/restore ELR_EL1/SPSR_EL1.
 - Idle task cho CPU n có id = n, không alloc stack riêng.
 - User task đang chạy có `current_cpu=<cpu>`; khi switch ra khỏi user task thì scheduler đặt `current_cpu=TASK_NO_CPU`. Dead task chỉ được reap ở đầu `schedule()` khi đã rời CPU để không free kernel stack đang active.
-- Mutex dùng spinlock nội bộ để bảo vệ wait queue, và gọi `sched_block_task`/`sched_wake_task`.
+- IPC và mutex dùng handshake `sched_park_task()`/`sched_unpark_task()` với một-bit wake token. Subsystem luôn nhả lock riêng trước khi gọi scheduler, nên wake xảy ra trước park cũng không bị mất.
+- Mọi chuyển đổi task state, `sleep_ticks`, `kill_pending`, `wake_pending` và exit status đều được serialize dưới `sched_lock`.
+- Reaper chỉ detach task khỏi run queue và chuyển sang `TASK_STATE_REAPING` khi giữ `sched_lock`; cleanup IPC, mutex, process, MM và stack diễn ra sau khi nhả khóa.
+- Remote kill đối với task đang RUNNING chỉ đặt `kill_pending` và gửi IPI. CPU đang sở hữu task tự chuyển nó sang DEAD trong `schedule()` trước khi task được reap.
 - `sched_new_task_kickoff()` chỉ nhả `sched_lock`; không bật IRQ sớm trước khi `fork_child_exit` restore exception frame và `eret`.
+
+## Giao thức SMP hiện tại
+
+1. Waiter được publish dưới subsystem lock, sau đó subsystem lock được nhả trước khi gọi `sched_park_task()`.
+2. Producer lấy waiter khỏi queue dưới subsystem lock, nhả khóa, rồi gọi `sched_unpark_task()`.
+3. Nếu unpark đến trước park, `wake_pending` được ghi dưới `sched_lock`; park kế tiếp tiêu thụ token thay vì block, loại bỏ lost wakeup.
+4. Cleanup không giữ `sched_lock` khi lấy IPC, mutex, process, MM hoặc allocator lock.
+5. `sched_sleep_current()` là đường duy nhất của nanosleep để cập nhật deadline và state.
+
+## Rủi ro SMP còn lại
+
+- `sched_dump_tasks()` vẫn là debug best-effort vì đọc task/process fields không khóa xuyên suốt snapshot.
+- `sched_lock` toàn cục có thể trở thành bottleneck khi tăng số CPU; chưa có per-CPU run queue hay load balancing có affinity.
+- Remote kill đã ngăn reaping khi task còn chạy trên CPU khác, nhưng chưa cung cấp API synchronous kill có acknowledgement cho caller.
 
 ## Lệnh verify nhanh
 - make clean all RUN_OS_DEMOS=1
@@ -35,7 +52,9 @@
 - Với GICv2 SGI, `IAR` chứa source CPU ở bits [12:10]. Chỉ dùng `iar & 0x3ff` để dispatch intid, nhưng phải ghi full `iar` vào EOIR; nếu không timer IRQ có thể bị chặn sau IPI.
 
 ## Next steps
-- Thêm ưu tiên (priority), deadline, load balancing giữa các core.
+- Thêm stress test riêng cho kill/reap, wake-before-park và waiter detach.
+- Cân nhắc synchronous remote-stop acknowledgement nếu API kill cần bảo đảm task đã dừng trước khi trả về.
+- Sau đó mới thêm priority, deadline, per-CPU run queue và load balancing.
 
 ---
 

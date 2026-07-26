@@ -65,7 +65,10 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - **Stage 11 (IPC And Synchronization)** — increments 1–2 đã chạy được trên QEMU:
   - increment 1: thêm `spinlock` IRQ-safe (`spin_lock_irqsave` / `spin_unlock_irqrestore`) và `wfe`/`sev` wait hints trong `src/kernel/spinlock.c`; logger hiện là consumer đầu tiên nên output kernel đã được serialize qua cùng primitive này
   - increment 2: thêm fixed IPC channels trong `src/kernel/ipc.c` với một-message mailbox (`IPC_CHANNEL_MAX=8`, `IPC_MESSAGE_MAX=64`), `ipc_send()`, `ipc_receive()`, và detach path cho waiter khi task chết
-  - scheduler hiện có thêm `TASK_STATE_BLOCKED`, `sched_block_task()`, và `sched_wake_task()` để task có thể sleep trong `SYS_IPC_RECV` thay vì spin/yield loop
+  - scheduler dùng `sched_park_task()` / `sched_unpark_task()` với pending-wake token để task sleep trong `SYS_IPC_RECV` mà không bị lost wakeup khi wake đến trước park
+  - IPC và mutex luôn nhả subsystem lock trước khi gọi scheduler; reaper tháo task khỏi run queue dưới `sched_lock` rồi cleanup IPC, mutex, process và MM sau khi nhả khóa
+  - remote kill task đang RUNNING chỉ đặt `kill_pending` và gửi IPI; CPU sở hữu task tự chuyển nó sang DEAD trước khi reaper giải phóng tài nguyên
+  - mutex pool có `active_ops`/`destroying`, task detach khỏi wait queue khi reap, và `mm_context` có refcount, `dying`, active CPU mask cùng deferred release
   - syscall ABI hiện có thêm `SYS_IPC_SEND=451` và `SYS_IPC_RECV=452`; user runtime expose `user_ipc_send()` / `user_ipc_recv()`
   - built-in demo apps mới: `/bin/ipc_recv.elf` và `/bin/ipc_send.elf`
   - runtime verify mới nhất: `load /bin/ipc_recv.elf`, sau đó `load /bin/ipc_send.elf` in `[ipc-send] sent message on channel 1`, `[ipc-recv] got: hello from ipc_send`, và cả hai task exit sạch

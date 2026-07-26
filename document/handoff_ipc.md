@@ -2,7 +2,7 @@
 
 ## Mục tiêu hiện tại
 
-Giữ một IPC slice nhỏ nhưng thực dụng cho single-core runtime:
+Giữ một IPC slice nhỏ nhưng thực dụng cho runtime hiện tại:
 
 - task có thể block trong syscall path
 - kernel có thể wake đúng task khi event đến
@@ -18,7 +18,7 @@ Giữ một IPC slice nhỏ nhưng thực dụng cho single-core runtime:
   - `ipc_receive()` return ngay nếu có message, hoặc block task hiện tại nếu mailbox rỗng
 - `src/kernel/sched.c` + `src/include/kernel/sched.h`
   - thêm `TASK_STATE_BLOCKED`
-  - thêm `sched_block_task()` và `sched_wake_task()`
+  - IPC blocking path dùng `sched_park_task()` và `sched_unpark_task()` với wake token để tránh lost wakeup
   - `ipc_detach_task()` được gọi khi task bị kill/reap để tránh dangling waiter pointer
 - `src/kernel/syscall.c` + `src/include/kernel/syscall.h`
   - thêm `SYS_IPC_SEND=451`
@@ -61,6 +61,14 @@ Fix hiện tại nằm ở:
 - `src/include/kernel/exception.h`
 - `src/kernel/exception.c`
 
+## SMP locking và lifetime
+
+- Receiver được publish vào `waiting_receiver` dưới `channel->lock`, sau đó channel lock được nhả trước khi gọi `sched_park_task()`.
+- Sender lấy waiter khỏi channel dưới `channel->lock`, nhả khóa, rồi mới gọi `sched_unpark_task()`.
+- Nếu sender wake trước khi receiver kịp park, scheduler lưu `wake_pending`; lần park kế tiếp tiêu thụ token thay vì chuyển task sang BLOCKED.
+- Reaper nhả `sched_lock` trước khi gọi `ipc_detach_task()`, vì vậy không còn cạnh khóa ngược `sched_lock -> channel->lock`.
+- Task slot chỉ được clear và tái sử dụng sau khi IPC và mutex detach hoàn tất.
+
 ## Limitations hiện tại
 
 - chỉ có một blocked receiver cho mỗi channel
@@ -68,9 +76,11 @@ Fix hiện tại nằm ở:
 - `send` hiện fail nếu mailbox đang đầy, không block
 - chưa có channel create/destroy động
 - chưa có close semantics, broadcast, multi-waiter queue, stream/pipe semantics, hoặc request/reply routing
+- Channel vẫn chỉ lưu một raw `struct task *` và chỉ hỗ trợ một receiver chờ. An toàn hiện tại phụ thuộc vào invariant reaper luôn detach trước khi clear task slot.
 
 ## Hướng đi hợp lý tiếp theo
 
-1. Thay `waiting_receiver` đơn bằng wait queue thật.
-2. Quyết định primitive kế tiếp: pipe/stream hay lifecycle/wait events cho process manager.
-3. Nếu đi tiếp tới process manager, cân nhắc thêm `waitpid`-style event IPC thay vì mở rộng shell polling.
+1. Thay `waiting_receiver` đơn bằng wait queue nhiều waiter có lifecycle rõ ràng.
+2. Thêm stress test cho wake-before-park, kill waiter và detach/reuse task slot.
+3. Quyết định primitive kế tiếp: pipe/stream hay lifecycle/wait events cho process manager.
+4. Nếu đi tiếp tới process manager, cân nhắc thêm `waitpid`-style event IPC thay vì mở rộng shell polling.

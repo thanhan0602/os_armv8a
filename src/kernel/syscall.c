@@ -242,10 +242,7 @@ static unsigned long sys_getcpu(void)
  */
 static unsigned long sys_exit(unsigned long code)
 {
-    struct task *task = sched_current();
-    if (task != (struct task *)0) {
-        task->exit_status = (int)code;
-    }
+    sched_set_current_exit_status((int)code);
     KER_LOGF("[syscall] user task exited code=%lu\n", code);
     task_exit();
     return 0UL;
@@ -347,16 +344,14 @@ static unsigned long sys_ipc_recv(unsigned long channel_id,
 
 static unsigned long sys_nanosleep(unsigned long seconds)
 {
-    struct task *t = sched_current();
-    if (!t) return (unsigned long)-1;
-
     /* Our timer frequency is currently 2Hz (timer_interval = frequency / 2) */
     /* So 1 second = 2 ticks */
-    t->sleep_ticks = seconds * 2;
-    t->state = TASK_STATE_BLOCKED;
-    
+    if (!sched_sleep_current(seconds * 2UL)) {
+        return (unsigned long)-1;
+    }
+
     schedule();
-    
+
     return 0;
 }
 
@@ -423,29 +418,17 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
         ret = (unsigned long)mutex_pool_alloc();
         break;
     case SYS_MUTEX_DESTROY:
-        mutex_pool_free((int)ctx->gpr[0]);
-        ret = 0UL;
+        ret = mutex_pool_free((int)ctx->gpr[0]) ? 0UL : (unsigned long)-1;
         break;
     case SYS_MUTEX_LOCK:
-    {
-        struct mutex *m = mutex_pool_get((int)ctx->gpr[0]);
-        if (m) mutex_lock(m);
-        ret = 0UL;
+        ret = mutex_pool_lock((int)ctx->gpr[0]) ? 0UL : (unsigned long)-1;
         break;
-    }
     case SYS_MUTEX_UNLOCK:
-    {
-        struct mutex *m = mutex_pool_get((int)ctx->gpr[0]);
-        if (m) mutex_unlock(m);
-        ret = 0UL;
+        ret = mutex_pool_unlock((int)ctx->gpr[0]) ? 0UL : (unsigned long)-1;
         break;
-    }
     case SYS_MUTEX_TRYLOCK:
-    {
-        struct mutex *m = mutex_pool_get((int)ctx->gpr[0]);
-        ret = m ? (unsigned long)mutex_trylock(m) : 0UL;
+        ret = (unsigned long)mutex_pool_trylock((int)ctx->gpr[0]);
         break;
-    }
     case SYS_NANOSLEEP:
         ret = sys_nanosleep(ctx->gpr[0]);
         break;

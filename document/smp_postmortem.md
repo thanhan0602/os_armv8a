@@ -55,3 +55,67 @@ Các core thứ cấp (CPU 1-3) không online ổn định hoặc gây panic nga
 ## Bài học kinh nghiệm
 1. Trong SMP, **mọi** tài nguyên dùng chung (UART, Scheduler, Page Allocator) bắt buộc phải có khóa (Spinlocks).
 2. Phải đảm bảo tính nhất quán của địa chỉ (VA vs PA) trên **tất cả** các core ngay khi MMU được kích hoạt. Con trỏ lưu trong thanh ghi hệ thống (`tpidr_el1`, `ttbrx_el1`) là nơi dễ bị bỏ quên nhất.
+
+---
+
+## 4. MMU, Page Allocator và Process Lifetime sau SMP
+
+### Vấn đề phát hiện
+
+Các subsystem MMU và page allocator được phát triển trước SMP nên từng có các composite operation không được khóa đầy đủ:
+
+- contiguous free có thể rebuild free list đồng thời với allocation
+- hai thread dùng chung MM có thể cùng fault/map một VA
+- CoW có check-then-act race trên PTE và page refcount
+- ASID bitmap/counter có thể được cập nhật đồng thời
+- page refcount về zero nhưng page chưa được trả về allocator
+- fork failure có thể để lại source PTE chuyển sang CoW mà TLB vẫn giữ writable translation
+
+### Cách khắc phục
+
+- Bảo vệ toàn bộ allocator state và consistency snapshot bằng `page_lock`.
+- Thêm `mm_context.lock` và các helper nội bộ yêu cầu caller giữ lock.
+- Serialize lazy fault, CoW, map, unmap, clone và software page-table walk.
+- Dùng broadcast ASID/VA TLB invalidation với barrier phù hợp sau PTE mutation.
+- Bảo vệ ASID allocator và giới hạn range theo cấu hình `TCR_EL1.AS=0`.
+- Đồng bộ process VM metadata với fault handler theo thứ tự `process -> mm -> page allocator`.
+- Chặn multithreaded exec cho đến khi sibling-thread termination được hỗ trợ.
+
+### Kết quả verify
+
+Hai commit liên quan trên branch `fix/mmu-page-allocator-smp` là:
+
+- `8d301d4 fix(mm): harden MMU and page allocator for SMP`
+- `ee16d51 fix(smp): harden process and MM lifetime paths`
+
+Clean build và QEMU 4-core pthread workload đã pass. Tuy nhiên đây không phải bằng chứng rằng mọi interleaving SMP đã được bao phủ.
+
+---
+
+## 5. Scheduler, IPC, mutex và MM lifetime hardening
+
+Audit tiếp theo xác định scheduler wait/wake là vùng rủi ro lớn nhất:
+
+- scheduler reaper giữ `sched_lock` rồi đi vào IPC/process cleanup
+- IPC và mutex giữ subsystem lock rồi gọi scheduler block/wake
+- task state có một số đường ghi ngoài `sched_lock`, gồm nanosleep và remote kill
+- mutex pool có thể destroy/reuse slot đồng thời với operation trên CPU khác
+
+Các đường này đã được xử lý như sau:
+
+- `sched_park_task()`/`sched_unpark_task()` dùng wake token để đóng cửa sổ lost wakeup giữa publish waiter và block.
+- IPC và mutex lấy waiter dưới lock riêng, nhả lock, rồi mới gọi scheduler.
+- Reaper chuyển task sang `TASK_STATE_REAPING` và tháo khỏi run queue dưới `sched_lock`, sau đó mới cleanup subsystem ngoài scheduler lock.
+- Remote kill chỉ đặt `kill_pending` cho task RUNNING và gửi IPI; CPU sở hữu task tự chuyển nó sang DEAD.
+- Nanosleep, exit status và task-state update đi qua scheduler API có khóa.
+- Mutex pool dùng `active_ops` và `destroying`; task chết được detach khỏi wait queue và ownership được handoff an toàn.
+- `mm_context` có refcount, `dying`, active CPU mask và deferred release sau khi CPU cuối cùng tháo context khỏi TTBR0.
+
+QEMU SMP 4 CPU đã chạy hoàn tất workload pthread/mutex với `Complex Test Finished.`, các task thoát `code=0` và không có fatal marker. Các test interleaving chuyên biệt vẫn cần được bổ sung vì một stress run không chứng minh mọi race đã bị loại bỏ.
+
+## Bài học bổ sung
+
+3. Có spinlock chưa đủ; phải định nghĩa **một thứ tự khóa toàn hệ thống** và không tạo chu trình giữa scheduler, process, MM, allocator, IPC và mutex.
+4. Block task và enqueue waiter phải là một transaction quan sát được nguyên tử, nếu không sẽ có lost wakeup.
+5. TLB invalidation chỉ giải quyết stale translation; nó không thay thế lifetime protocol cho page table đang được CPU khác dùng.
+6. Stress test thành công là điều kiện cần, không phải chứng minh không còn race. Cần test riêng các interleaving kill/reap, IPC wait/wake, mutex destroy/waiter, fork/CoW và mmap/fault.

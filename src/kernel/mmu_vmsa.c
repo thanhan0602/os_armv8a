@@ -14,6 +14,7 @@
 /* Root pointer for the empty TTBR0 root during kernel tasks. */
 unsigned long *ttbr0_runtime_empty_root;
 
+#include <arch/arm/cpu.h>
 void mmu_install_empty_ttbr0_root(void)
 {
     unsigned long *new_root;
@@ -453,6 +454,9 @@ struct mm_context *mmu_context_create(void)
     mm->root_pa = (unsigned long)root;
     mm->asid    = mmu_asid_alloc();
     spinlock_init(&mm->lock);
+    mm->refs = 1U;
+    mm->dying = 0U;
+    mm->active_cpu_mask = 0U;
     mm->page_count = 0U;
     for (index = 0U; index < MM_MAX_TRACKED_PAGES; index++) {
         mm->pages[index] = 0UL;
@@ -474,16 +478,38 @@ struct mm_context *mmu_context_create(void)
     return mm;
 }
 
-void mmu_context_destroy(struct mm_context *mm)
+/*
+ * MM ownership and active-TTBR tracking use one global lock. This avoids
+ * taking two mm_context locks in an address-space switch and gives destroy a
+ * single synchronization point against a CPU installing a dying context.
+ */
+static struct spinlock mmu_lifecycle_lock = SPINLOCK_INITIALIZER;
+static struct mm_context *mmu_cpu_context[4];
+
+int mmu_context_get(struct mm_context *mm)
+{
+    unsigned long flags;
+    int acquired = 0;
+
+    if (mm == (struct mm_context *)0) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&mmu_lifecycle_lock);
+    if (mm->refs != 0U && mm->dying == 0U) {
+        mm->refs++;
+        acquired = 1;
+    }
+    spin_unlock_irqrestore(&mmu_lifecycle_lock, flags);
+    return acquired;
+}
+
+static void mmu_context_release(struct mm_context *mm)
 {
     unsigned long owned_pages[MM_MAX_TRACKED_PAGES];
     unsigned int owned_page_count;
     unsigned int index;
     unsigned long irq_flags;
-
-    if (mm == (struct mm_context *)0) {
-        return;
-    }
 
     /*
      * Detach the ownership list atomically from page-table mutation paths.
@@ -515,6 +541,39 @@ void mmu_context_destroy(struct mm_context *mm)
     mmu_asid_free(mm->asid);
 
     kfree(mm);
+}
+
+void mmu_context_put(struct mm_context *mm)
+{
+    unsigned long flags;
+    int release = 0;
+
+    if (mm == (struct mm_context *)0) {
+        return;
+    }
+
+    flags = spin_lock_irqsave(&mmu_lifecycle_lock);
+    if (mm->refs == 0U) {
+        spin_unlock_irqrestore(&mmu_lifecycle_lock, flags);
+        return;
+    }
+
+    mm->refs--;
+    if (mm->refs == 0U) {
+        mm->dying = 1U;
+        release = (mm->active_cpu_mask == 0U);
+    }
+    spin_unlock_irqrestore(&mmu_lifecycle_lock, flags);
+
+    if (release) {
+        mmu_context_release(mm);
+    }
+}
+
+void mmu_context_destroy(struct mm_context *mm)
+{
+    /* Compatibility name: destruction now means dropping an owner ref. */
+    mmu_context_put(mm);
 }
 
 /* Caller holds both source and destination mm locks. */
@@ -682,19 +741,47 @@ int mmu_user_page_pa(const struct mm_context *mm, unsigned long va,
 void mmu_context_switch(struct mm_context *mm)
 {
     unsigned long ttbr0_val;
+    unsigned long flags;
+    unsigned int cpu_id;
+    struct mm_context *old_mm;
+    struct mm_context *release_mm = (struct mm_context *)0;
 
     if (!mmu_is_enabled()) {
         return;
     }
 
-    if (mm == (struct mm_context *)0) {
-        ttbr0_val = (unsigned long)va_to_pa(ttbr0_runtime_empty_root);
-    } else {
-        ttbr0_val = mm->root_pa | ((unsigned long)mm->asid << 48);
+    cpu_id = arch_get_cpu_id();
+    flags = spin_lock_irqsave(&mmu_lifecycle_lock);
+    old_mm = mmu_cpu_context[cpu_id];
+
+    if (old_mm != (struct mm_context *)0) {
+        old_mm->active_cpu_mask &= ~(1U << cpu_id);
+        if (old_mm->dying != 0U && old_mm->refs == 0U &&
+            old_mm->active_cpu_mask == 0U) {
+            release_mm = old_mm;
+        }
     }
+
+    if (mm != (struct mm_context *)0 && mm->dying == 0U && mm->refs != 0U) {
+        mm->active_cpu_mask |= (1U << cpu_id);
+        mmu_cpu_context[cpu_id] = mm;
+        ttbr0_val = mm->root_pa | ((unsigned long)mm->asid << 48);
+    } else {
+        mmu_cpu_context[cpu_id] = (struct mm_context *)0;
+        ttbr0_val = (unsigned long)va_to_pa(ttbr0_runtime_empty_root);
+    }
+    spin_unlock_irqrestore(&mmu_lifecycle_lock, flags);
 
     mmu_set_ttbr0(ttbr0_val);
     mmu_invalidate_tlb_all();
+
+    /*
+     * The final active CPU performs deferred release only after its TTBR0 no
+     * longer references the context and the local TLB has been invalidated.
+     */
+    if (release_mm != (struct mm_context *)0) {
+        mmu_context_release(release_mm);
+    }
 }
 
 /* Caller must hold mm->lock. */

@@ -267,8 +267,8 @@ Current behavior:
 
 Implemented (second increment — fixed IPC channels + blocking receive):
 - Added `src/include/kernel/ipc.h` and `src/kernel/ipc.c` with fixed global channels (`IPC_CHANNEL_MAX=8`) and one-message mailboxes (`IPC_MESSAGE_MAX=64`)
-- Added `ipc_send()` and `ipc_receive()`; `recv` blocks by marking the current task `TASK_STATE_BLOCKED`, and `send` wakes a waiting receiver when a message arrives
-- Scheduler now has `TASK_STATE_BLOCKED`, `sched_block_task()`, and `sched_wake_task()` so Stage 11 can suspend and resume tasks cleanly instead of spinning in the syscall layer
+- Added `ipc_send()` and `ipc_receive()`; `recv` publishes its waiter under the channel lock and then uses `sched_park_task()`, while `send` removes the waiter before calling `sched_unpark_task()` after releasing the channel lock
+- Scheduler now uses a pending-wake token in `sched_park_task()` / `sched_unpark_task()` so Stage 11 can suspend and resume tasks without spinning or losing a wake that arrives before the receiver parks
 - Added `ipc_detach_task()` so a killed/reaped task is removed from channel wait state before its task slot and process resources are freed
 - Added user-visible syscalls `SYS_IPC_SEND=451` and `SYS_IPC_RECV=452`, plus user wrappers `user_ipc_send()` / `user_ipc_recv()`
 - Added built-in user demos `/bin/ipc_recv.elf` and `/bin/ipc_send.elf` for shell-driven validation
@@ -284,6 +284,14 @@ Implemented (third increment — blocking Mutex):
 - Implemented `mutex_lock` and `mutex_unlock` with wait-queue support using `task->wait_next`
 - Mutex operations are SMP-safe using internal spinlocks and `irqsave/irqrestore`
 - Verified by spawning multiple kernel tasks on different cores competing for a shared variable with deliberate delays
+
+Implemented (fourth increment — SMP scheduler and lifetime hardening):
+- Removed scheduler/subsystem lock inversion by performing IPC, mutex, process, MM, stack, and allocator cleanup after releasing `sched_lock`
+- Added `TASK_STATE_REAPING`, waiter detach, mutex ownership handoff, and mutex-pool `active_ops`/`destroying` lifetime protection
+- Made remote task kill SMP-safe with `kill_pending` plus IPI; the owning CPU transitions a running task to DEAD before reaping
+- Routed nanosleep and task-state updates through scheduler APIs protected by `sched_lock`
+- Added `mm_context` owner references, `dying`, active CPU tracking, and deferred release after the final CPU switches TTBR0 away
+- Verified on QEMU with four CPUs: all secondary CPUs came online, the pthread workload printed `Complex Test Finished.`, all user tasks exited with code 0, and no fatal marker was found
 
 ### Stage 12: Filesystem And Program Loading
 
