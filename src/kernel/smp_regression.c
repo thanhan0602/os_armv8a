@@ -13,7 +13,9 @@
 #define SMP_PASS_MUTEX_WAITER_DETACH    (1U << 3)
 #define SMP_PASS_MUTEX_DESTROY_REJECT   (1U << 4)
 #define SMP_PASS_MM_DEFERRED_RELEASE    (1U << 5)
-#define SMP_PASS_ALL                    ((1U << 6) - 1U)
+#define SMP_PASS_MUTEX_DESTROY_RACE     (1U << 6)
+#define SMP_PASS_ALL                    ((1U << 7) - 1U)
+#define MUTEX_DESTROY_RACE_ROUNDS       512U
 
 static volatile unsigned int smp_regression_pass_mask;
 static struct spinlock smp_regression_pass_lock = SPINLOCK_INITIALIZER;
@@ -55,6 +57,11 @@ static volatile unsigned int waiter_kill_owner_ready;
 static volatile unsigned int killed_waiter_started;
 static volatile unsigned int waiter_kill_release_owner;
 static volatile unsigned int waiter_kill_owner_done;
+static volatile int mutex_destroy_race_id;
+static volatile unsigned int mutex_destroy_race_held;
+static volatile unsigned int mutex_destroy_race_probe_done;
+static volatile unsigned int mutex_destroy_race_finished;
+static volatile unsigned int mutex_destroy_race_failed;
 static volatile struct mm_context *mm_lifetime_context;
 static volatile unsigned int mm_lifetime_active;
 static volatile unsigned int mm_lifetime_detach;
@@ -366,6 +373,8 @@ static void mutex_detach_controller(void)
 
 static void mutex_waiter_kill_owner(void)
 {
+    unsigned int round;
+
     if (!mutex_pool_lock(mutex_waiter_kill_id)) {
         KER_INFO("[stress] mutex-waiter-detach FAIL: owner lock failed");
         task_exit();
@@ -380,6 +389,40 @@ static void mutex_waiter_kill_owner(void)
 
     (void)mutex_pool_unlock(mutex_waiter_kill_id);
     waiter_kill_owner_done = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+
+    while (mutex_destroy_race_id < 0) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        schedule();
+    }
+
+    for (round = 0U; round < MUTEX_DESTROY_RACE_ROUNDS; round++) {
+        if (!mutex_pool_lock(mutex_destroy_race_id)) {
+            mutex_destroy_race_failed = 1U;
+            break;
+        }
+
+        mutex_destroy_race_held = round + 1U;
+        __asm__ volatile("dmb ish; sev" ::: "memory");
+        while (mutex_destroy_race_probe_done != round + 1U) {
+            __asm__ volatile("dmb ish" ::: "memory");
+            schedule();
+        }
+
+        if (!mutex_pool_unlock(mutex_destroy_race_id)) {
+            mutex_destroy_race_failed = 1U;
+            break;
+        }
+
+        if (mutex_pool_trylock(mutex_destroy_race_id)) {
+            if (!mutex_pool_unlock(mutex_destroy_race_id)) {
+                mutex_destroy_race_failed = 1U;
+                break;
+            }
+        }
+    }
+
+    mutex_destroy_race_finished = 1U;
     __asm__ volatile("dmb ish; sev" ::: "memory");
     task_exit();
 }
@@ -463,6 +506,46 @@ static void mutex_waiter_kill_controller(void)
         smp_regression_mark_pass(SMP_PASS_MUTEX_WAITER_DETACH);
     } else {
         KER_INFO("[stress] mutex-waiter-detach FAIL: slot stayed busy");
+        task_exit();
+    }
+
+    mutex_destroy_race_id = mutex_pool_alloc();
+    if (mutex_destroy_race_id < 0) {
+        KER_INFO("[stress] mutex-destroy-race FAIL: pool allocation failed");
+        task_exit();
+    }
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+
+    for (unsigned int round = 0U; round < MUTEX_DESTROY_RACE_ROUNDS; round++) {
+        while (mutex_destroy_race_held != round + 1U) {
+            __asm__ volatile("dmb ish" ::: "memory");
+            if (mutex_destroy_race_failed != 0U) {
+                break;
+            }
+            schedule();
+        }
+
+        if (mutex_destroy_race_failed != 0U ||
+            mutex_pool_free(mutex_destroy_race_id)) {
+            mutex_destroy_race_failed = 1U;
+            break;
+        }
+
+        mutex_destroy_race_probe_done = round + 1U;
+        __asm__ volatile("dmb ish; sev" ::: "memory");
+    }
+
+    while (mutex_destroy_race_finished == 0U) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        schedule();
+    }
+
+    if (mutex_destroy_race_failed == 0U &&
+        mutex_pool_free(mutex_destroy_race_id)) {
+        KER_INFO("[stress] mutex-destroy-race PASS");
+        smp_regression_mark_pass(SMP_PASS_MUTEX_DESTROY_RACE);
+    } else {
+        KER_INFO("[stress] mutex-destroy-race FAIL: race invariant violated");
     }
     task_exit();
 }
@@ -485,6 +568,11 @@ void smp_regression_start(void)
     killed_waiter_started = 0U;
     waiter_kill_release_owner = 0U;
     waiter_kill_owner_done = 0U;
+    mutex_destroy_race_id = -1;
+    mutex_destroy_race_held = 0U;
+    mutex_destroy_race_probe_done = 0U;
+    mutex_destroy_race_finished = 0U;
+    mutex_destroy_race_failed = 0U;
     mutex_waiter_kill_id = mutex_pool_alloc();
     mm_lifetime_context = (struct mm_context *)0;
     mm_lifetime_active = 0U;
