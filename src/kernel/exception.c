@@ -253,6 +253,7 @@ void exception_handle_irq(unsigned long vector_id,
 {
     unsigned int iar;
     unsigned int intid;
+    int reschedule = 1;
 
     (void)esr_el1;
     (void)elr_el1;
@@ -279,6 +280,15 @@ void exception_handle_irq(unsigned long vector_id,
     if (intid == 0U) {
         /* IPI 0: reschedule request */
         /* ACK/EOI is enough to clear the SGI */
+    } else if (intid == 1U) {
+        /* IPI 1: synchronous MM ASID shootdown request. */
+        mmu_handle_shootdown_ipi();
+        /*
+         * A shootdown acknowledgement must not implicitly switch the target
+         * CPU away from its current address space. The requester only needs
+         * confirmation that this CPU completed the requested TLBI.
+         */
+        reschedule = 0;
     } else if (!timer_handle_irq(intid)) {
         KER_LOGF("[irq] unexpected vector=%s\n", exception_vector_name(vector_id));
         KER_LOGF("[irq] unexpected intid=%u\n", intid);
@@ -286,7 +296,9 @@ void exception_handle_irq(unsigned long vector_id,
 
     gicv2_end_of_interrupt(iar);
 
-    schedule();
+    if (reschedule) {
+        schedule();
+    }
 }
 
 void exception_trigger_test(void)

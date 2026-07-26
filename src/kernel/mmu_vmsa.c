@@ -8,6 +8,7 @@
 #include <kernel/vm.h>
 #include <arch/arm/virt.h>
 #include <arch/arm/sysregs.h>
+#include <drivers/interrupt/gicv2.h>
 
 #ifdef CONFIG_KERNEL_VIRTUAL
 
@@ -485,6 +486,99 @@ struct mm_context *mmu_context_create(void)
  */
 static struct spinlock mmu_lifecycle_lock = SPINLOCK_INITIALIZER;
 static struct mm_context *mmu_cpu_context[4];
+
+/*
+ * SGI 1 is reserved for synchronous MM shootdown. Requests are serialized so
+ * one global ASID and acknowledgement mask are sufficient. The state lock is
+ * separate because remote IRQ handlers must acknowledge while the requester
+ * retains the serialization lock.
+ */
+#define MMU_SHOOTDOWN_SGI 1U
+#define MMU_CPU_MASK_ALL  0x0fU
+
+static struct spinlock mmu_shootdown_lock = SPINLOCK_INITIALIZER;
+static struct spinlock mmu_shootdown_state_lock = SPINLOCK_INITIALIZER;
+static unsigned int mmu_shootdown_asid;
+static unsigned int mmu_shootdown_pending_mask;
+
+void mmu_handle_shootdown_ipi(void)
+{
+    unsigned long flags;
+    unsigned int cpu_id;
+    unsigned int cpu_bit;
+    unsigned int asid;
+
+    cpu_id = arch_get_cpu_id();
+    if (cpu_id >= 4U) {
+        return;
+    }
+    cpu_bit = 1U << cpu_id;
+
+    flags = spin_lock_irqsave(&mmu_shootdown_state_lock);
+    if ((mmu_shootdown_pending_mask & cpu_bit) == 0U) {
+        spin_unlock_irqrestore(&mmu_shootdown_state_lock, flags);
+        return;
+    }
+    asid = mmu_shootdown_asid;
+    spin_unlock_irqrestore(&mmu_shootdown_state_lock, flags);
+
+    mmu_tlbi_asid(asid);
+
+    flags = spin_lock_irqsave(&mmu_shootdown_state_lock);
+    mmu_shootdown_pending_mask &= ~cpu_bit;
+    spin_unlock_irqrestore(&mmu_shootdown_state_lock, flags);
+    __asm__ volatile("sev" ::: "memory");
+}
+
+int mmu_context_shootdown(struct mm_context *mm)
+{
+    unsigned long serial_flags;
+    unsigned long lifecycle_flags;
+    unsigned long state_flags;
+    unsigned int cpu_id;
+    unsigned int local_bit;
+    unsigned int target_mask;
+    unsigned int pending;
+
+    if (mm == (struct mm_context *)0 || !mmu_is_enabled()) {
+        return 0;
+    }
+
+    cpu_id = arch_get_cpu_id();
+    if (cpu_id >= 4U) {
+        return 0;
+    }
+    local_bit = 1U << cpu_id;
+
+    serial_flags = spin_lock_irqsave(&mmu_shootdown_lock);
+
+    lifecycle_flags = spin_lock_irqsave(&mmu_lifecycle_lock);
+    target_mask = mm->active_cpu_mask & MMU_CPU_MASK_ALL & ~local_bit;
+    spin_unlock_irqrestore(&mmu_lifecycle_lock, lifecycle_flags);
+
+    state_flags = spin_lock_irqsave(&mmu_shootdown_state_lock);
+    mmu_shootdown_asid = mm->asid;
+    mmu_shootdown_pending_mask = target_mask;
+    spin_unlock_irqrestore(&mmu_shootdown_state_lock, state_flags);
+
+    /* The requester completes its own invalidation directly. */
+    mmu_tlbi_asid(mm->asid);
+    if (target_mask != 0U) {
+        gicv2_send_ipi(target_mask, MMU_SHOOTDOWN_SGI);
+    }
+
+    do {
+        state_flags = spin_lock_irqsave(&mmu_shootdown_state_lock);
+        pending = mmu_shootdown_pending_mask;
+        spin_unlock_irqrestore(&mmu_shootdown_state_lock, state_flags);
+        if (pending != 0U) {
+            __asm__ volatile("wfe" ::: "memory");
+        }
+    } while (pending != 0U);
+
+    spin_unlock_irqrestore(&mmu_shootdown_lock, serial_flags);
+    return 1;
+}
 
 #ifdef CONFIG_SMP_REGRESSION_TESTS
 static unsigned long mmu_context_release_count;

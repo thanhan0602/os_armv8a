@@ -144,6 +144,16 @@ void mmu_context_put(struct mm_context *mm);
 void mmu_context_destroy(struct mm_context *mm);
 void mmu_context_switch(struct mm_context *mm);
 
+/*
+ * Synchronously invalidate an address-space ASID on every CPU that currently
+ * has the context installed. Remote CPUs acknowledge completion through the
+ * dedicated MM shootdown SGI before this function returns.
+ */
+int mmu_context_shootdown(struct mm_context *mm);
+
+/* Called by the IRQ dispatcher when the dedicated MM shootdown SGI arrives. */
+void mmu_handle_shootdown_ipi(void);
+
 #ifdef CONFIG_SMP_REGRESSION_TESTS
 /*
  * Test-only lifecycle observability. The snapshot caller must ensure the
