@@ -15,7 +15,8 @@
 #define SMP_PASS_MM_DEFERRED_RELEASE    (1U << 5)
 #define SMP_PASS_MUTEX_DESTROY_RACE     (1U << 6)
 #define SMP_PASS_MM_MULTI_CPU_DETACH    (1U << 7)
-#define SMP_PASS_ALL                    ((1U << 8) - 1U)
+#define SMP_PASS_MUTEX_STALE_HANDLE     (1U << 8)
+#define SMP_PASS_ALL                    ((1U << 9) - 1U)
 #define MUTEX_DESTROY_RACE_ROUNDS       512U
 
 static volatile unsigned int smp_regression_pass_mask;
@@ -593,8 +594,27 @@ static void mutex_waiter_kill_controller(void)
 
     if (mutex_destroy_race_failed == 0U &&
         mutex_pool_free(mutex_destroy_race_id)) {
+        int stale_handle = mutex_destroy_race_id;
+        int replacement_handle;
+
         KER_INFO("[stress] mutex-destroy-race PASS");
         smp_regression_mark_pass(SMP_PASS_MUTEX_DESTROY_RACE);
+
+        replacement_handle = mutex_pool_alloc();
+        if (replacement_handle < 0 || replacement_handle == stale_handle ||
+            mutex_pool_lock(stale_handle) ||
+            mutex_pool_trylock(stale_handle) ||
+            mutex_pool_unlock(stale_handle) ||
+            mutex_pool_free(stale_handle) ||
+            !mutex_pool_trylock(replacement_handle) ||
+            !mutex_pool_unlock(replacement_handle) ||
+            !mutex_pool_free(replacement_handle)) {
+            KER_INFO("[stress] mutex-stale-handle FAIL: generation check failed");
+            task_exit();
+        }
+
+        KER_INFO("[stress] mutex-stale-handle PASS");
+        smp_regression_mark_pass(SMP_PASS_MUTEX_STALE_HANDLE);
     } else {
         KER_INFO("[stress] mutex-destroy-race FAIL: race invariant violated");
     }

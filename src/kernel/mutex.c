@@ -3,9 +3,32 @@
 #include <kernel/log.h>
 
 #define MAX_MUTEX_POOL 64
+#define MUTEX_HANDLE_INDEX_BITS 6U
+#define MUTEX_HANDLE_INDEX_MASK ((1U << MUTEX_HANDLE_INDEX_BITS) - 1U)
+#define MUTEX_HANDLE_GENERATION_MAX 0x01ffffffU
 static struct mutex mutex_pool[MAX_MUTEX_POOL];
 static int mutex_pool_used[MAX_MUTEX_POOL];
+static unsigned int mutex_pool_generation[MAX_MUTEX_POOL];
 static struct spinlock pool_lock = SPINLOCK_INITIALIZER;
+
+static int mutex_handle_index(int handle)
+{
+    if (handle < 0) {
+        return -1;
+    }
+    return (int)((unsigned int)handle & MUTEX_HANDLE_INDEX_MASK);
+}
+
+static unsigned int mutex_handle_generation(int handle)
+{
+    return (unsigned int)handle >> MUTEX_HANDLE_INDEX_BITS;
+}
+
+static int mutex_make_handle(int index, unsigned int generation)
+{
+    return (int)((generation << MUTEX_HANDLE_INDEX_BITS) |
+                 (unsigned int)index);
+}
 
 void mutex_init(struct mutex *mutex)
 {
@@ -185,18 +208,24 @@ void mutex_detach_task(struct task *task)
     }
 }
 
-static struct mutex *mutex_pool_pin(int id)
+static struct mutex *mutex_pool_pin(int handle)
 {
     struct mutex *mutex;
+    int index;
+    unsigned int generation;
     unsigned long flags;
 
-    if (id < 0 || id >= MAX_MUTEX_POOL) {
+    index = mutex_handle_index(handle);
+    generation = mutex_handle_generation(handle);
+    if (index < 0 || index >= MAX_MUTEX_POOL || generation == 0U) {
         return (struct mutex *)0;
     }
 
     flags = spin_lock_irqsave(&pool_lock);
-    mutex = &mutex_pool[id];
-    if (!mutex_pool_used[id] || mutex->destroying != 0U) {
+    mutex = &mutex_pool[index];
+    if (!mutex_pool_used[index] ||
+        mutex_pool_generation[index] != generation ||
+        mutex->destroying != 0U) {
         spin_unlock_irqrestore(&pool_lock, flags);
         return (struct mutex *)0;
     }
@@ -219,10 +248,15 @@ int mutex_pool_alloc(void)
     unsigned long flags = spin_lock_irqsave(&pool_lock);
     for (int i = 0; i < MAX_MUTEX_POOL; i++) {
         if (!mutex_pool_used[i]) {
+            mutex_pool_generation[i]++;
+            if (mutex_pool_generation[i] == 0U ||
+                mutex_pool_generation[i] > MUTEX_HANDLE_GENERATION_MAX) {
+                mutex_pool_generation[i] = 1U;
+            }
             mutex_pool_used[i] = 1;
             mutex_init(&mutex_pool[i]);
             spin_unlock_irqrestore(&pool_lock, flags);
-            return i;
+            return mutex_make_handle(i, mutex_pool_generation[i]);
         }
     }
     spin_unlock_irqrestore(&pool_lock, flags);
@@ -257,17 +291,23 @@ int mutex_pool_unlock(int id)
     return 1;
 }
 
-int mutex_pool_free(int id)
+int mutex_pool_free(int handle)
 {
     struct mutex *mutex;
+    int index;
+    unsigned int generation;
     unsigned long pool_flags;
     unsigned long mutex_flags;
 
-    if (id < 0 || id >= MAX_MUTEX_POOL) return 0;
+    index = mutex_handle_index(handle);
+    generation = mutex_handle_generation(handle);
+    if (index < 0 || index >= MAX_MUTEX_POOL || generation == 0U) return 0;
 
     pool_flags = spin_lock_irqsave(&pool_lock);
-    mutex = &mutex_pool[id];
-    if (!mutex_pool_used[id] || mutex->destroying != 0U) {
+    mutex = &mutex_pool[index];
+    if (!mutex_pool_used[index] ||
+        mutex_pool_generation[index] != generation ||
+        mutex->destroying != 0U) {
         spin_unlock_irqrestore(&pool_lock, pool_flags);
         return 0;
     }
@@ -291,7 +331,13 @@ int mutex_pool_free(int id)
     spin_unlock_irqrestore(&mutex->lock, mutex_flags);
 
     pool_flags = spin_lock_irqsave(&pool_lock);
-    mutex_pool_used[id] = 0;
+    if (!mutex_pool_used[index] ||
+        mutex_pool_generation[index] != generation) {
+        mutex->destroying = 0U;
+        spin_unlock_irqrestore(&pool_lock, pool_flags);
+        return 0;
+    }
+    mutex_pool_used[index] = 0;
     mutex->destroying = 0U;
     spin_unlock_irqrestore(&pool_lock, pool_flags);
     return 1;

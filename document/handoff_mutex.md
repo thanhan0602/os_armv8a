@@ -48,6 +48,7 @@
 - SMP regression cũng xác minh trường hợp waiter đang BLOCKED bị kill. `mutex_detach_task()` xóa waiter khỏi queue và giải phóng `active_ops` pin mà task bị kill không thể tự unpin khi quay về từ `mutex_pool_lock()`. Owner sau đó unlock bình thường và pool slot được giải phóng. Marker: `[stress] mutex-waiter-detach PASS`.
 - Trước khi cho owner unlock, regression gọi `mutex_pool_free()` đồng thời và xác minh destroy bị từ chối khi mutex còn locked/có owner. Marker: `[stress] mutex-concurrent-destroy PASS`.
 - Regression nhiều vòng tái sử dụng hai task hiện có để chạy 512 vòng lock, concurrent destroy rejection, unlock và trylock/unlock. Sau khi worker kết thúc, pool slot phải destroy thành công. Marker: `[stress] mutex-destroy-race PASS`.
+- Mutex pool handle giờ mã hóa cả slot index và generation. Khi một slot được free rồi cấp lại, handle cũ bị từ chối bởi lock, trylock, unlock và free, trong khi handle generation mới vẫn hoạt động bình thường. Marker: `[stress] mutex-stale-handle PASS`.
 
 ## Lệnh verify nhanh
 - Build và chạy QEMU:
@@ -65,6 +66,7 @@
 - [x] Thêm regression test kill waiter đang BLOCKED và phát hiện operation-pin leak.
 - [x] Xác minh destroy bị từ chối khi mutex còn locked/có owner.
 - [x] Thêm stress test 512 vòng cho destroy cạnh tranh với lock/trylock/unlock.
+- [x] Thêm generation-tagged handle và regression ngăn stale handle truy cập mutex mới tái sử dụng cùng pool slot.
 - [ ] Cân nhắc generation counter cho mutex ID để phát hiện stale handle sau khi slot được tái sử dụng.
 - [ ] Hỗ trợ **Condition Variables** (`pthread_cond_t`) để hoàn thiện bộ công cụ POSIX sync.
 - [ ] Cải thiện bộ cấp phát Mutex Pool (dynamic allocation thay vì static array nếu có nhu cầu).

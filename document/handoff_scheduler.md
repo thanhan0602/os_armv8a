@@ -64,6 +64,7 @@
 - [x] Thêm regression test shared `mm_context` active trên hai CPU; xác minh chỉ CPU detach cuối cùng mới release context.
 - [x] Tổng hợp sáu regression bằng pass mask có khóa, in `[stress] ALL PASS` và tắt QEMU xác định qua PSCI `SYSTEM_OFF`.
 - [x] Thêm stress test 512 vòng lock/trylock/unlock cạnh tranh với destroy; xác minh destroy luôn bị từ chối khi mutex đang được giữ và thành công sau khi mọi operation kết thúc.
+- [x] Thêm stale mutex handle regression; xác minh generation cũ không thể thao tác trên slot đã được cấp lại.
 - Cân nhắc synchronous remote-stop acknowledgement nếu API kill cần bảo đảm task đã dừng trước khi trả về.
 - Sau đó mới thêm priority, deadline, per-CPU run queue và load balancing.
 

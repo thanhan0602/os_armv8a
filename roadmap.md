@@ -354,7 +354,8 @@ Implemented (fifth increment — ASID support):
 3. Stage 16 regression runner: ✅ Added spinlock-protected suite aggregation, `[stress] ALL PASS`, and deterministic QEMU exit through PSCI `SYSTEM_OFF`. A full four-core run exits with status 0 after all six checks pass.
 4. Stage 16 repeated mutex lifetime race: ✅ Added a deterministic 512-round lock/trylock/unlock versus destroy regression. The full four-core suite prints `[stress] mutex-destroy-race PASS`, then `[stress] ALL PASS`, and QEMU exits with status 0.
 5. Stage 16 multi-CPU MM lifetime: ✅ Added a deterministic shared-MM regression with the same context active on two CPUs. The first detach leaves the DYING context alive, the final detach releases it exactly once, and the full suite exits with status 0 after `[stress] mm-multi-cpu-detach PASS` and `[stress] ALL PASS`.
-6. Add generation-tagged mutex pool handles and synchronous cross-CPU MM shootdown acknowledgement.
+6. Stage 16 generation-tagged mutex handles: ✅ Mutex handles now encode pool index and generation. A deterministic regression frees and reallocates the same slot, rejects every operation through the stale handle, validates the replacement handle, prints `[stress] mutex-stale-handle PASS`, and completes the four-core suite with status 0.
+7. Add synchronous cross-CPU MM shootdown acknowledgement.
 4. Stage 16 increment 3: Kernel Preemption. Currently, the kernel only reschedules on explicit yield or return from interrupt. Full kernel preemption would allow higher priority tasks to interrupt lower priority kernel work.
 5. Stage 11 increment 3: add a real wait-queue abstraction or multi-waiter channel queue so IPC is no longer limited to one blocked receiver per channel.
 6. Stage 12 increment 3: add a real init-style launch path so the kernel boots one named program from the filesystem instead of hardcoding demo pairs in `main.c`.
