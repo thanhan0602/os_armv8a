@@ -349,38 +349,79 @@ void page_free(void *page)
 void page_ref_inc(unsigned long pa)
 {
     unsigned long flags = spin_lock_irqsave(&page_lock);
-    unsigned int idx = page_index_from_address(pa);
-    if (pa >= managed_start && pa < managed_end) {
-        pages[idx].ref_count++;
+
+    if (pa < managed_start || pa >= managed_end) {
+        spin_unlock_irqrestore(&page_lock, flags);
+        return;
     }
+
+    unsigned int idx = page_index_from_address(pa);
+    if (pages[idx].state != PAGE_STATE_ALLOCATED ||
+        pages[idx].ref_count == 0U ||
+        pages[idx].ref_count == (unsigned short)~0U) {
+        spin_unlock_irqrestore(&page_lock, flags);
+        return;
+    }
+
+    pages[idx].ref_count++;
     spin_unlock_irqrestore(&page_lock, flags);
 }
 
 int page_ref_dec(unsigned long pa)
 {
+    struct page_node *node;
     unsigned long flags = spin_lock_irqsave(&page_lock);
-    unsigned int idx = page_index_from_address(pa);
+
     if (pa < managed_start || pa >= managed_end) {
         spin_unlock_irqrestore(&page_lock, flags);
         return 0;
     }
-    if (pages[idx].ref_count > 0) {
-        pages[idx].ref_count--;
+
+    unsigned int idx = page_index_from_address(pa);
+    if (pages[idx].state != PAGE_STATE_ALLOCATED ||
+        pages[idx].ref_count == 0U) {
+        spin_unlock_irqrestore(&page_lock, flags);
+        return 0;
     }
-    int ref = (int)pages[idx].ref_count;
+
+    pages[idx].ref_count--;
+    if (pages[idx].ref_count != 0U) {
+        spin_unlock_irqrestore(&page_lock, flags);
+        return 0;
+    }
+
+    /*
+     * The final reference owns the transition back to the allocator. Keep
+     * the refcount decrement, state change, free-list insertion, and counter
+     * update in one critical section so another CPU cannot observe a zero-ref
+     * page that is still marked allocated or recycle it twice.
+     */
+    node = (struct page_node *)page_pa_to_ptr(pa);
+    node->next = (struct page_node *)page_free_list_pa;
+    page_free_list_pa = pa;
+    pages[idx].state = PAGE_STATE_FREE;
+    free_pages++;
+
     spin_unlock_irqrestore(&page_lock, flags);
-    return ref;
+    return 1;
 }
 
 unsigned int page_ref_get(unsigned long pa)
 {
     unsigned int ref;
     unsigned long flags = spin_lock_irqsave(&page_lock);
-    unsigned int idx = page_index_from_address(pa);
+
     if (pa < managed_start || pa >= managed_end) {
         spin_unlock_irqrestore(&page_lock, flags);
         return 0;
     }
+
+    unsigned int idx = page_index_from_address(pa);
+    if (pages[idx].state != PAGE_STATE_ALLOCATED) {
+        spin_unlock_irqrestore(&page_lock, flags);
+        return 0;
+    }
+
     ref = (unsigned int)pages[idx].ref_count;
     spin_unlock_irqrestore(&page_lock, flags);
     return ref;
@@ -390,20 +431,25 @@ void page_free_contiguous(void *page, unsigned long page_count)
 {
     unsigned long page_addr;
     unsigned long offset;
+    unsigned long flags;
 
     if (page == (void *)0 || page_count == 0UL) {
         return;
     }
 
+    flags = spin_lock_irqsave(&page_lock);
+
     page_addr = (unsigned long)page;
     if ((page_addr & (PAGE_SIZE - 1UL)) != 0UL) {
         invalid_free_count++;
+        spin_unlock_irqrestore(&page_lock, flags);
         page_allocator_warn("ignoring unaligned contiguous page free", page_addr);
         return;
     }
 
     if (page_addr < managed_start || (page_addr + (page_count * PAGE_SIZE)) > managed_end) {
         invalid_free_count++;
+        spin_unlock_irqrestore(&page_lock, flags);
         page_allocator_warn("ignoring out-of-range contiguous page free", page_addr);
         return;
     }
@@ -414,6 +460,7 @@ void page_free_contiguous(void *page, unsigned long page_count)
         free_addr = page_addr + (offset * PAGE_SIZE);
         if (pages[page_index_from_address(free_addr)].state != PAGE_STATE_ALLOCATED) {
             double_free_count++;
+            spin_unlock_irqrestore(&page_lock, flags);
             page_allocator_warn("ignoring duplicate or invalid contiguous page free", free_addr);
             return;
         }
@@ -428,6 +475,7 @@ void page_free_contiguous(void *page, unsigned long page_count)
 
     free_pages += page_count;
     page_allocator_rebuild_free_list();
+    spin_unlock_irqrestore(&page_lock, flags);
 }
 
 unsigned long page_allocator_total_pages(void)

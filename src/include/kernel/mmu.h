@@ -1,6 +1,8 @@
 #ifndef KERNEL_MMU_H
 #define KERNEL_MMU_H
 
+#include <kernel/spinlock.h>
+
 /*
  * MMU bring-up API for the current kernel-only EL1 address space.
  *
@@ -15,7 +17,6 @@ void mmu_init(void);
 void mmu_init_secondary(void);
 int mmu_is_enabled(void);
 int mmu_handle_page_fault(unsigned long far_el1, unsigned long esr_el1);
-void mmu_log_kernel_layout(void);
 
 /* Refactored version to handle faults for a specific process (used during loading) */
 struct process;
@@ -50,7 +51,7 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
 #define MMU_MAIR_NORMAL_WBWA   0xffUL
 #define MMU_TCR_IPS_48BIT      (5UL << 32)
 #ifdef CONFIG_KERNEL_VIRTUAL
-#define MMU_T1SZ               (16UL << 16)
+#define MMU_T1SZ               (MMU_T0SZ << 16)
 #define MMU_TG1_4K             (2UL << 30)
 #endif
 
@@ -87,7 +88,7 @@ extern unsigned long *l2_ram_table_ttbr1;
 int build_kernel_map(void);
 #endif
 
-unsigned long mmu_kernel_page_attrs(unsigned long address);
+unsigned long mmu_kernel_page_attrs_pa(unsigned long pa);
 int mmu_build_identity_map(void);
 unsigned long *alloc_named_table_page(const char *name);
 
@@ -106,14 +107,23 @@ void mmu_install_empty_ttbr0_root(void);
  */
 /*
  * Maximum number of physical pages an mm_context can track.
- * Currently 256 allows for large mappings (hundreds of code/stack pages) 
- * plus their intermediate page table pages.
+ * For the current two-mapping layout (code page + stack page):
+ *   L0=1, L1=1, L2=1, L3=1 per mmu_map_user_page call (up to 4 sub-tables)
+ *   2 calls × 4 levels = 8 sub-table pages worst-case (many shared in practice)
+ *   + 2 user content pages (code, stack) = 10 total.
+ * 16 gives comfortable headroom for future extra mappings.
  */
 #define MM_MAX_TRACKED_PAGES 256
 
 struct mm_context {
     unsigned long root_pa;
-    unsigned int  asid;     /* 8-bit ASID encoded in TTBR0_EL1[55:48]; 0 = kernel/empty */
+    unsigned int  asid;     /* Active 8-bit ASID, 1-255; 0 = kernel/empty */
+    /*
+     * Serializes page-table mutations and the owned-page tracking array.
+     * This is required when CLONE_VM threads sharing this context run on
+     * different CPUs and fault, map, unmap, or resolve CoW concurrently.
+     */
+    struct spinlock lock;
     unsigned long pages[MM_MAX_TRACKED_PAGES]; /* PAs of all owned pages (sub-tables + user data) */
     unsigned int  page_count;                  /* number of valid entries in pages[] */
 };

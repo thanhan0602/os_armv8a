@@ -58,10 +58,18 @@ void mmu_install_empty_ttbr0_root(void)
 /*
  * ASID allocation state.
  * ASID 0 is reserved for kernel tasks / the empty lower-half root.
- * 16-bit ASIDs (TCR_EL1.AS=1): valid user range is 1–65535.
+ * TCR_EL1.AS is currently 0, so the active hardware ASID width is 8 bits
+ * even when ID_AA64MMFR0_EL1 reports support for 16-bit ASIDs.
  */
+#define MMU_ASID_MAX 255U
+
 static unsigned int next_asid = 1;
 static unsigned long asid_bitmap[65536 / 64];
+static struct spinlock asid_lock = SPINLOCK_INITIALIZER;
+
+/* Internal ownership helpers. The caller must hold mm->lock. */
+static int mmu_context_add_page_locked(struct mm_context *mm, unsigned long pa);
+static int mmu_context_remove_page_locked(struct mm_context *mm, unsigned long pa);
 
 static void mmu_tlbi_asid(unsigned int asid)
 {
@@ -72,12 +80,13 @@ static void mmu_tlbi_asid(unsigned int asid)
     mmu_invalidate_tlb_asid(asid);
 }
 
-static void *mmu_alloc_sub_table(struct mm_context *mm, const char *name)
+/* Caller must hold mm->lock while allocating and publishing a sub-table. */
+static void *mmu_alloc_sub_table_locked(struct mm_context *mm, const char *name)
 {
     void *new_page = page_alloc();
     if (!new_page) return (void *)0;
 
-    if (!mmu_context_add_page(mm, (unsigned long)va_to_pa(new_page))) {
+    if (!mmu_context_add_page_locked(mm, (unsigned long)va_to_pa(new_page))) {
         page_free(new_page);
         return (void *)0;
     }
@@ -118,37 +127,57 @@ static unsigned int mmu_asid_alloc(void)
 {
     unsigned int attempts;
     unsigned int asid;
+    unsigned long irq_flags;
 
-    for (attempts = 0U; attempts < 65535U; attempts++) {
+    irq_flags = spin_lock_irqsave(&asid_lock);
+
+    for (attempts = 0U; attempts < MMU_ASID_MAX; attempts++) {
         asid = next_asid;
         next_asid++;
-        if (next_asid >= 65536U) {
+        if (next_asid > MMU_ASID_MAX) {
             next_asid = 1U;
         }
 
-        if (asid == 0U || asid >= 65536U || mmu_asid_test(asid)) {
+        if (asid == 0U || asid > MMU_ASID_MAX || mmu_asid_test(asid)) {
             continue;
         }
 
         mmu_asid_set(asid);
         mmu_tlbi_asid(asid);
+        spin_unlock_irqrestore(&asid_lock, irq_flags);
         return asid;
     }
 
+    spin_unlock_irqrestore(&asid_lock, irq_flags);
     return 0U;
 }
 
 static void mmu_asid_free(unsigned int asid)
 {
-    if (asid == 0U || asid >= 65536U) {
+    unsigned long irq_flags;
+
+    if (asid == 0U || asid > MMU_ASID_MAX) {
+        return;
+    }
+
+    irq_flags = spin_lock_irqsave(&asid_lock);
+
+    if (!mmu_asid_test(asid)) {
+        spin_unlock_irqrestore(&asid_lock, irq_flags);
         return;
     }
 
     mmu_tlbi_asid(asid);
     mmu_asid_clear(asid);
+    spin_unlock_irqrestore(&asid_lock, irq_flags);
 }
 
-static int mmu_context_has_page(const struct mm_context *mm, unsigned long pa)
+/*
+ * The *_locked ownership helpers require mm->lock to be held by the caller.
+ * Keeping the internal helpers separate avoids recursively acquiring the
+ * non-reentrant spinlock from page-table mutation paths.
+ */
+static int mmu_context_has_page_locked(const struct mm_context *mm, unsigned long pa)
 {
     unsigned int index;
 
@@ -165,13 +194,13 @@ static int mmu_context_has_page(const struct mm_context *mm, unsigned long pa)
     return 0;
 }
 
-int mmu_context_add_page(struct mm_context *mm, unsigned long pa)
+static int mmu_context_add_page_locked(struct mm_context *mm, unsigned long pa)
 {
     if (mm == (struct mm_context *)0 || pa == 0UL) {
         return 0;
     }
 
-    if (mmu_context_has_page(mm, pa)) {
+    if (mmu_context_has_page_locked(mm, pa)) {
         return 1;
     }
 
@@ -183,7 +212,7 @@ int mmu_context_add_page(struct mm_context *mm, unsigned long pa)
     return 1;
 }
 
-int mmu_context_remove_page(struct mm_context *mm, unsigned long pa)
+static int mmu_context_remove_page_locked(struct mm_context *mm, unsigned long pa)
 {
     unsigned int index;
 
@@ -208,6 +237,36 @@ int mmu_context_remove_page(struct mm_context *mm, unsigned long pa)
     }
 
     return 0;
+}
+
+int mmu_context_add_page(struct mm_context *mm, unsigned long pa)
+{
+    unsigned long irq_flags;
+    int result;
+
+    if (mm == (struct mm_context *)0 || pa == 0UL) {
+        return 0;
+    }
+
+    irq_flags = spin_lock_irqsave(&mm->lock);
+    result = mmu_context_add_page_locked(mm, pa);
+    spin_unlock_irqrestore(&mm->lock, irq_flags);
+    return result;
+}
+
+int mmu_context_remove_page(struct mm_context *mm, unsigned long pa)
+{
+    unsigned long irq_flags;
+    int result;
+
+    if (mm == (struct mm_context *)0 || pa == 0UL) {
+        return 0;
+    }
+
+    irq_flags = spin_lock_irqsave(&mm->lock);
+    result = mmu_context_remove_page_locked(mm, pa);
+    spin_unlock_irqrestore(&mm->lock, irq_flags);
+    return result;
 }
 
 static int mmu_resolve_user_page_desc(const struct mm_context *mm,
@@ -299,25 +358,41 @@ static int mmu_copy_user_range(const struct mm_context *mm,
         unsigned long chunk;
         unsigned char *page_va;
         unsigned long index;
+        unsigned long irq_flags;
+        int resolved;
 
-        if (!mmu_resolve_user_page(mm, user_va, &page_pa, &entry)) {
+retry_page:
+        /*
+         * Keep the page-table walk and the physical-page access in one MM
+         * critical section. Without this lock, another CPU sharing the same
+         * address space can unmap the PTE and release or recycle the physical
+         * page after this CPU resolves it but before the copy completes.
+         *
+         * Fault handling is deliberately invoked after dropping the lock,
+         * because mmu_handle_process_page_fault() acquires the same lock.
+         */
+        irq_flags = spin_lock_irqsave((struct spinlock *)&mm->lock);
+        resolved = mmu_resolve_user_page(mm, user_va, &page_pa, &entry);
+
+        if (!resolved) {
+            spin_unlock_irqrestore((struct spinlock *)&mm->lock, irq_flags);
+
             /* Try to handle fault if it's the current task's MM */
             struct task *cur = sched_current();
             if (cur && cur->mm == mm && cur->process) {
                 /* KER_LOGF("[mmu] Software fault: VA=%lx\n", user_va); */
                 /* ESR 0x04 = translation fault EL0 */
                 if (mmu_handle_process_page_fault(cur->process, user_va, 0x04)) {
-                    if (mmu_resolve_user_page(mm, user_va, &page_pa, &entry)) {
-                        goto resolved;
-                    }
+                    goto retry_page;
                 }
             }
             KER_LOGF("[mmu] copy failed: could not resolve VA=%lx\n", user_va);
             return 0;
         }
 
-resolved:
         if (!mmu_user_access_allowed(entry, write_to_user)) {
+            spin_unlock_irqrestore((struct spinlock *)&mm->lock, irq_flags);
+
             /* If it's a write and it failed, it might be CoW */
             if (write_to_user) {
                 struct task *cur = sched_current();
@@ -325,9 +400,7 @@ resolved:
                     /* KER_LOGF("[mmu] Software permission fault: VA=%lx\n", user_va); */
                     /* ESR 0x0F = permission fault EL0 write */
                     if (mmu_handle_process_page_fault(cur->process, user_va, 0x0F)) {
-                        if (mmu_resolve_user_page(mm, user_va, &page_pa, &entry)) {
-                            goto resolved_cow;
-                        }
+                        goto retry_page;
                     }
                 }
             }
@@ -335,7 +408,6 @@ resolved:
             return 0;
         }
 
-resolved_cow:
         page_offset = user_va & (PAGE_SIZE - 1UL);
         chunk = PAGE_SIZE - page_offset;
         if (chunk > len) {
@@ -350,6 +422,8 @@ resolved_cow:
                 kernel_buffer[index] = page_va[index];
             }
         }
+
+        spin_unlock_irqrestore((struct spinlock *)&mm->lock, irq_flags);
 
         kernel_buffer += chunk;
         user_va += chunk;
@@ -378,6 +452,7 @@ struct mm_context *mmu_context_create(void)
 
     mm->root_pa = (unsigned long)root;
     mm->asid    = mmu_asid_alloc();
+    spinlock_init(&mm->lock);
     mm->page_count = 0U;
     for (index = 0U; index < MM_MAX_TRACKED_PAGES; index++) {
         mm->pages[index] = 0UL;
@@ -401,14 +476,39 @@ struct mm_context *mmu_context_create(void)
 
 void mmu_context_destroy(struct mm_context *mm)
 {
+    unsigned long owned_pages[MM_MAX_TRACKED_PAGES];
+    unsigned int owned_page_count;
+    unsigned int index;
+    unsigned long irq_flags;
+
     if (mm == (struct mm_context *)0) {
         return;
     }
 
-    while (mm->page_count > 0U) {
-        mm->page_count--;
-        if (mm->pages[mm->page_count] != 0UL) {
-            page_free((void *)mm->pages[mm->page_count]);
+    /*
+     * Detach the ownership list atomically from page-table mutation paths.
+     * Physical pages are released after dropping mm->lock so allocator work
+     * and TLB maintenance do not extend the mm critical section.
+     *
+     * The process/task lifecycle must still guarantee that no new user of
+     * this mm can appear once destruction starts.
+     */
+    irq_flags = spin_lock_irqsave(&mm->lock);
+    owned_page_count = mm->page_count;
+    for (index = 0U; index < owned_page_count; index++) {
+        owned_pages[index] = mm->pages[index];
+        mm->pages[index] = 0UL;
+    }
+    mm->page_count = 0U;
+    spin_unlock_irqrestore(&mm->lock, irq_flags);
+
+    /* Flush this ASID before any page-table or user page is recycled. */
+    mmu_tlbi_asid(mm->asid);
+
+    while (owned_page_count > 0U) {
+        owned_page_count--;
+        if (owned_pages[owned_page_count] != 0UL) {
+            page_free((void *)owned_pages[owned_page_count]);
         }
     }
 
@@ -417,7 +517,11 @@ void mmu_context_destroy(struct mm_context *mm)
     kfree(mm);
 }
 
-static void mmu_clone_walk(struct mm_context *mm, unsigned long *src_tbl, unsigned long *dst_tbl, int level)
+/* Caller holds both source and destination mm locks. */
+static int mmu_clone_walk_locked(struct mm_context *dst_mm,
+                                 unsigned long *src_tbl,
+                                 unsigned long *dst_tbl,
+                                 int level)
 {
     for (int i = 0; i < 512; i++) {
         unsigned long entry = src_tbl[i];
@@ -427,24 +531,41 @@ static void mmu_clone_walk(struct mm_context *mm, unsigned long *src_tbl, unsign
             /* Table entry */
             unsigned long *next_src = (unsigned long *)pa_to_va(entry & MMU_DESC_ADDR_MASK);
             unsigned long next_dst_pa = (unsigned long)page_alloc();
-            if (!next_dst_pa) continue;
+            if (!next_dst_pa) return 0;
             
-            if (!mmu_context_add_page(mm, next_dst_pa)) {
+            if (!mmu_context_add_page_locked(dst_mm, next_dst_pa)) {
                 page_free((void *)next_dst_pa);
-                continue;
+                return 0;
             }
             
             unsigned long *next_dst_va = (unsigned long *)pa_to_va(next_dst_pa);
             for (int k = 0; k < 512; k++) next_dst_va[k] = 0;
             
             dst_tbl[i] = (next_dst_pa & MMU_L3_PAGE_ADDR_MASK) | (entry & ~MMU_L3_PAGE_ADDR_MASK);
-            mmu_clone_walk(mm, next_src, next_dst_va, level + 1);
+            if (!mmu_clone_walk_locked(dst_mm, next_src, next_dst_va, level + 1)) {
+                return 0;
+            }
         } else if (level == 3) {
             /* L3 Leaf entry - Mark as Read-Only for CoW */
             unsigned long pa = entry & MMU_L3_PAGE_ADDR_MASK;
             
             /* Ensure it is Read-Only in both and marked for CoW */
             unsigned long cow_entry = (entry & ~MMU_AP_RW) | MMU_AP_RO | MMU_DESC_SOFTWARE_COW;
+
+            /*
+             * The child owns one reference to every shared leaf page. Track
+             * that ownership before incrementing the allocator refcount so
+             * mmu_context_destroy() can drop the child's reference later.
+             * Without this entry, destroying a forked child leaks the shared
+             * page reference permanently.
+             *
+             * On a later clone failure, destroying dst_mm walks this same
+             * ownership list and rolls back every reference established so
+             * far, including shared CoW leaves and private table pages.
+             */
+            if (!mmu_context_add_page_locked(dst_mm, pa)) {
+                return 0;
+            }
             
             /* 
              * Order is important: increment ref_count before making src_tbl entry RO 
@@ -456,22 +577,49 @@ static void mmu_clone_walk(struct mm_context *mm, unsigned long *src_tbl, unsign
             src_tbl[i] = cow_entry;
         }
     }
+
+    return 1;
 }
 
 struct mm_context *mmu_context_clone(struct mm_context *src)
 {
+    unsigned long src_irq_flags;
+    unsigned long dst_irq_flags;
+    int clone_ok;
+
     if (!src) return (struct mm_context *)0;
 
     struct mm_context *dst = mmu_context_create();
     if (!dst) return (struct mm_context *)0;
 
+    /*
+     * The destination is new and cannot yet be observed by another CPU.
+     * Lock the existing source first, then the private destination, so fork
+     * cannot race mapping, unmapping, lazy faults, or CoW in the parent.
+     */
+    src_irq_flags = spin_lock_irqsave(&src->lock);
+    dst_irq_flags = spin_lock_irqsave(&dst->lock);
+
     unsigned long *src_root = (unsigned long *)pa_to_va(src->root_pa);
     unsigned long *dst_root = (unsigned long *)pa_to_va(dst->root_pa);
 
-    mmu_clone_walk(dst, src_root, dst_root, 0);
+    clone_ok = mmu_clone_walk_locked(dst, src_root, dst_root, 0);
 
-    /* Invalidate TLB for the source ASID since we modified its entries to RO */
+    /*
+     * The clone walk may have converted some source leaf descriptors to CoW
+     * before a later allocation or ownership-tracking failure. Invalidate the
+     * source ASID even when the clone ultimately fails, otherwise another CPU
+     * can retain a stale writable translation for a PTE that is now read-only.
+     */
     mmu_invalidate_tlb_asid(src->asid);
+
+    spin_unlock_irqrestore(&dst->lock, dst_irq_flags);
+    spin_unlock_irqrestore(&src->lock, src_irq_flags);
+
+    if (!clone_ok) {
+        mmu_context_destroy(dst);
+        return (struct mm_context *)0;
+    }
 
     return dst;
 }
@@ -508,16 +656,26 @@ int mmu_user_page_pa(const struct mm_context *mm, unsigned long va,
                      unsigned long *page_pa_out)
 {
     unsigned long page_pa;
+    unsigned long irq_flags;
+    int resolved;
 
-    if (page_pa_out == (unsigned long *)0) {
+    if (mm == (const struct mm_context *)0 ||
+        page_pa_out == (unsigned long *)0) {
         return 0;
     }
 
-    if (!mmu_resolve_user_page(mm, va, &page_pa, (unsigned long *)0)) {
+    irq_flags = spin_lock_irqsave((struct spinlock *)&mm->lock);
+    resolved = mmu_resolve_user_page(mm, va, &page_pa,
+                                     (unsigned long *)0);
+    if (resolved) {
+        *page_pa_out = page_pa;
+    }
+    spin_unlock_irqrestore((struct spinlock *)&mm->lock, irq_flags);
+
+    if (!resolved) {
         return 0;
     }
 
-    *page_pa_out = page_pa;
     return 1;
 }
 
@@ -539,7 +697,8 @@ void mmu_context_switch(struct mm_context *mm)
     mmu_invalidate_tlb_all();
 }
 
-static void mmu_split_block(struct mm_context *mm, unsigned long *entry_ptr, unsigned long level)
+/* Caller must hold mm->lock. */
+static void mmu_split_block_locked(struct mm_context *mm, unsigned long *entry_ptr, unsigned long level)
 {
     unsigned long entry = *entry_ptr;
     unsigned long block_pa = entry & MMU_DESC_ADDR_MASK;
@@ -547,7 +706,7 @@ static void mmu_split_block(struct mm_context *mm, unsigned long *entry_ptr, uns
     unsigned long step = (level == 1) ? MMU_L2_BLOCK_SIZE : PAGE_SIZE;
     unsigned long next_type = (level == 1) ? MMU_DESC_BLOCK : MMU_DESC_PAGE;
 
-    void *new_page = mmu_alloc_sub_table(mm, (level == 1) ? "split-l2" : "split-l3");
+    void *new_page = mmu_alloc_sub_table_locked(mm, (level == 1) ? "split-l2" : "split-l3");
     if (!new_page) return;
 
     unsigned long *new_tbl = (unsigned long *)pa_to_va(new_page);
@@ -558,7 +717,8 @@ static void mmu_split_block(struct mm_context *mm, unsigned long *entry_ptr, uns
     *entry_ptr = (unsigned long)va_to_pa(new_page) | MMU_DESC_TABLE;
 }
 
-static unsigned long *mmu_find_pte(struct mm_context *mm, unsigned long va, int create)
+/* Caller must hold mm->lock whenever create is non-zero or the PTE is mutated. */
+static unsigned long *mmu_find_pte_locked(struct mm_context *mm, unsigned long va, int create)
 {
     unsigned long *l0, *l1, *l2, *l3;
     unsigned long idx;
@@ -569,7 +729,7 @@ static unsigned long *mmu_find_pte(struct mm_context *mm, unsigned long va, int 
     idx = L0_INDEX_FOR(va);
     if (!(l0[idx] & MMU_DESC_VALID)) {
         if (!create) return (unsigned long *)0;
-        void *new_page = mmu_alloc_sub_table(mm, "l1");
+        void *new_page = mmu_alloc_sub_table_locked(mm, "l1");
         if (!new_page) return (unsigned long *)0;
         l0[idx] = (unsigned long)va_to_pa(new_page) | MMU_DESC_TABLE;
     }
@@ -579,12 +739,12 @@ static unsigned long *mmu_find_pte(struct mm_context *mm, unsigned long va, int 
 
     if ((l1[idx] & MMU_DESC_VALID) && (l1[idx] & MMU_DESC_TYPE_MASK) == MMU_DESC_BLOCK) {
         if (!create) return (unsigned long *)0;
-        mmu_split_block(mm, &l1[idx], 1);
+        mmu_split_block_locked(mm, &l1[idx], 1);
     }
 
     if (!(l1[idx] & MMU_DESC_VALID)) {
         if (!create) return (unsigned long *)0;
-        void *new_page = mmu_alloc_sub_table(mm, "l2");
+        void *new_page = mmu_alloc_sub_table_locked(mm, "l2");
         if (!new_page) return (unsigned long *)0;
         l1[idx] = (unsigned long)va_to_pa(new_page) | MMU_DESC_TABLE;
     }
@@ -594,12 +754,12 @@ static unsigned long *mmu_find_pte(struct mm_context *mm, unsigned long va, int 
 
     if ((l2[idx] & MMU_DESC_VALID) && (l2[idx] & MMU_DESC_TYPE_MASK) == MMU_DESC_BLOCK) {
         if (!create) return (unsigned long *)0;
-        mmu_split_block(mm, &l2[idx], 2);
+        mmu_split_block_locked(mm, &l2[idx], 2);
     }
 
     if (!(l2[idx] & MMU_DESC_VALID)) {
         if (!create) return (unsigned long *)0;
-        void *new_page = mmu_alloc_sub_table(mm, "l3");
+        void *new_page = mmu_alloc_sub_table_locked(mm, "l3");
         if (!new_page) return (unsigned long *)0;
         l2[idx] = (unsigned long)va_to_pa(new_page) | MMU_DESC_TABLE;
     }
@@ -608,8 +768,9 @@ static unsigned long *mmu_find_pte(struct mm_context *mm, unsigned long va, int 
     return l3;
 }
 
-int mmu_map_user_page(struct mm_context *mm, unsigned long va,
-                      unsigned long pa, unsigned long flags)
+/* Caller must hold mm->lock. */
+static int mmu_map_user_page_locked(struct mm_context *mm, unsigned long va,
+                                    unsigned long pa, unsigned long flags)
 {
     unsigned long *l3;
     unsigned long idx;
@@ -618,7 +779,7 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
         return 0;
     }
 
-    l3 = mmu_find_pte(mm, va, 1);
+    l3 = mmu_find_pte_locked(mm, va, 1);
     if (!l3) return 0;
 
     /* Install the L3 page descriptor.
@@ -632,7 +793,24 @@ int mmu_map_user_page(struct mm_context *mm, unsigned long va,
     return 1;
 }
 
-static void mmu_try_merge_table(struct mm_context *mm, unsigned long va, int level)
+int mmu_map_user_page(struct mm_context *mm, unsigned long va,
+                      unsigned long pa, unsigned long flags)
+{
+    unsigned long irq_flags;
+    int result;
+
+    if (mm == (struct mm_context *)0) {
+        return 0;
+    }
+
+    irq_flags = spin_lock_irqsave(&mm->lock);
+    result = mmu_map_user_page_locked(mm, va, pa, flags);
+    spin_unlock_irqrestore(&mm->lock, irq_flags);
+    return result;
+}
+
+/* Caller must hold mm->lock. */
+static void mmu_try_merge_table_locked(struct mm_context *mm, unsigned long va, int level)
 {
     unsigned long *l0, *l1, *l2;
     unsigned long *table;
@@ -672,38 +850,51 @@ static void mmu_try_merge_table(struct mm_context *mm, unsigned long va, int lev
 
     parent_table[idx] = base_pa | (base_attrs & ~MMU_DESC_TYPE_MASK) | MMU_DESC_BLOCK;
 
-    mmu_context_remove_page(mm, table_pa);
+    mmu_context_remove_page_locked(mm, table_pa);
     page_free((void *)table_pa);
     mmu_invalidate_tlb_va(mm->asid, va & ~(block_size - 1));
 
     /* Recurse up if we just merged a table */
-    if (level > 2) mmu_try_merge_table(mm, va, level - 1);
+    if (level > 2) mmu_try_merge_table_locked(mm, va, level - 1);
 }
 
 int mmu_unmap_user_page(struct mm_context *mm, unsigned long va)
 {
     unsigned long *l3;
     unsigned long idx;
+    unsigned long irq_flags;
+    int result;
 
     if (mm == (struct mm_context *)0) {
         return 0;
     }
 
-    l3 = mmu_find_pte(mm, va, 0);
-    if (!l3) return 0;
+    irq_flags = spin_lock_irqsave(&mm->lock);
+    l3 = mmu_find_pte_locked(mm, va, 0);
+    if (!l3) {
+        spin_unlock_irqrestore(&mm->lock, irq_flags);
+        return 0;
+    }
 
     idx = L3_INDEX_FOR(va);
-    l3[idx] = 0UL;
+    result = (l3[idx] & MMU_DESC_VALID) != 0UL;
+    if (result) {
+        l3[idx] = 0UL;
 
-    mmu_invalidate_tlb_va(mm->asid, va);
+        mmu_invalidate_tlb_va(mm->asid, va);
 
-    /* Try to merge L3->L2 then L2->L1 */
-    mmu_try_merge_table(mm, va, 3);
+        /* Try to merge L3->L2 then L2->L1. */
+        mmu_try_merge_table_locked(mm, va, 3);
+    }
 
-    return 1;
+    spin_unlock_irqrestore(&mm->lock, irq_flags);
+    return result;
 }
 
-int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsigned long esr_el1)
+/* Caller must hold p->mm->lock. */
+static int mmu_handle_process_page_fault_locked(struct process *p,
+                                                unsigned long far_el1,
+                                                unsigned long esr_el1)
 {
     unsigned long fsc;
     unsigned long fsc_type;
@@ -721,6 +912,18 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
 
     fsc = esr_el1 & 0x3FUL;
     fsc_type = fsc & 0x3CUL;
+
+    /*
+     * Another CPU sharing this mm may have resolved the translation fault
+     * before this CPU acquired mm->lock. Treat an already-present mapping as
+     * success instead of allocating and publishing a duplicate page.
+     */
+    if (fsc_type == 0x04UL &&
+        mmu_resolve_user_page(p->mm, far_el1,
+                              (unsigned long *)0,
+                              (unsigned long *)0)) {
+        return 1;
+    }
 
     /* KER_LOGF("[mmu] Fault: VA=%lx ESR=%lx (EC=%x FSC=%x)\n", far_el1, esr_el1, ec, (unsigned int)fsc); */
 
@@ -759,10 +962,27 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
             unsigned char *dst = (unsigned char *)pa_to_va(copy_page);
             for (unsigned long i = 0; i < PAGE_SIZE; i++) dst[i] = src[i];
 
-            *cow_entry_ptr = ((unsigned long)va_to_pa(copy_page) & MMU_DESC_ADDR_MASK) | 
+            /*
+             * Track the replacement page before publishing it in the PTE.
+             * If ownership tracking is full, leave the old mapping untouched
+             * and release the unpublished page.
+             */
+            if (!mmu_context_add_page_locked(p->mm,
+                                             (unsigned long)va_to_pa(copy_page))) {
+                page_free(copy_page);
+                return 0;
+            }
+
+            *cow_entry_ptr = ((unsigned long)va_to_pa(copy_page) & MMU_DESC_ADDR_MASK) |
                          (entry & ~MMU_DESC_ADDR_MASK & ~MMU_AP_RO & ~MMU_DESC_SOFTWARE_COW) | MMU_AP_RW;
 
-            if (!mmu_context_add_page(p->mm, (unsigned long)va_to_pa(copy_page))) {}
+            /*
+             * This mm no longer owns a reference to old_pa after replacing
+             * the PTE. Remove it from the ownership list before dropping the
+             * allocator reference, otherwise mmu_context_destroy() will try
+             * to release the old page a second time.
+             */
+            mmu_context_remove_page_locked(p->mm, old_pa);
             page_ref_dec(old_pa);
 
             mmu_invalidate_tlb_va(p->mm->asid, page_va);
@@ -812,13 +1032,16 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
             }
 
             flags = region->flags;
-            if (!mmu_context_add_page(p->mm, (unsigned long)va_to_pa(new_page))) {
+            if (!mmu_context_add_page_locked(p->mm,
+                                             (unsigned long)va_to_pa(new_page))) {
                 page_free(new_page);
                 return 0;
             }
 
-            if (!mmu_map_user_page(p->mm, page_va, (unsigned long)va_to_pa(new_page), flags)) {
-                mmu_context_remove_page(p->mm, (unsigned long)va_to_pa(new_page));
+            if (!mmu_map_user_page_locked(p->mm, page_va,
+                                          (unsigned long)va_to_pa(new_page), flags)) {
+                mmu_context_remove_page_locked(p->mm,
+                                               (unsigned long)va_to_pa(new_page));
                 page_free(new_page);
                 return 0;
             }
@@ -845,13 +1068,16 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
             MMU_USER_PAGE_INNER_SH | MMU_USER_PAGE_AP_RW |
             MMU_USER_PAGE_UXN | MMU_USER_PAGE_PXN;
 
-    if (!mmu_context_add_page(p->mm, (unsigned long)va_to_pa(new_page))) {
+    if (!mmu_context_add_page_locked(p->mm,
+                                     (unsigned long)va_to_pa(new_page))) {
         page_free(new_page);
         return 0;
     }
 
-    if (!mmu_map_user_page(p->mm, page_va, (unsigned long)va_to_pa(new_page), flags)) {
-        mmu_context_remove_page(p->mm, (unsigned long)va_to_pa(new_page));
+    if (!mmu_map_user_page_locked(p->mm, page_va,
+                                  (unsigned long)va_to_pa(new_page), flags)) {
+        mmu_context_remove_page_locked(p->mm,
+                                       (unsigned long)va_to_pa(new_page));
         page_free(new_page);
         return 0;
     }
@@ -860,6 +1086,36 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
 
 cleanup_fatal:
     return 0;
+}
+
+int mmu_handle_process_page_fault(struct process *p,
+                                  unsigned long far_el1,
+                                  unsigned long esr_el1)
+{
+    struct mm_context *mm;
+    unsigned long irq_flags;
+    int result;
+
+    if (!mmu_is_enabled() || p == (struct process *)0) {
+        return 0;
+    }
+
+    mm = p->mm;
+    if (mm == (struct mm_context *)0) {
+        return 0;
+    }
+
+    irq_flags = spin_lock_irqsave(&mm->lock);
+
+    /* Recheck after acquiring the lock in case the process changed mm. */
+    if (p->mm != mm) {
+        spin_unlock_irqrestore(&mm->lock, irq_flags);
+        return 0;
+    }
+
+    result = mmu_handle_process_page_fault_locked(p, far_el1, esr_el1);
+    spin_unlock_irqrestore(&mm->lock, irq_flags);
+    return result;
 }
 
 int mmu_handle_page_fault(unsigned long far_el1, unsigned long esr_el1)
@@ -875,20 +1131,27 @@ int mmu_handle_page_fault(unsigned long far_el1, unsigned long esr_el1)
 
 int mmu_unmap_user_range(struct mm_context *mm, unsigned long va, unsigned long len)
 {
+    unsigned long irq_flags;
+
     if (!mm || len == 0) return 1;
 
     unsigned long start = va & ~(PAGE_SIZE - 1UL);
     unsigned long end = (va + len + (PAGE_SIZE - 1UL)) & ~(PAGE_SIZE - 1UL);
 
+    irq_flags = spin_lock_irqsave(&mm->lock);
     for (unsigned long curr = start; curr < end; curr += PAGE_SIZE) {
-        unsigned long *pte = mmu_find_pte(mm, curr, 0);
+        unsigned long *pte = mmu_find_pte_locked(mm, curr, 0);
         if (pte && (*pte & MMU_DESC_VALID)) {
             unsigned long pa = *pte & MMU_DESC_ADDR_MASK;
             *pte = 0;
+
+            /* Detach ownership before releasing the mapping reference. */
+            mmu_context_remove_page_locked(mm, pa);
             page_ref_dec(pa);
             mmu_invalidate_tlb_va(mm->asid, curr);
         }
     }
+    spin_unlock_irqrestore(&mm->lock, irq_flags);
     return 1;
 }
 
