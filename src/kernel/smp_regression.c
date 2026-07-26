@@ -303,6 +303,17 @@ static void mutex_waiter_kill_controller(void)
         task_exit();
     }
 
+    /*
+     * The owner still holds the mutex here. Destroy must fail while the slot
+     * is locked and has an owner, even though the killed waiter and its
+     * abandoned operation pin have already been detached.
+     */
+    if (mutex_pool_free(mutex_waiter_kill_id)) {
+        KER_INFO("[stress] mutex-concurrent-destroy FAIL: destroyed locked mutex");
+        task_exit();
+    }
+    KER_INFO("[stress] mutex-concurrent-destroy PASS");
+
     waiter_kill_release_owner = 1U;
     __asm__ volatile("dmb ish; sev" ::: "memory");
     for (attempts = 0UL; attempts < 100000UL; attempts++) {

@@ -46,6 +46,7 @@
 - Test pthread/mutex trên QEMU 4 CPU đã hoàn tất với `Complex Test Finished.` và các thread thoát `code=0`.
 - SMP regression đã xác minh trường hợp owner bị kill khi có waiter đang BLOCKED: reaper detach owner, handoff mutex cho waiter, waiter được wake và pool slot có thể được giải phóng. Marker: `[stress] mutex-owner-detach PASS`.
 - SMP regression cũng xác minh trường hợp waiter đang BLOCKED bị kill. `mutex_detach_task()` xóa waiter khỏi queue và giải phóng `active_ops` pin mà task bị kill không thể tự unpin khi quay về từ `mutex_pool_lock()`. Owner sau đó unlock bình thường và pool slot được giải phóng. Marker: `[stress] mutex-waiter-detach PASS`.
+- Trước khi cho owner unlock, regression gọi `mutex_pool_free()` đồng thời và xác minh destroy bị từ chối khi mutex còn locked/có owner. Marker: `[stress] mutex-concurrent-destroy PASS`.
 
 ## Lệnh verify nhanh
 - Build và chạy QEMU:
@@ -61,7 +62,8 @@
 ## Next steps
 - [x] Thêm regression test kill owner và handoff cho waiter.
 - [x] Thêm regression test kill waiter đang BLOCKED và phát hiện operation-pin leak.
-- [ ] Thêm stress test chuyên biệt cho destroy đồng thời với lock/unlock.
+- [x] Xác minh destroy bị từ chối khi mutex còn locked/có owner.
+- [ ] Thêm stress test nhiều vòng cho destroy cạnh tranh với lock/trylock/unlock.
 - [ ] Cân nhắc generation counter cho mutex ID để phát hiện stale handle sau khi slot được tái sử dụng.
 - [ ] Hỗ trợ **Condition Variables** (`pthread_cond_t`) để hoàn thiện bộ công cụ POSIX sync.
 - [ ] Cải thiện bộ cấp phát Mutex Pool (dynamic allocation thay vì static array nếu có nhu cầu).
