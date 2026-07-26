@@ -486,6 +486,46 @@ struct mm_context *mmu_context_create(void)
 static struct spinlock mmu_lifecycle_lock = SPINLOCK_INITIALIZER;
 static struct mm_context *mmu_cpu_context[4];
 
+#ifdef CONFIG_SMP_REGRESSION_TESTS
+static unsigned long mmu_context_release_count;
+
+int mmu_context_test_snapshot(struct mm_context *mm,
+                              unsigned int *refs,
+                              unsigned int *dying,
+                              unsigned int *active_cpu_mask)
+{
+    unsigned long flags;
+
+    if (mm == (struct mm_context *)0) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&mmu_lifecycle_lock);
+    if (refs != (unsigned int *)0) {
+        *refs = mm->refs;
+    }
+    if (dying != (unsigned int *)0) {
+        *dying = mm->dying;
+    }
+    if (active_cpu_mask != (unsigned int *)0) {
+        *active_cpu_mask = mm->active_cpu_mask;
+    }
+    spin_unlock_irqrestore(&mmu_lifecycle_lock, flags);
+    return 1;
+}
+
+unsigned long mmu_context_test_release_count(void)
+{
+    unsigned long flags;
+    unsigned long count;
+
+    flags = spin_lock_irqsave(&mmu_lifecycle_lock);
+    count = mmu_context_release_count;
+    spin_unlock_irqrestore(&mmu_lifecycle_lock, flags);
+    return count;
+}
+#endif
+
 int mmu_context_get(struct mm_context *mm)
 {
     unsigned long flags;
@@ -539,6 +579,12 @@ static void mmu_context_release(struct mm_context *mm)
     }
 
     mmu_asid_free(mm->asid);
+
+#ifdef CONFIG_SMP_REGRESSION_TESTS
+    irq_flags = spin_lock_irqsave(&mmu_lifecycle_lock);
+    mmu_context_release_count++;
+    spin_unlock_irqrestore(&mmu_lifecycle_lock, irq_flags);
+#endif
 
     kfree(mm);
 }

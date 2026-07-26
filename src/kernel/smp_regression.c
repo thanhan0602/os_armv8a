@@ -1,4 +1,5 @@
 #include <kernel/log.h>
+#include <kernel/mmu.h>
 #include <kernel/mutex.h>
 #include <kernel/sched.h>
 #include <kernel/smp_regression.h>
@@ -20,6 +21,91 @@ static volatile unsigned int waiter_kill_owner_ready;
 static volatile unsigned int killed_waiter_started;
 static volatile unsigned int waiter_kill_release_owner;
 static volatile unsigned int waiter_kill_owner_done;
+static volatile struct mm_context *mm_lifetime_context;
+static volatile unsigned int mm_lifetime_active;
+static volatile unsigned int mm_lifetime_detach;
+static volatile unsigned long mm_lifetime_release_baseline;
+
+static void mm_lifetime_holder(void)
+{
+    struct mm_context *mm = mmu_context_create();
+    unsigned long irq_flags;
+
+    if (mm == (struct mm_context *)0) {
+        KER_INFO("[stress] mm-deferred-release FAIL: context creation failed");
+        task_exit();
+    }
+
+    mm_lifetime_release_baseline = mmu_context_test_release_count();
+    mm_lifetime_context = mm;
+
+    /*
+     * Keep this task on its current CPU until the controller has observed
+     * the DYING context. Otherwise a timer interrupt may enter schedule(),
+     * switch to another task, and legitimately detach the context before the
+     * controller takes its post-put snapshot.
+     */
+    irq_flags = arch_local_irq_save();
+    mmu_context_switch(mm);
+    __asm__ volatile("dmb ish" ::: "memory");
+    mm_lifetime_active = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+
+    while (mm_lifetime_detach == 0U) {
+        __asm__ volatile("dmb ish; yield" ::: "memory");
+    }
+
+    mmu_context_switch((struct mm_context *)0);
+    arch_local_irq_restore(irq_flags);
+    task_exit();
+}
+
+static void mm_lifetime_run_controller(void)
+{
+    struct mm_context *mm;
+    unsigned int refs = 1U;
+    unsigned int dying = 0U;
+    unsigned int active_mask = 0U;
+    unsigned long baseline;
+    unsigned long attempts;
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        if (mm_lifetime_active != 0U) {
+            break;
+        }
+        schedule();
+    }
+
+    mm = (struct mm_context *)mm_lifetime_context;
+    baseline = mm_lifetime_release_baseline;
+    if (mm_lifetime_active == 0U || mm == (struct mm_context *)0 ||
+        !mmu_context_test_snapshot(mm, &refs, &dying, &active_mask) ||
+        refs != 1U || dying != 0U || active_mask == 0U) {
+        KER_INFO("[stress] mm-deferred-release FAIL: context was not active");
+        return;
+    }
+
+    mmu_context_put(mm);
+    if (!mmu_context_test_snapshot(mm, &refs, &dying, &active_mask) ||
+        refs != 0U || dying == 0U || active_mask == 0U ||
+        mmu_context_test_release_count() != baseline) {
+        KER_INFO("[stress] mm-deferred-release FAIL: released before CPU detach");
+        return;
+    }
+
+    mm_lifetime_detach = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        if (mmu_context_test_release_count() == baseline + 1UL) {
+            KER_INFO("[stress] mm-deferred-release PASS");
+            return;
+        }
+        schedule();
+    }
+
+    KER_INFO("[stress] mm-deferred-release FAIL: final release missing");
+}
 
 static void wake_before_park_consumer(void)
 {
@@ -131,6 +217,7 @@ static void remote_kill_controller(void)
         if (!sched_task_snapshot(target_id, &state, &target_cpu,
                                  &kill_pending)) {
             KER_INFO("[stress] remote-kill PASS");
+            mm_lifetime_run_controller();
             task_exit();
         }
         schedule();
@@ -351,6 +438,10 @@ void smp_regression_start(void)
     waiter_kill_release_owner = 0U;
     waiter_kill_owner_done = 0U;
     mutex_waiter_kill_id = mutex_pool_alloc();
+    mm_lifetime_context = (struct mm_context *)0;
+    mm_lifetime_active = 0U;
+    mm_lifetime_detach = 0U;
+    mm_lifetime_release_baseline = 0UL;
     KER_INFO("[stress] starting SMP regression suite");
 
     if (task_create(wake_before_park_consumer, "stress-waiter") ==
@@ -387,5 +478,15 @@ void smp_regression_start(void)
                task_create(mutex_waiter_kill_controller,
                            "stress-waiter-controller") == (struct task *)0) {
         KER_INFO("[stress] mutex-waiter-detach FAIL: task creation failed");
+    }
+
+    /*
+     * Reuse the remote-kill controller for the MM assertions. The regression
+     * build already has a shell plus ten stress tasks, so creating a separate
+     * MM controller would exceed MAX_TASKS before any test task is reaped.
+     */
+    if (task_create(mm_lifetime_holder, "stress-mm-holder") ==
+            (struct task *)0) {
+        KER_INFO("[stress] mm-deferred-release FAIL: task creation failed");
     }
 }

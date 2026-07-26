@@ -143,6 +143,18 @@ int mmu_context_get(struct mm_context *mm);
 void mmu_context_put(struct mm_context *mm);
 void mmu_context_destroy(struct mm_context *mm);
 void mmu_context_switch(struct mm_context *mm);
+
+#ifdef CONFIG_SMP_REGRESSION_TESTS
+/*
+ * Test-only lifecycle observability. The snapshot caller must ensure the
+ * context cannot complete deferred release while the snapshot is requested.
+ */
+int mmu_context_test_snapshot(struct mm_context *mm,
+                              unsigned int *refs,
+                              unsigned int *dying,
+                              unsigned int *active_cpu_mask);
+unsigned long mmu_context_test_release_count(void);
+#endif
 /*
  * Register a physical page with the mm_context so it is freed when the
  * context is destroyed.  Call this for user content pages (code, stack)
