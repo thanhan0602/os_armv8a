@@ -90,8 +90,11 @@ void sched_unpark_task(struct task *task);
 int sched_sleep_current(unsigned long ticks);
 void sched_set_current_exit_status(int status);
 unsigned long sched_wait4(long pid, unsigned long status_ptr);
+int sched_register_init_task(struct task *task);
+int sched_adopt_task(struct task *task);
 void sched_dump_tasks(void);
 int sched_kill_task(unsigned long task_id);
+int sched_kill_task_sync(unsigned long task_id);
 int sched_task_snapshot(unsigned long task_id,
                         unsigned long *state,
                         unsigned int *current_cpu,

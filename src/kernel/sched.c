@@ -4,10 +4,12 @@
 #include <kernel/ipc.h>
 #include <kernel/mmu.h>
 #include <kernel/mutex.h>
+#include <kernel/semaphore.h>
 #include <kernel/page_alloc.h>
 #include <kernel/process.h>
 #include <kernel/vm.h>
 #include <kernel/console.h>
+#include <kernel/condvar.h>
 #include <kernel/spinlock.h>
 #include <drivers/interrupt/gicv2.h>
 #include <arch/arm/cpu.h>
@@ -18,6 +20,9 @@ struct task tasks[MAX_TASKS];
 static unsigned long next_task_id;
 static struct spinlock sched_lock = SPINLOCK_INITIALIZER;
 static unsigned long switch_count;
+static unsigned long init_task_id;
+
+#define SCHED_NO_PARENT (~0UL)
 
 static const char *sched_state_name(unsigned long state)
 {
@@ -70,6 +75,7 @@ void sched_init(void)
 
     next_task_id = 0;
     switch_count = 0;
+    init_task_id = SCHED_NO_PARENT;
     
     /* Zero out all tasks */
     for (unsigned long i = 0; i < MAX_TASKS; i++) {
@@ -301,6 +307,8 @@ static void sched_reap_dead(void)
 
         ipc_detach_task(victim);
         mutex_detach_task(victim);
+        semaphore_detach_task(victim);
+        condvar_detach_task(victim);
 
         if (stack_base != (void *)0) {
             page_free_contiguous((void *)va_to_pa(stack_base),
@@ -452,17 +460,39 @@ void schedule(void)
 void task_exit(void)
 {
     struct task *curr = arch_get_current_task();
+    struct task *parent = (struct task *)0;
     
     KER_LOGF("[sched] task %s exiting\n", curr->name);
 
     unsigned long flags = spin_lock_irqsave(&sched_lock);
-    curr->state = TASK_STATE_ZOMBIE;
+    /* Reparent live children before publishing this task's final state. */
+    for (unsigned long i = 0; i < MAX_TASKS; i++) {
+        struct task *child = &tasks[i];
+
+        if (child->name != (const char *)0 && child->parent_id == curr->id &&
+            child != curr) {
+            child->parent_id = init_task_id;
+        }
+    }
+
+    for (unsigned long i = 0; i < MAX_TASKS; i++) {
+        if (tasks[i].name != (const char *)0 &&
+            tasks[i].id == curr->parent_id) {
+            parent = &tasks[i];
+            break;
+        }
+    }
+
+    /* Parentless tasks and init itself cannot be waited on, so reap them. */
+    if (parent == (struct task *)0 || curr->id == init_task_id) {
+        curr->state = TASK_STATE_DEAD;
+    } else {
+        curr->state = TASK_STATE_ZOMBIE;
+    }
 
     /* Wake up parent if it's waiting */
-    for (unsigned long i = 0; i < MAX_TASKS; i++) {
-        struct task *t = &tasks[i];
-        if (t->name && t->id == curr->parent_id && t->state == TASK_STATE_BLOCKED) {
-            t->state = TASK_STATE_READY;
+    if (parent != (struct task *)0 && parent->state == TASK_STATE_BLOCKED) {
+            parent->state = TASK_STATE_READY;
             
             /* Send IPI to other cores */
             unsigned int current_cpu = arch_get_cpu_id();
@@ -473,8 +503,6 @@ void task_exit(void)
                 }
             }
             gicv2_send_ipi(target_mask, 0);
-            break;
-        }
     }
     
     spin_unlock_irqrestore(&sched_lock, flags);
@@ -484,6 +512,43 @@ void task_exit(void)
     while (1) {
         cpu_wfe();
     }
+}
+
+int sched_register_init_task(struct task *task)
+{
+    unsigned long flags;
+
+    if (task == (struct task *)0 || task->id < 4UL) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    if (init_task_id != SCHED_NO_PARENT) {
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return 0;
+    }
+    init_task_id = task->id;
+    task->parent_id = SCHED_NO_PARENT;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return 1;
+}
+
+int sched_adopt_task(struct task *task)
+{
+    unsigned long flags;
+
+    if (task == (struct task *)0 || task->id < 4UL) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    if (init_task_id == SCHED_NO_PARENT || task->id == init_task_id) {
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return 0;
+    }
+    task->parent_id = init_task_id;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return 1;
 }
 
 struct task *sched_current(void)
@@ -749,6 +814,38 @@ int sched_kill_task(unsigned long task_id)
     }
 
     return killed;
+}
+
+int sched_kill_task_sync(unsigned long task_id)
+{
+    unsigned long state;
+    unsigned int current_cpu;
+    unsigned int kill_pending;
+
+    if (!sched_kill_task(task_id)) {
+        return 0;
+    }
+
+    /*
+     * Wait until the owning CPU has consumed kill_pending and detached the
+     * task from its RUNNING CPU. Disappearance is also a valid acknowledgement
+     * because another CPU may reap the task before this caller observes DEAD.
+     */
+    for (;;) {
+        if (!sched_task_snapshot(task_id, &state, &current_cpu,
+                                 &kill_pending)) {
+            return 1;
+        }
+
+        if (state == TASK_STATE_DEAD ||
+            state == TASK_STATE_ZOMBIE ||
+            state == TASK_STATE_REAPING ||
+            current_cpu == TASK_NO_CPU) {
+            return 1;
+        }
+
+        schedule();
+    }
 }
 
 int sched_task_snapshot(unsigned long task_id,

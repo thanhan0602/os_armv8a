@@ -46,6 +46,34 @@ static const struct boot_service boot_services[] = {
     {(const char *)0, (const char *)0, 0}
 };
 
+static struct task *kernel_spawn_init(void)
+{
+    struct process *proc = loader_load_process_image("/bin/init.elf");
+    struct task *task;
+
+    if (proc == (struct process *)0) {
+        KER_INFO("[boot] failed to load /bin/init.elf");
+        return (struct task *)0;
+    }
+
+    task = task_create_user(proc, "init");
+    if (task == (struct task *)0) {
+        process_destroy(proc);
+        KER_INFO("[boot] failed to create init task");
+        return (struct task *)0;
+    }
+
+    if (!sched_register_init_task(task)) {
+        (void)sched_kill_task(task->id);
+        KER_INFO("[boot] failed to register init task");
+        return (struct task *)0;
+    }
+
+    sched_wake_task(task);
+    KER_LOGF("[boot] spawned init task id=%lu\n", task->id);
+    return task;
+}
+
 static void kernel_spawn_service(const char *path, const char *name)
 {
     struct process *proc = loader_load_process_image(path);
@@ -61,6 +89,12 @@ static void kernel_spawn_service(const char *path, const char *name)
         return;
     }
 
+    if (!sched_adopt_task(t)) {
+        (void)sched_kill_task(t->id);
+        KER_LOGF("[boot] init could not adopt %s\n", name);
+        return;
+    }
+
     sched_wake_task(t);
     KER_LOGF("[boot] spawned %s (%s)\n", name, path);
 }
@@ -68,6 +102,11 @@ static void kernel_spawn_service(const char *path, const char *name)
 static void kernel_start_user_services(void)
 {
     KER_INFO("starting user services");
+
+    if (kernel_spawn_init() == (struct task *)0) {
+        KER_INFO("[boot] user services disabled: init unavailable");
+        return;
+    }
     
     for (int i = 0; boot_services[i].path != (const char *)0; i++) {
         for (int j = 0; j < boot_services[i].count; j++) {
@@ -239,7 +278,7 @@ void kernel_main(void)
     /* Enable interrupts on CPU 0 */
     arch_local_irq_enable();
 
-#ifdef CONFIG_KERNEL_VIRTUAL
+#if defined(CONFIG_KERNEL_VIRTUAL) && defined(CONFIG_RUN_OS_DEMOS)
     kernel_start_user_services();
 #endif
 #ifdef CONFIG_SMP_REGRESSION_TESTS
