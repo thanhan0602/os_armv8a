@@ -1,4 +1,5 @@
 #include <kernel/log.h>
+#include <kernel/mutex.h>
 #include <kernel/sched.h>
 #include <kernel/smp_regression.h>
 #include <arch/arm/cpu.h>
@@ -7,6 +8,12 @@ static volatile struct task *wake_before_park_waiter;
 static volatile unsigned int wake_before_park_done;
 static volatile unsigned long remote_kill_target_id;
 static volatile unsigned int remote_kill_target_ready;
+static volatile int mutex_detach_id;
+static volatile unsigned long mutex_owner_id;
+static volatile unsigned long mutex_waiter_id;
+static volatile unsigned int mutex_owner_ready;
+static volatile unsigned int mutex_waiter_started;
+static volatile unsigned int mutex_waiter_acquired;
 
 static void wake_before_park_consumer(void)
 {
@@ -127,12 +134,110 @@ static void remote_kill_controller(void)
     task_exit();
 }
 
+static void mutex_detach_owner(void)
+{
+    if (!mutex_pool_lock(mutex_detach_id)) {
+        KER_INFO("[stress] mutex-owner-detach FAIL: owner lock failed");
+        task_exit();
+    }
+
+    mutex_owner_id = sched_current()->id;
+    __asm__ volatile("dmb ish" ::: "memory");
+    mutex_owner_ready = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+
+    /* The controller kills this task while it owns the mutex. */
+    for (;;) {
+        __asm__ volatile("yield");
+    }
+}
+
+static void mutex_detach_waiter(void)
+{
+    while (mutex_owner_ready == 0U) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        schedule();
+    }
+
+    mutex_waiter_id = sched_current()->id;
+    mutex_waiter_started = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+
+    if (!mutex_pool_lock(mutex_detach_id)) {
+        KER_INFO("[stress] mutex-owner-detach FAIL: waiter lock failed");
+        task_exit();
+    }
+
+    mutex_waiter_acquired = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    (void)mutex_pool_unlock(mutex_detach_id);
+    task_exit();
+}
+
+static void mutex_detach_controller(void)
+{
+    unsigned long state = TASK_STATE_READY;
+    unsigned int cpu = TASK_NO_CPU;
+    unsigned int pending = 0U;
+    unsigned long attempts;
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        if (mutex_owner_ready != 0U && mutex_waiter_started != 0U &&
+            sched_task_snapshot(mutex_waiter_id, &state, &cpu, &pending) &&
+            state == TASK_STATE_BLOCKED) {
+            break;
+        }
+        schedule();
+    }
+
+    if (state != TASK_STATE_BLOCKED) {
+        KER_INFO("[stress] mutex-owner-detach FAIL: waiter did not block");
+        task_exit();
+    }
+
+    if (!sched_kill_task(mutex_owner_id)) {
+        KER_INFO("[stress] mutex-owner-detach FAIL: owner kill rejected");
+        task_exit();
+    }
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        if (mutex_waiter_acquired != 0U) {
+            break;
+        }
+        schedule();
+    }
+
+    if (mutex_waiter_acquired == 0U) {
+        KER_INFO("[stress] mutex-owner-detach FAIL: ownership not handed off");
+        task_exit();
+    }
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        if (mutex_pool_free(mutex_detach_id)) {
+            KER_INFO("[stress] mutex-owner-detach PASS");
+            task_exit();
+        }
+        schedule();
+    }
+
+    KER_INFO("[stress] mutex-owner-detach FAIL: pool slot stayed busy");
+    task_exit();
+}
+
 void smp_regression_start(void)
 {
     wake_before_park_waiter = (struct task *)0;
     wake_before_park_done = 0U;
     remote_kill_target_id = 0UL;
     remote_kill_target_ready = 0U;
+    mutex_owner_id = 0UL;
+    mutex_waiter_id = 0UL;
+    mutex_owner_ready = 0U;
+    mutex_waiter_started = 0U;
+    mutex_waiter_acquired = 0U;
+    mutex_detach_id = mutex_pool_alloc();
     KER_INFO("[stress] starting SMP regression suite");
 
     if (task_create(wake_before_park_consumer, "stress-waiter") ==
@@ -147,5 +252,16 @@ void smp_regression_start(void)
         task_create(remote_kill_controller, "stress-kill-controller") ==
             (struct task *)0) {
         KER_INFO("[stress] remote-kill FAIL: task creation failed");
+    }
+
+    if (mutex_detach_id < 0) {
+        KER_INFO("[stress] mutex-owner-detach FAIL: pool allocation failed");
+    } else if (task_create(mutex_detach_owner, "stress-mutex-owner") ==
+                   (struct task *)0 ||
+               task_create(mutex_detach_waiter, "stress-mutex-waiter") ==
+                   (struct task *)0 ||
+               task_create(mutex_detach_controller,
+                           "stress-mutex-controller") == (struct task *)0) {
+        KER_INFO("[stress] mutex-owner-detach FAIL: task creation failed");
     }
 }
