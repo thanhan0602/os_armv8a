@@ -3,12 +3,13 @@
 
 #include <kernel/spinlock.h>
 #include <kernel/sched.h>
+#include <kernel/wait_queue.h>
 
 struct mutex {
     struct spinlock lock;
     int locked;
     struct task *owner;
-    struct task *wait_queue;
+    struct wait_queue waiters;
     unsigned int active_ops;
     unsigned int destroying;
 };

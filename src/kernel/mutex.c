@@ -38,7 +38,7 @@ void mutex_init(struct mutex *mutex)
     spinlock_init(&mutex->lock);
     mutex->locked = 0;
     mutex->owner = (struct task *)0;
-    mutex->wait_queue = (struct task *)0;
+    wait_queue_init(&mutex->waiters);
     mutex->active_ops = 0U;
     mutex->destroying = 0U;
 }
@@ -58,18 +58,11 @@ void mutex_lock(struct mutex *mutex)
         return;
     }
 
-    /* Already locked, add current task to wait queue */
+    /* Already locked, add current task to the shared FIFO wait queue. */
     struct task *curr = sched_current();
-    curr->wait_next = (struct task *)0;
-
-    if (mutex->wait_queue == (struct task *)0) {
-        mutex->wait_queue = curr;
-    } else {
-        struct task *t = mutex->wait_queue;
-        while (t->wait_next != (struct task *)0) {
-            t = t->wait_next;
-        }
-        t->wait_next = curr;
+    if (!wait_queue_enqueue(&mutex->waiters, curr)) {
+        spin_unlock_irqrestore(&mutex->lock, flags);
+        return;
     }
 
     /* Never acquire sched_lock while holding mutex->lock. */
@@ -116,15 +109,13 @@ void mutex_unlock(struct mutex *mutex)
 
     unsigned long flags = spin_lock_irqsave(&mutex->lock);
 
-    if (mutex->wait_queue == (struct task *)0) {
+    if (wait_queue_empty(&mutex->waiters)) {
         /* No one is waiting */
         mutex->locked = 0;
         mutex->owner = (struct task *)0;
     } else {
         /* Hand off ownership to the next waiting task */
-        next_task = mutex->wait_queue;
-        mutex->wait_queue = next_task->wait_next;
-        next_task->wait_next = (struct task *)0;
+        next_task = wait_queue_dequeue(&mutex->waiters);
         
         mutex->owner = next_task;
     }
@@ -158,31 +149,14 @@ void mutex_detach_task(struct task *task)
         spin_unlock_irqrestore(&pool_lock, pool_flags);
 
         unsigned long flags = spin_lock_irqsave(&mutex->lock);
-        struct task *prev = (struct task *)0;
-        struct task *cur = mutex->wait_queue;
-        while (cur != (struct task *)0) {
-            if (cur == task) {
-                if (prev == (struct task *)0) {
-                    mutex->wait_queue = cur->wait_next;
-                } else {
-                    prev->wait_next = cur->wait_next;
-                }
-                cur->wait_next = (struct task *)0;
-                detached_waiter = 1;
-                break;
-            }
-            prev = cur;
-            cur = cur->wait_next;
-        }
+        detached_waiter = wait_queue_remove(&mutex->waiters, task);
 
         if (mutex->owner == task) {
-            if (mutex->wait_queue == (struct task *)0) {
+            if (wait_queue_empty(&mutex->waiters)) {
                 mutex->owner = (struct task *)0;
                 mutex->locked = 0;
             } else {
-                wake_task = mutex->wait_queue;
-                mutex->wait_queue = wake_task->wait_next;
-                wake_task->wait_next = (struct task *)0;
+                wake_task = wait_queue_dequeue(&mutex->waiters);
                 mutex->owner = wake_task;
             }
         }
@@ -321,7 +295,7 @@ int mutex_pool_free(int handle)
 
     mutex_flags = spin_lock_irqsave(&mutex->lock);
     if (mutex->locked || mutex->owner != (struct task *)0 ||
-        mutex->wait_queue != (struct task *)0) {
+        !wait_queue_empty(&mutex->waiters)) {
         spin_unlock_irqrestore(&mutex->lock, mutex_flags);
         pool_flags = spin_lock_irqsave(&pool_lock);
         mutex->destroying = 0U;

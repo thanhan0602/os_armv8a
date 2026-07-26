@@ -2,13 +2,14 @@
 
 #include <kernel/sched.h>
 #include <kernel/spinlock.h>
+#include <kernel/wait_queue.h>
 
 struct ipc_channel {
     struct spinlock lock;
     unsigned long has_message;
     unsigned long length;
     unsigned char buffer[IPC_MESSAGE_MAX];
-    struct task *waiting_receiver;
+    struct wait_queue receivers;
 };
 
 static struct ipc_channel ipc_channels[IPC_CHANNEL_MAX];
@@ -28,7 +29,7 @@ void ipc_init(void)
         spinlock_init(&ipc_channels[channel_index].lock);
         ipc_channels[channel_index].has_message = 0UL;
         ipc_channels[channel_index].length = 0UL;
-        ipc_channels[channel_index].waiting_receiver = (struct task *)0;
+        wait_queue_init(&ipc_channels[channel_index].receivers);
         for (byte_index = 0UL; byte_index < IPC_MESSAGE_MAX; byte_index++) {
             ipc_channels[channel_index].buffer[byte_index] = 0U;
         }
@@ -60,10 +61,7 @@ long ipc_send(unsigned long channel_id, const unsigned char *data, unsigned long
     channel->length = len;
     channel->has_message = 1UL;
 
-    if (channel->waiting_receiver != (struct task *)0) {
-        waiting_receiver = channel->waiting_receiver;
-        channel->waiting_receiver = (struct task *)0;
-    }
+    waiting_receiver = wait_queue_dequeue(&channel->receivers);
 
     spin_unlock_irqrestore(&channel->lock, flags);
 
@@ -107,12 +105,11 @@ long ipc_receive(unsigned long channel_id,
         return (long)index;
     }
 
-    if (channel->waiting_receiver != (struct task *)0 && channel->waiting_receiver != task) {
+    if (!wait_queue_enqueue(&channel->receivers, task) &&
+        !wait_queue_contains(&channel->receivers, task)) {
         spin_unlock_irqrestore(&channel->lock, flags);
         return IPC_RESULT_ERROR;
     }
-
-    channel->waiting_receiver = task;
     spin_unlock_irqrestore(&channel->lock, flags);
 
     /*
@@ -138,9 +135,7 @@ void ipc_detach_task(struct task *task)
 
         channel = &ipc_channels[channel_index];
         flags = spin_lock_irqsave(&channel->lock);
-        if (channel->waiting_receiver == task) {
-            channel->waiting_receiver = (struct task *)0;
-        }
+        (void)wait_queue_remove(&channel->receivers, task);
         spin_unlock_irqrestore(&channel->lock, flags);
     }
 }
