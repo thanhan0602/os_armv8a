@@ -52,6 +52,7 @@ struct process {
     unsigned long user_sp;
     struct spinlock lock;
     unsigned int ref_count;   /* number of tasks (threads) sharing this process */
+    unsigned int exec_in_progress; /* blocks new sibling threads during execve */
 };
 
 struct process *process_create_from_image(char *code_start, char *code_end);

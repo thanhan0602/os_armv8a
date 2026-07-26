@@ -1093,6 +1093,7 @@ int mmu_handle_process_page_fault(struct process *p,
                                   unsigned long esr_el1)
 {
     struct mm_context *mm;
+    unsigned long process_irq_flags;
     unsigned long irq_flags;
     int result;
 
@@ -1100,8 +1101,15 @@ int mmu_handle_process_page_fault(struct process *p,
         return 0;
     }
 
+    /*
+     * VM metadata (regions and brk) is owned by process->lock. Acquire it
+     * before mm->lock so mmap/brk publication and page faults have a single
+     * lock order: process -> mm -> page allocator.
+     */
+    process_irq_flags = spin_lock_irqsave(&p->lock);
     mm = p->mm;
     if (mm == (struct mm_context *)0) {
+        spin_unlock_irqrestore(&p->lock, process_irq_flags);
         return 0;
     }
 
@@ -1110,11 +1118,13 @@ int mmu_handle_process_page_fault(struct process *p,
     /* Recheck after acquiring the lock in case the process changed mm. */
     if (p->mm != mm) {
         spin_unlock_irqrestore(&mm->lock, irq_flags);
+        spin_unlock_irqrestore(&p->lock, process_irq_flags);
         return 0;
     }
 
     result = mmu_handle_process_page_fault_locked(p, far_el1, esr_el1);
     spin_unlock_irqrestore(&mm->lock, irq_flags);
+    spin_unlock_irqrestore(&p->lock, process_irq_flags);
     return result;
 }
 

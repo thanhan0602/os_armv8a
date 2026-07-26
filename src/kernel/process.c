@@ -564,6 +564,7 @@ static struct process *process_create_flat_binary(const unsigned char *code, uns
     }
     spinlock_init(&process->lock);
     process->ref_count = 1U;
+    process->exec_in_progress = 0U;
 
     process->entry_va = USER_CODE_BASE;
     process->stack_top = USER_STACK_TOP;
@@ -752,6 +753,7 @@ struct process *process_create_from_elf(const unsigned char *image, unsigned lon
     }
     spinlock_init(&process->lock);
     process->ref_count = 1U;
+    process->exec_in_progress = 0U;
 
     process_zero_bytes(&load_state, sizeof(load_state));
     load_state.process = process;
@@ -849,6 +851,8 @@ struct process *process_create_from_image(char *code_start, char *code_end)
 
 void process_destroy(struct process *process)
 {
+    struct mm_context *mm;
+    unsigned int owned_image_count;
     if (process == (struct process *)0) {
         return;
     }
@@ -861,15 +865,23 @@ void process_destroy(struct process *process)
         spin_unlock_irqrestore(&process->lock, irq_flags);
         return;
     }
+    if (process->ref_count == 0U) {
+        spin_unlock_irqrestore(&process->lock, irq_flags);
+        return;
+    }
+    process->ref_count = 0U;
+    mm = process->mm;
+    process->mm = (struct mm_context *)0;
+    owned_image_count = process->owned_image_count;
+    process->owned_image_count = 0U;
     spin_unlock_irqrestore(&process->lock, irq_flags);
 
-    if (process->mm != (struct mm_context *)0) {
-        mmu_context_destroy(process->mm);
-        process->mm = (struct mm_context *)0;
+    if (mm != (struct mm_context *)0) {
+        mmu_context_destroy(mm);
     }
 
     /* Free owned ELF images */
-    for (unsigned int i = 0; i < process->owned_image_count; i++) {
+    for (unsigned int i = 0; i < owned_image_count; i++) {
         if (process->owned_images[i] != (unsigned char *)0) {
             kfree(process->owned_images[i]);
             process->owned_images[i] = (unsigned char *)0;
@@ -918,6 +930,10 @@ unsigned long process_clone(unsigned long flags, unsigned long stack, unsigned l
          * until the last thread exits. */
         child_proc = parent_task->process;
         unsigned long p_flags = spin_lock_irqsave(&child_proc->lock);
+        if (child_proc->ref_count == 0U || child_proc->exec_in_progress != 0U) {
+            spin_unlock_irqrestore(&child_proc->lock, p_flags);
+            return (unsigned long)-1;
+        }
         child_proc->ref_count++;
         spin_unlock_irqrestore(&child_proc->lock, p_flags);
 
@@ -934,7 +950,9 @@ unsigned long process_clone(unsigned long flags, unsigned long stack, unsigned l
         if (!child_proc) return (unsigned long)-1;
         spinlock_init(&child_proc->lock);
         child_proc->ref_count = 1U;
+        child_proc->exec_in_progress = 0U;
 
+        unsigned long parent_flags = spin_lock_irqsave(&parent_task->process->lock);
         child_proc->entry_va = parent_task->process->entry_va;
         child_proc->stack_top = parent_task->process->stack_top;
         child_proc->heap_start = parent_task->process->heap_start;
@@ -947,6 +965,7 @@ unsigned long process_clone(unsigned long flags, unsigned long stack, unsigned l
         }
 
         child_proc->mm = mmu_context_clone(parent_task->mm);
+        spin_unlock_irqrestore(&parent_task->process->lock, parent_flags);
         if (!child_proc->mm) {
             kfree(child_proc);
             return (unsigned long)-1;
@@ -1042,11 +1061,35 @@ unsigned long process_execve(const char *filename_va, char *const argv_va[], cha
     unsigned long image_size;
     char filename[128];
     unsigned long i;
+    unsigned long process_flags;
+
+    if (task == (struct task *)0 || task->process == (struct process *)0) {
+        return (unsigned long)-1;
+    }
+
+    /*
+     * Until sibling-thread termination is implemented, execve is allowed
+     * only for a single-threaded process. Keep this flag set while the new
+     * image is built so another CPU cannot publish a new CLONE_THREAD task.
+     */
+    process_flags = spin_lock_irqsave(&task->process->lock);
+    if (task->process->ref_count != 1U ||
+        task->process->exec_in_progress != 0U) {
+        spin_unlock_irqrestore(&task->process->lock, process_flags);
+        return (unsigned long)-1;
+    }
+    task->process->exec_in_progress = 1U;
+    spin_unlock_irqrestore(&task->process->lock, process_flags);
 
     /* 1. Copy filename from user space */
     for (i = 0; i < sizeof(filename) - 1; i++) {
         char c;
-        if (!mmu_copy_from_user(task->mm, &c, (unsigned long)filename_va + i, 1)) return (unsigned long)-1;
+        if (!mmu_copy_from_user(task->mm, &c, (unsigned long)filename_va + i, 1)) {
+            process_flags = spin_lock_irqsave(&task->process->lock);
+            task->process->exec_in_progress = 0U;
+            spin_unlock_irqrestore(&task->process->lock, process_flags);
+            return (unsigned long)-1;
+        }
         filename[i] = c;
         if (c == '\0') break;
     }
@@ -1057,6 +1100,9 @@ unsigned long process_execve(const char *filename_va, char *const argv_va[], cha
     /* 2. Load the new ELF image into kernel memory */
     if (!process_load_file_image(filename, &image_buffer, &image_size)) {
         KER_LOGF("[process] execve: failed to load %s\n", filename);
+        process_flags = spin_lock_irqsave(&task->process->lock);
+        task->process->exec_in_progress = 0U;
+        spin_unlock_irqrestore(&task->process->lock, process_flags);
         return (unsigned long)-1;
     }
 
@@ -1066,6 +1112,9 @@ unsigned long process_execve(const char *filename_va, char *const argv_va[], cha
 
     if (!new_process) {
         KER_LOGF("[process] execve: failed to parse ELF %s\n", filename);
+        process_flags = spin_lock_irqsave(&task->process->lock);
+        task->process->exec_in_progress = 0U;
+        spin_unlock_irqrestore(&task->process->lock, process_flags);
         return (unsigned long)-1;
     }
 
@@ -1116,8 +1165,31 @@ unsigned long process_thread_create(struct exception_context *ctx)
     
     /* Legacy wrapper for our custom thread_create syscall */
     struct task *parent_task = sched_current();
-    struct task *thread_task = task_create_user(parent_task->process, parent_task->name);
-    if (!thread_task) return (unsigned long)-1;
+    struct process *process;
+    struct task *thread_task;
+    unsigned long process_flags;
+
+    if (parent_task == (struct task *)0 ||
+        parent_task->process == (struct process *)0) {
+        return (unsigned long)-1;
+    }
+
+    process = parent_task->process;
+    process_flags = spin_lock_irqsave(&process->lock);
+    if (process->ref_count == 0U || process->exec_in_progress != 0U) {
+        spin_unlock_irqrestore(&process->lock, process_flags);
+        return (unsigned long)-1;
+    }
+    process->ref_count++;
+    spin_unlock_irqrestore(&process->lock, process_flags);
+
+    thread_task = task_create_user(process, parent_task->name);
+    if (!thread_task) {
+        process_flags = spin_lock_irqsave(&process->lock);
+        process->ref_count--;
+        spin_unlock_irqrestore(&process->lock, process_flags);
+        return (unsigned long)-1;
+    }
 
     thread_task->parent_id = parent_task->id;
     thread_task->context.x19 = entry;
@@ -1125,6 +1197,7 @@ unsigned long process_thread_create(struct exception_context *ctx)
     thread_task->context.x21 = arg;
     thread_task->context.x30 = (unsigned long)el0_entry_trampoline;
 
+    __asm__ volatile("dsb ish" ::: "memory");
     sched_wake_task(thread_task);
     return (unsigned long)thread_task->id;
 }
