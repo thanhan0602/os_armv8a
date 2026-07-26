@@ -123,6 +123,7 @@ void mutex_detach_task(struct task *task)
     for (int i = 0; i < MAX_MUTEX_POOL; i++) {
         struct mutex *mutex = &mutex_pool[i];
         struct task *wake_task = (struct task *)0;
+        int detached_waiter = 0;
         unsigned long pool_flags = spin_lock_irqsave(&pool_lock);
 
         if (!mutex_pool_used[i]) {
@@ -144,6 +145,7 @@ void mutex_detach_task(struct task *task)
                     prev->wait_next = cur->wait_next;
                 }
                 cur->wait_next = (struct task *)0;
+                detached_waiter = 1;
                 break;
             }
             prev = cur;
@@ -165,6 +167,16 @@ void mutex_detach_task(struct task *task)
 
         pool_flags = spin_lock_irqsave(&pool_lock);
         mutex->active_ops--;
+        /*
+         * A task blocked inside mutex_pool_lock() keeps one operation pin
+         * until mutex_lock() returns. A killed waiter can never return through
+         * that wrapper, so detach must release its abandoned pin after removing
+         * it from the queue. The increment above belongs to this detach scan
+         * and is released separately by the first decrement.
+         */
+        if (detached_waiter && mutex->active_ops > 0U) {
+            mutex->active_ops--;
+        }
         spin_unlock_irqrestore(&pool_lock, pool_flags);
 
         if (wake_task != (struct task *)0) {

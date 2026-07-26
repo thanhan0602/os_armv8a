@@ -46,7 +46,7 @@
 - Mutex test: xem `src/kernel/mutex_test.c` (được verify trên QEMU thành công).
 - SMP regression wake-before-park:
 	`make clean all SMP_REGRESSION_TESTS=1 RUN_OS_DEMOS=0`
-- Marker thành công: `[stress] wake-before-park PASS`, `[stress] remote-kill PASS` và `[stress] mutex-owner-detach PASS`.
+- Marker thành công: `[stress] wake-before-park PASS`, `[stress] remote-kill PASS`, `[stress] mutex-owner-detach PASS` và `[stress] mutex-waiter-detach PASS`.
 
 ## Pitfall/Debug note
 - Khi task không quay lại đúng PC, kiểm tra save/restore ELR/SPSR.
@@ -58,7 +58,8 @@
 - [x] Thêm regression test xác định cho wake-before-park.
 - [x] Thêm regression test cho remote kill/reap trên CPU khác.
 - [x] Thêm regression test kill mutex owner, handoff ownership và wake waiter.
-- [ ] Thêm regression test kill mutex waiter và concurrent mutex destroy.
+- [x] Thêm regression test kill mutex waiter và giải phóng operation pin bị bỏ dở.
+- [ ] Thêm regression test concurrent mutex destroy.
 - Cân nhắc synchronous remote-stop acknowledgement nếu API kill cần bảo đảm task đã dừng trước khi trả về.
 - Sau đó mới thêm priority, deadline, per-CPU run queue và load balancing.
 
