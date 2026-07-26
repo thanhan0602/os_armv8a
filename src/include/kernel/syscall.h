@@ -30,6 +30,16 @@
 #define SYS_MUTEX_LOCK   500UL
 #define SYS_MUTEX_UNLOCK 501UL
 #define SYS_MUTEX_TRYLOCK 504UL
+#define SYS_SEM_INIT      510UL
+#define SYS_SEM_DESTROY   511UL
+#define SYS_SEM_WAIT      512UL
+#define SYS_SEM_TRYWAIT   513UL
+#define SYS_SEM_POST      514UL
+#define SYS_COND_INIT      520UL
+#define SYS_COND_DESTROY   521UL
+#define SYS_COND_WAIT      522UL
+#define SYS_COND_SIGNAL    523UL
+#define SYS_COND_BROADCAST 524UL
 /*
  * Dispatch a syscall from EL0.
  *

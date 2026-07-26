@@ -22,6 +22,16 @@
 #define USER_SYS_MUTEX_LOCK   500UL
 #define USER_SYS_MUTEX_UNLOCK 501UL
 #define USER_SYS_MUTEX_TRYLOCK 504UL
+#define USER_SYS_SEM_INIT      510UL
+#define USER_SYS_SEM_DESTROY   511UL
+#define USER_SYS_SEM_WAIT      512UL
+#define USER_SYS_SEM_TRYWAIT   513UL
+#define USER_SYS_SEM_POST      514UL
+#define USER_SYS_COND_INIT      520UL
+#define USER_SYS_COND_DESTROY   521UL
+#define USER_SYS_COND_WAIT      522UL
+#define USER_SYS_COND_SIGNAL    523UL
+#define USER_SYS_COND_BROADCAST 524UL
 
 #define USER_IPC_MESSAGE_MAX  64UL
 
@@ -171,6 +181,17 @@ static inline void user_mutex_destroy(int id) { user_syscall1(USER_SYS_MUTEX_DES
 static inline void user_mutex_lock(int id) { user_syscall1(USER_SYS_MUTEX_LOCK, (unsigned long)id); }
 static inline void user_mutex_unlock(int id) { user_syscall1(USER_SYS_MUTEX_UNLOCK, (unsigned long)id); }
 static inline int user_mutex_trylock(int id) { return (int)user_syscall1(USER_SYS_MUTEX_TRYLOCK, (unsigned long)id); }
+
+static inline int user_sem_init(unsigned long value) { return (int)user_syscall1(USER_SYS_SEM_INIT, value); }
+static inline long user_sem_destroy(int id) { return user_syscall1(USER_SYS_SEM_DESTROY, (unsigned long)id); }
+static inline long user_sem_wait(int id) { return user_syscall1(USER_SYS_SEM_WAIT, (unsigned long)id); }
+static inline int user_sem_trywait(int id) { return (int)user_syscall1(USER_SYS_SEM_TRYWAIT, (unsigned long)id); }
+static inline long user_sem_post(int id) { return user_syscall1(USER_SYS_SEM_POST, (unsigned long)id); }
+static inline int user_cond_init(void) { return (int)user_syscall0(USER_SYS_COND_INIT); }
+static inline long user_cond_destroy(int id) { return user_syscall1(USER_SYS_COND_DESTROY, (unsigned long)id); }
+static inline long user_cond_wait(int cond_id, int mutex_id) { return user_syscall2(USER_SYS_COND_WAIT, (unsigned long)cond_id, (unsigned long)mutex_id); }
+static inline long user_cond_signal(int id) { return user_syscall1(USER_SYS_COND_SIGNAL, (unsigned long)id); }
+static inline long user_cond_broadcast(int id) { return user_syscall1(USER_SYS_COND_BROADCAST, (unsigned long)id); }
 
 static inline void *user_mmap(void *addr, unsigned long length, int prot, int flags, int fd, unsigned long offset)
 {

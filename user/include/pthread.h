@@ -13,7 +13,12 @@ typedef struct {
     int id;
 } pthread_mutex_t;
 
+typedef struct {
+    int id;
+} pthread_cond_t;
+
 typedef int pthread_mutexattr_t;
+typedef int pthread_condattr_t;
 typedef int pthread_attr_t;
 typedef unsigned long pthread_t;
 
@@ -23,6 +28,7 @@ typedef unsigned long pthread_t;
  * compare-exchange so it is safe even under concurrent first use.
  */
 #define PTHREAD_MUTEX_INITIALIZER { -1 }
+#define PTHREAD_COND_INITIALIZER { -1 }
 
 #define PTHREAD_STACK_SIZE 65536
 
@@ -94,6 +100,56 @@ static inline int pthread_mutex_unlock(pthread_mutex_t *mutex)
 {
     user_mutex_unlock(mutex->id);
     return 0;
+}
+
+/* -------- Condition variables -------- */
+
+static inline void __pthread_cond_ensure(pthread_cond_t *cond)
+{
+    if (cond->id >= 0) {
+        return;
+    }
+    int new_id = user_cond_init();
+    if (__pthread_cas_int(&cond->id, -1, new_id) != -1) {
+        user_cond_destroy(new_id);
+    }
+}
+
+static inline int pthread_cond_init(pthread_cond_t *cond,
+                                    const pthread_condattr_t *attr)
+{
+    (void)attr;
+    cond->id = user_cond_init();
+    return (cond->id >= 0) ? 0 : -1;
+}
+
+static inline int pthread_cond_destroy(pthread_cond_t *cond)
+{
+    if (cond->id < 0 || user_cond_destroy(cond->id) < 0) {
+        return -1;
+    }
+    cond->id = -1;
+    return 0;
+}
+
+static inline int pthread_cond_wait(pthread_cond_t *cond,
+                                    pthread_mutex_t *mutex)
+{
+    __pthread_cond_ensure(cond);
+    __pthread_mutex_ensure(mutex);
+    return user_cond_wait(cond->id, mutex->id) < 0 ? -1 : 0;
+}
+
+static inline int pthread_cond_signal(pthread_cond_t *cond)
+{
+    __pthread_cond_ensure(cond);
+    return user_cond_signal(cond->id) < 0 ? -1 : 0;
+}
+
+static inline int pthread_cond_broadcast(pthread_cond_t *cond)
+{
+    __pthread_cond_ensure(cond);
+    return user_cond_broadcast(cond->id) < 0 ? -1 : 0;
 }
 
 /* -------- Threads -------- */

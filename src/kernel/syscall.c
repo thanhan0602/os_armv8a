@@ -9,6 +9,8 @@
 #include <kernel/ramfs.h>
 #include <kernel/heap.h>
 #include <kernel/mutex.h>
+#include <kernel/semaphore.h>
+#include <kernel/condvar.h>
 #include <kernel/spinlock.h>
 #include <arch/arm/cpu.h>
 
@@ -428,6 +430,38 @@ void syscall_dispatch(unsigned long nr, struct exception_context *ctx)
         break;
     case SYS_MUTEX_TRYLOCK:
         ret = (unsigned long)mutex_pool_trylock((int)ctx->gpr[0]);
+        break;
+    case SYS_SEM_INIT:
+        ret = (unsigned long)semaphore_pool_alloc(ctx->gpr[0]);
+        break;
+    case SYS_SEM_DESTROY:
+        ret = semaphore_pool_free((int)ctx->gpr[0]) ? 0UL : (unsigned long)-1;
+        break;
+    case SYS_SEM_WAIT:
+        ret = semaphore_pool_wait((int)ctx->gpr[0]) ? 0UL : (unsigned long)-1;
+        break;
+    case SYS_SEM_TRYWAIT:
+        ret = (unsigned long)semaphore_pool_trywait((int)ctx->gpr[0]);
+        break;
+    case SYS_SEM_POST:
+        ret = semaphore_pool_post((int)ctx->gpr[0]) ? 0UL : (unsigned long)-1;
+        break;
+    case SYS_COND_INIT:
+        ret = (unsigned long)condvar_pool_alloc();
+        break;
+    case SYS_COND_DESTROY:
+        ret = condvar_pool_free((int)ctx->gpr[0]) ? 0UL : (unsigned long)-1;
+        break;
+    case SYS_COND_WAIT:
+        ret = condvar_pool_wait((int)ctx->gpr[0], (int)ctx->gpr[1]) ?
+              0UL : (unsigned long)-1;
+        break;
+    case SYS_COND_SIGNAL:
+        ret = condvar_pool_signal((int)ctx->gpr[0]) ? 0UL : (unsigned long)-1;
+        break;
+    case SYS_COND_BROADCAST:
+        ret = condvar_pool_broadcast((int)ctx->gpr[0]) ?
+              0UL : (unsigned long)-1;
         break;
     case SYS_NANOSLEEP:
         ret = sys_nanosleep(ctx->gpr[0]);
