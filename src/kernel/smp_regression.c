@@ -1,11 +1,15 @@
 #include <kernel/log.h>
 #include <kernel/mmu.h>
 #include <kernel/mutex.h>
+#include <kernel/semaphore.h>
+#include <kernel/condvar.h>
 #include <kernel/sched.h>
 #include <kernel/smp_regression.h>
 #include <kernel/spinlock.h>
 #include <arch/arm/cpu.h>
 #include <arch/arm/psci.h>
+
+#ifdef CONFIG_SMP_REGRESSION_TESTS
 
 #define SMP_PASS_WAKE_BEFORE_PARK       (1U << 0)
 #define SMP_PASS_REMOTE_KILL            (1U << 1)
@@ -16,7 +20,11 @@
 #define SMP_PASS_MUTEX_DESTROY_RACE     (1U << 6)
 #define SMP_PASS_MM_MULTI_CPU_DETACH    (1U << 7)
 #define SMP_PASS_MUTEX_STALE_HANDLE     (1U << 8)
-#define SMP_PASS_ALL                    ((1U << 9) - 1U)
+#define SMP_PASS_MM_SHOOTDOWN_ACK       (1U << 9)
+#define SMP_PASS_SEMAPHORE               (1U << 10)
+#define SMP_PASS_CONDVAR                 (1U << 11)
+#define SMP_PASS_INIT_REAP               (1U << 12)
+#define SMP_PASS_ALL                    ((1U << 13) - 1U)
 #define MUTEX_DESTROY_RACE_ROUNDS       512U
 
 static volatile unsigned int smp_regression_pass_mask;
@@ -71,6 +79,46 @@ static volatile unsigned long mm_lifetime_release_baseline;
 static volatile unsigned int mm_lifetime_second_active;
 static volatile unsigned int mm_lifetime_first_detached;
 static volatile unsigned int mm_lifetime_second_detach;
+static volatile int sync_sem_handle;
+static volatile int sync_cond_handle;
+static volatile int sync_cond_mutex_handle;
+static volatile unsigned int sync_sem_waiter_started;
+static volatile unsigned int sync_sem_waiter_done;
+static volatile unsigned int sync_cond_waiter_started;
+static volatile unsigned int sync_cond_waiter_done;
+static volatile unsigned int sync_cond_predicate;
+static volatile unsigned long init_reap_child_id;
+static volatile unsigned int init_reap_child_exit;
+static volatile unsigned long init_reap_parent_id;
+static volatile unsigned int init_reap_parent_done;
+
+static void sync_regression_controller(void);
+
+static void init_reap_child(void)
+{
+    while (init_reap_child_exit == 0U) {
+        schedule();
+    }
+    task_exit();
+}
+
+static void init_reap_parent(void)
+{
+    struct task *child;
+
+    init_reap_parent_id = sched_current()->id;
+    child = task_create(init_reap_child, "stress-orphan-child");
+    if (child == (struct task *)0 ||
+        !sched_test_set_parent(child, init_reap_parent_id)) {
+        KER_INFO("[stress] init-reap FAIL: child creation failed");
+        task_exit();
+    }
+
+    init_reap_child_id = child->id;
+    init_reap_parent_done = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    task_exit();
+}
 
 static void mm_lifetime_holder(void)
 {
@@ -98,6 +146,13 @@ static void mm_lifetime_holder(void)
     __asm__ volatile("dmb ish; sev" ::: "memory");
 
     while (mm_lifetime_detach == 0U) {
+        /*
+         * This deterministic holder masks timer IRQs so schedule() cannot
+         * detach the test context before the controller observes it. Poll
+         * the shootdown handler explicitly so a synchronous request can
+         * still complete while ordinary IRQ delivery remains masked.
+         */
+        mmu_handle_shootdown_ipi();
         __asm__ volatile("dmb ish; yield" ::: "memory");
     }
 
@@ -136,6 +191,22 @@ static void mm_lifetime_run_controller(void)
         KER_INFO("[stress] mm-multi-cpu-detach FAIL: context not active on two CPUs");
         return;
     }
+
+    /*
+     * Both holder CPUs currently have this context installed. A synchronous
+     * shootdown must invalidate the ASID locally and remotely, wait for every
+     * SGI acknowledgement, and leave both active-context bits intact.
+     */
+    if (!mmu_context_shootdown(mm) ||
+        !mmu_context_test_snapshot(mm, &refs, &dying, &active_mask) ||
+        refs != 1U || dying != 0U || active_mask == 0U ||
+        (active_mask & (active_mask - 1U)) == 0U) {
+        KER_INFO("[stress] mm-shootdown-ack FAIL: acknowledgement incomplete");
+        return;
+    }
+
+    KER_INFO("[stress] mm-shootdown-ack PASS");
+    smp_regression_mark_pass(SMP_PASS_MM_SHOOTDOWN_ACK);
 
     mmu_context_put(mm);
     if (!mmu_context_test_snapshot(mm, &refs, &dying, &active_mask) ||
@@ -287,23 +358,25 @@ static void remote_kill_controller(void)
         task_exit();
     }
 
-    if (!sched_kill_task(target_id)) {
-        KER_INFO("[stress] remote-kill FAIL: kill request rejected");
+    if (!sched_kill_task_sync(target_id)) {
+        KER_INFO("[stress] remote-stop-ack FAIL: synchronous kill rejected");
         task_exit();
     }
 
-    for (attempts = 0UL; attempts < 100000UL; attempts++) {
-        if (!sched_task_snapshot(target_id, &state, &target_cpu,
-                                 &kill_pending)) {
-            KER_INFO("[stress] remote-kill PASS");
-            smp_regression_mark_pass(SMP_PASS_REMOTE_KILL);
-            mm_lifetime_run_controller();
-            task_exit();
-        }
-        schedule();
+    if (sched_task_snapshot(target_id, &state, &target_cpu,
+                            &kill_pending) &&
+        state != TASK_STATE_DEAD &&
+        state != TASK_STATE_ZOMBIE &&
+        state != TASK_STATE_REAPING &&
+        target_cpu != TASK_NO_CPU) {
+        KER_INFO("[stress] remote-stop-ack FAIL: target still running");
+        task_exit();
     }
 
-    KER_INFO("[stress] remote-kill FAIL: target was not reaped");
+    KER_INFO("[stress] remote-stop-ack PASS");
+    KER_INFO("[stress] remote-kill PASS");
+    smp_regression_mark_pass(SMP_PASS_REMOTE_KILL);
+    mm_lifetime_run_controller();
     task_exit();
 }
 
@@ -472,6 +545,9 @@ static void mutex_waiter_kill_owner(void)
     mm_lifetime_second_active = 1U;
     __asm__ volatile("dmb ish; sev" ::: "memory");
     while (mm_lifetime_second_detach == 0U) {
+        /* See mm_lifetime_holder(): service pending shootdowns while the
+         * deterministic observation window keeps timer IRQs masked. */
+        mmu_handle_shootdown_ipi();
         __asm__ volatile("dmb ish; yield" ::: "memory");
     }
     mmu_context_switch((struct mm_context *)0);
@@ -615,9 +691,154 @@ static void mutex_waiter_kill_controller(void)
 
         KER_INFO("[stress] mutex-stale-handle PASS");
         smp_regression_mark_pass(SMP_PASS_MUTEX_STALE_HANDLE);
+        sync_regression_controller();
     } else {
         KER_INFO("[stress] mutex-destroy-race FAIL: race invariant violated");
     }
+    task_exit();
+}
+
+static void sync_semaphore_waiter(void)
+{
+    sync_sem_waiter_started = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+
+    if (!semaphore_pool_wait(sync_sem_handle)) {
+        KER_INFO("[stress] semaphore FAIL: wait rejected");
+        task_exit();
+    }
+
+    sync_sem_waiter_done = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    task_exit();
+}
+
+static void sync_condvar_waiter(void)
+{
+    if (!mutex_pool_lock(sync_cond_mutex_handle)) {
+        KER_INFO("[stress] condvar FAIL: mutex lock rejected");
+        task_exit();
+    }
+
+    sync_cond_waiter_started = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    while (sync_cond_predicate == 0U) {
+        if (!condvar_pool_wait(sync_cond_handle,
+                               sync_cond_mutex_handle)) {
+            KER_INFO("[stress] condvar FAIL: wait rejected");
+            (void)mutex_pool_unlock(sync_cond_mutex_handle);
+            task_exit();
+        }
+    }
+
+    sync_cond_waiter_done = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    (void)mutex_pool_unlock(sync_cond_mutex_handle);
+    task_exit();
+}
+
+static void sync_regression_controller(void)
+{
+    unsigned long attempts;
+    unsigned long child_id;
+    unsigned long parent_id;
+    struct task *parent;
+
+    if (!sched_register_init_task(sched_current())) {
+        KER_INFO("[stress] init-reap FAIL: init setup failed");
+        task_exit();
+    }
+
+    parent = task_create(init_reap_parent, "stress-orphan-parent");
+    if (parent == (struct task *)0 || !sched_adopt_task(parent)) {
+        KER_INFO("[stress] init-reap FAIL: parent creation failed");
+        task_exit();
+    }
+    parent_id = parent->id;
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        if (init_reap_parent_done != 0U) {
+            break;
+        }
+        schedule();
+    }
+
+    if (init_reap_parent_done == 0U ||
+        sched_wait4((long)parent_id, 0UL) != parent_id) {
+        KER_INFO("[stress] init-reap FAIL: parent was not collected");
+        task_exit();
+    }
+
+    init_reap_child_exit = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    child_id = sched_wait4((long)init_reap_child_id, 0UL);
+    if (init_reap_parent_done == 0U || child_id != init_reap_child_id) {
+        KER_INFO("[stress] init-reap FAIL: orphan was not collected");
+        task_exit();
+    }
+
+    KER_INFO("[stress] init-reap PASS");
+    smp_regression_mark_pass(SMP_PASS_INIT_REAP);
+
+    if (task_create(sync_semaphore_waiter, "stress-sem-waiter") ==
+            (struct task *)0 ||
+        task_create(sync_condvar_waiter, "stress-cond-waiter") ==
+            (struct task *)0) {
+        KER_INFO("[stress] sync primitives FAIL: task creation failed");
+        task_exit();
+    }
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        if (sync_sem_waiter_started != 0U &&
+            sync_cond_waiter_started != 0U) {
+            break;
+        }
+        schedule();
+    }
+
+    if (sync_sem_waiter_started == 0U ||
+        !semaphore_pool_post(sync_sem_handle)) {
+        KER_INFO("[stress] semaphore FAIL: waiter did not start");
+        task_exit();
+    }
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        if (sync_sem_waiter_done != 0U) break;
+        schedule();
+    }
+
+    if (sync_sem_waiter_done == 0U ||
+        !semaphore_pool_free(sync_sem_handle)) {
+        KER_INFO("[stress] semaphore FAIL: wake or destroy failed");
+        task_exit();
+    }
+    KER_INFO("[stress] semaphore PASS");
+    smp_regression_mark_pass(SMP_PASS_SEMAPHORE);
+
+    if (!mutex_pool_lock(sync_cond_mutex_handle)) {
+        KER_INFO("[stress] condvar FAIL: controller lock rejected");
+        task_exit();
+    }
+    sync_cond_predicate = 1U;
+    if (!condvar_pool_signal(sync_cond_handle) ||
+        !mutex_pool_unlock(sync_cond_mutex_handle)) {
+        KER_INFO("[stress] condvar FAIL: signal rejected");
+        task_exit();
+    }
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        if (sync_cond_waiter_done != 0U) break;
+        schedule();
+    }
+
+    if (sync_cond_waiter_done == 0U ||
+        !condvar_pool_free(sync_cond_handle) ||
+        !mutex_pool_free(sync_cond_mutex_handle)) {
+        KER_INFO("[stress] condvar FAIL: wake or destroy failed");
+        task_exit();
+    }
+    KER_INFO("[stress] condvar PASS");
+    smp_regression_mark_pass(SMP_PASS_CONDVAR);
     task_exit();
 }
 
@@ -652,7 +873,24 @@ void smp_regression_start(void)
     mm_lifetime_second_active = 0U;
     mm_lifetime_first_detached = 0U;
     mm_lifetime_second_detach = 0U;
+    sync_sem_handle = semaphore_pool_alloc(0UL);
+    sync_cond_handle = condvar_pool_alloc();
+    sync_cond_mutex_handle = mutex_pool_alloc();
+    sync_sem_waiter_started = 0U;
+    sync_sem_waiter_done = 0U;
+    sync_cond_waiter_started = 0U;
+    sync_cond_waiter_done = 0U;
+    sync_cond_predicate = 0U;
+    init_reap_child_id = 0UL;
+    init_reap_child_exit = 0U;
+    init_reap_parent_id = 0UL;
+    init_reap_parent_done = 0U;
     KER_INFO("[stress] starting SMP regression suite");
+
+    if (sync_sem_handle < 0 || sync_cond_handle < 0 ||
+        sync_cond_mutex_handle < 0) {
+        KER_INFO("[stress] sync primitives FAIL: pool allocation failed");
+    }
 
     if (task_create(wake_before_park_consumer, "stress-waiter") ==
             (struct task *)0 ||
@@ -700,3 +938,11 @@ void smp_regression_start(void)
         KER_INFO("[stress] mm-deferred-release FAIL: task creation failed");
     }
 }
+
+#else
+
+void smp_regression_start(void)
+{
+}
+
+#endif /* CONFIG_SMP_REGRESSION_TESTS */

@@ -551,6 +551,22 @@ int sched_adopt_task(struct task *task)
     return 1;
 }
 
+#ifdef CONFIG_SMP_REGRESSION_TESTS
+int sched_test_set_parent(struct task *task, unsigned long parent_id)
+{
+    unsigned long flags;
+
+    if (task == (struct task *)0 || task->id < 4UL) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    task->parent_id = parent_id;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return 1;
+}
+#endif
+
 struct task *sched_current(void)
 {
     return arch_get_current_task();

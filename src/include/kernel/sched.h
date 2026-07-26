@@ -92,6 +92,9 @@ void sched_set_current_exit_status(int status);
 unsigned long sched_wait4(long pid, unsigned long status_ptr);
 int sched_register_init_task(struct task *task);
 int sched_adopt_task(struct task *task);
+#ifdef CONFIG_SMP_REGRESSION_TESTS
+int sched_test_set_parent(struct task *task, unsigned long parent_id);
+#endif
 void sched_dump_tasks(void);
 int sched_kill_task(unsigned long task_id);
 int sched_kill_task_sync(unsigned long task_id);
