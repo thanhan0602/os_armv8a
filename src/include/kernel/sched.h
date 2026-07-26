@@ -92,6 +92,10 @@ void sched_set_current_exit_status(int status);
 unsigned long sched_wait4(long pid, unsigned long status_ptr);
 void sched_dump_tasks(void);
 int sched_kill_task(unsigned long task_id);
+int sched_task_snapshot(unsigned long task_id,
+                        unsigned long *state,
+                        unsigned int *current_cpu,
+                        unsigned int *kill_pending);
 
 extern void switch_context(struct task_context *old_ctx,
                            struct task_context *new_ctx);

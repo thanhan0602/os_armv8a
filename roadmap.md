@@ -350,8 +350,8 @@ Implemented (fifth increment — ASID support):
 ## Immediate Next Steps
 
 1. ~~Stage 16: Multicore Support (SMP).~~ ✅ Done.
-2. Stage 16 regression increment: ✅ Added an opt-in SMP regression suite via `SMP_REGRESSION_TESTS=1`; the first deterministic test forces wake-before-park and validates the scheduler pending-wake token with `[stress] wake-before-park PASS` on four-core QEMU.
-3. Extend the SMP regression suite with remote kill/reap, killed mutex waiter/owner, concurrent mutex destroy, and deferred `mm_context` release tests.
+2. Stage 16 regression increment: ✅ Added an opt-in SMP regression suite via `SMP_REGRESSION_TESTS=1`. Deterministic four-core QEMU tests now validate wake-before-park and remote kill/reap with `[stress] wake-before-park PASS` and `[stress] remote-kill PASS`.
+3. Extend the SMP regression suite with killed mutex waiter/owner, concurrent mutex destroy, and deferred `mm_context` release tests.
 4. Stage 16 increment 3: Kernel Preemption. Currently, the kernel only reschedules on explicit yield or return from interrupt. Full kernel preemption would allow higher priority tasks to interrupt lower priority kernel work.
 5. Stage 11 increment 3: add a real wait-queue abstraction or multi-waiter channel queue so IPC is no longer limited to one blocked receiver per channel.
 6. Stage 12 increment 3: add a real init-style launch path so the kernel boots one named program from the filesystem instead of hardcoding demo pairs in `main.c`.

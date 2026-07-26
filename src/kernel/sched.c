@@ -750,3 +750,36 @@ int sched_kill_task(unsigned long task_id)
 
     return killed;
 }
+
+int sched_task_snapshot(unsigned long task_id,
+                        unsigned long *state,
+                        unsigned int *current_cpu,
+                        unsigned int *kill_pending)
+{
+    unsigned long flags;
+    int found = 0;
+
+    flags = spin_lock_irqsave(&sched_lock);
+    for (unsigned long index = 0UL; index < MAX_TASKS; index++) {
+        struct task *task = &tasks[index];
+
+        if (task->name == (const char *)0 || task->id != task_id) {
+            continue;
+        }
+
+        if (state != (unsigned long *)0) {
+            *state = task->state;
+        }
+        if (current_cpu != (unsigned int *)0) {
+            *current_cpu = task->current_cpu;
+        }
+        if (kill_pending != (unsigned int *)0) {
+            *kill_pending = task->kill_pending;
+        }
+        found = 1;
+        break;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+
+    return found;
+}
