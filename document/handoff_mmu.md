@@ -10,6 +10,7 @@
 - Đã hoàn thành (SMP hardening): per-`mm_context` lock cho page-table mutation, lazy fault, CoW, map/unmap và software walk; ASID allocator lock; allocator/refcount release an toàn; process VM metadata được đồng bộ với page-fault handler.
 - Đã hoàn thành (MM lifetime): `mm_context` có owner refcount, trạng thái `dying`, active CPU mask và lifecycle lock. Context chỉ được giải phóng sau khi owner cuối cùng biến mất và không còn CPU nào cài nó trong TTBR0.
 - Đã verify (MM deferred release): regression xác định trên QEMU 4 core giữ context active trên một CPU, drop owner cuối từ task điều khiển, xác nhận context chuyển sang `dying` nhưng chưa release, rồi xác nhận release đúng một lần sau khi CPU giữ context chuyển TTBR0 về empty root.
+- Đã verify (multi-CPU detach): cùng một `mm_context` được cài đồng thời trên hai CPU; sau khi owner cuối biến mất, detach CPU đầu tiên không được release context, và CPU cuối cùng detach mới thực hiện release đúng một lần. Marker: `[stress] mm-multi-cpu-detach PASS`.
 - Đã verify: test_cow.elf (CoW success), fork/wait4 logic, lazy page fault handler, execve memory cleanup.
 - Đã verify thêm trên QEMU 4 core: CPU 1-3 online, kernel init hoàn tất, pthread workload in ra `Complex Test Finished.`, không có fatal MMU/allocator marker trong log kiểm thử.
 
@@ -54,7 +55,7 @@
 - Khi free page, chỉ lưu PA, không lưu VA.
 
 ## Next steps
-- Thêm stress lặp và cross-CPU shootdown cho trường hợp nhiều CPU đồng thời active cùng một context.
+- Thêm stress lặp và synchronous cross-CPU shootdown/acknowledgement cho trường hợp nhiều CPU đồng thời active cùng một context.
 - Bỏ global TLB flush khỏi context-switch fast path và thêm ASID generation rollover sau khi có targeted shootdown đầy đủ.
 - Thêm object cache (slab/slub).
 - Hỗ trợ Shared Memory (SYS_SHM).

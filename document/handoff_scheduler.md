@@ -61,6 +61,7 @@
 - [x] Thêm regression test kill mutex waiter và giải phóng operation pin bị bỏ dở.
 - [x] Thêm regression test từ chối destroy mutex đang locked/có owner.
 - [x] Thêm regression test deferred `mm_context` release khi owner cuối biến mất trong lúc context vẫn active trên CPU khác.
+- [x] Thêm regression test shared `mm_context` active trên hai CPU; xác minh chỉ CPU detach cuối cùng mới release context.
 - [x] Tổng hợp sáu regression bằng pass mask có khóa, in `[stress] ALL PASS` và tắt QEMU xác định qua PSCI `SYSTEM_OFF`.
 - [x] Thêm stress test 512 vòng lock/trylock/unlock cạnh tranh với destroy; xác minh destroy luôn bị từ chối khi mutex đang được giữ và thành công sau khi mọi operation kết thúc.
 - Cân nhắc synchronous remote-stop acknowledgement nếu API kill cần bảo đảm task đã dừng trước khi trả về.

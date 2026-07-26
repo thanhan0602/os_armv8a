@@ -14,7 +14,8 @@
 #define SMP_PASS_MUTEX_DESTROY_REJECT   (1U << 4)
 #define SMP_PASS_MM_DEFERRED_RELEASE    (1U << 5)
 #define SMP_PASS_MUTEX_DESTROY_RACE     (1U << 6)
-#define SMP_PASS_ALL                    ((1U << 7) - 1U)
+#define SMP_PASS_MM_MULTI_CPU_DETACH    (1U << 7)
+#define SMP_PASS_ALL                    ((1U << 8) - 1U)
 #define MUTEX_DESTROY_RACE_ROUNDS       512U
 
 static volatile unsigned int smp_regression_pass_mask;
@@ -66,6 +67,9 @@ static volatile struct mm_context *mm_lifetime_context;
 static volatile unsigned int mm_lifetime_active;
 static volatile unsigned int mm_lifetime_detach;
 static volatile unsigned long mm_lifetime_release_baseline;
+static volatile unsigned int mm_lifetime_second_active;
+static volatile unsigned int mm_lifetime_first_detached;
+static volatile unsigned int mm_lifetime_second_detach;
 
 static void mm_lifetime_holder(void)
 {
@@ -97,6 +101,8 @@ static void mm_lifetime_holder(void)
     }
 
     mmu_context_switch((struct mm_context *)0);
+    mm_lifetime_first_detached = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
     arch_local_irq_restore(irq_flags);
     task_exit();
 }
@@ -112,7 +118,8 @@ static void mm_lifetime_run_controller(void)
 
     for (attempts = 0UL; attempts < 100000UL; attempts++) {
         __asm__ volatile("dmb ish" ::: "memory");
-        if (mm_lifetime_active != 0U) {
+        if (mm_lifetime_active != 0U &&
+            mm_lifetime_second_active != 0U) {
             break;
         }
         schedule();
@@ -120,10 +127,12 @@ static void mm_lifetime_run_controller(void)
 
     mm = (struct mm_context *)mm_lifetime_context;
     baseline = mm_lifetime_release_baseline;
-    if (mm_lifetime_active == 0U || mm == (struct mm_context *)0 ||
+    if (mm_lifetime_active == 0U || mm_lifetime_second_active == 0U ||
+        mm == (struct mm_context *)0 ||
         !mmu_context_test_snapshot(mm, &refs, &dying, &active_mask) ||
-        refs != 1U || dying != 0U || active_mask == 0U) {
-        KER_INFO("[stress] mm-deferred-release FAIL: context was not active");
+        refs != 1U || dying != 0U || active_mask == 0U ||
+        (active_mask & (active_mask - 1U)) == 0U) {
+        KER_INFO("[stress] mm-multi-cpu-detach FAIL: context not active on two CPUs");
         return;
     }
 
@@ -138,9 +147,28 @@ static void mm_lifetime_run_controller(void)
     mm_lifetime_detach = 1U;
     __asm__ volatile("dmb ish; sev" ::: "memory");
     for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        if (mm_lifetime_first_detached != 0U) {
+            break;
+        }
+        schedule();
+    }
+
+    if (mm_lifetime_first_detached == 0U ||
+        !mmu_context_test_snapshot(mm, &refs, &dying, &active_mask) ||
+        refs != 0U || dying == 0U || active_mask == 0U ||
+        mmu_context_test_release_count() != baseline) {
+        KER_INFO("[stress] mm-multi-cpu-detach FAIL: released after first detach");
+        return;
+    }
+
+    mm_lifetime_second_detach = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
         if (mmu_context_test_release_count() == baseline + 1UL) {
             KER_INFO("[stress] mm-deferred-release PASS");
             smp_regression_mark_pass(SMP_PASS_MM_DEFERRED_RELEASE);
+            KER_INFO("[stress] mm-multi-cpu-detach PASS");
+            smp_regression_mark_pass(SMP_PASS_MM_MULTI_CPU_DETACH);
 
             while (smp_regression_passes() != SMP_PASS_ALL) {
                 schedule();
@@ -374,6 +402,8 @@ static void mutex_detach_controller(void)
 static void mutex_waiter_kill_owner(void)
 {
     unsigned int round;
+    unsigned long irq_flags;
+    struct mm_context *mm;
 
     if (!mutex_pool_lock(mutex_waiter_kill_id)) {
         KER_INFO("[stress] mutex-waiter-detach FAIL: owner lock failed");
@@ -424,6 +454,27 @@ static void mutex_waiter_kill_owner(void)
 
     mutex_destroy_race_finished = 1U;
     __asm__ volatile("dmb ish; sev" ::: "memory");
+
+    while (mm_lifetime_active == 0U) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        schedule();
+    }
+
+    mm = (struct mm_context *)mm_lifetime_context;
+    if (mm == (struct mm_context *)0) {
+        KER_INFO("[stress] mm-multi-cpu-detach FAIL: missing shared context");
+        task_exit();
+    }
+
+    irq_flags = arch_local_irq_save();
+    mmu_context_switch(mm);
+    mm_lifetime_second_active = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    while (mm_lifetime_second_detach == 0U) {
+        __asm__ volatile("dmb ish; yield" ::: "memory");
+    }
+    mmu_context_switch((struct mm_context *)0);
+    arch_local_irq_restore(irq_flags);
     task_exit();
 }
 
@@ -578,6 +629,9 @@ void smp_regression_start(void)
     mm_lifetime_active = 0U;
     mm_lifetime_detach = 0U;
     mm_lifetime_release_baseline = 0UL;
+    mm_lifetime_second_active = 0U;
+    mm_lifetime_first_detached = 0U;
+    mm_lifetime_second_detach = 0U;
     KER_INFO("[stress] starting SMP regression suite");
 
     if (task_create(wake_before_park_consumer, "stress-waiter") ==
