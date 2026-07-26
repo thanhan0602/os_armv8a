@@ -46,6 +46,10 @@ The combined changes passed a clean build and a 4-core QEMU pthread run. CPUs 1-
 
 The opt-in SMP regression build now aggregates all six deterministic checks under a spinlock-protected pass mask. After every check succeeds it prints `[stress] ALL PASS` and calls PSCI `SYSTEM_OFF`, allowing QEMU to terminate normally with status 0 instead of depending on an external timeout.
 
+The suite now also covers init-style orphan reparenting and collection, semaphore blocking/wakeup, and condition-variable wait/signal with mutex reacquisition. The corresponding markers are `[stress] init-reap PASS`, `[stress] semaphore PASS`, and `[stress] condvar PASS`.
+
+MM invalidation now reserves GICv2 SGI 1 for synchronous cross-CPU ASID shootdown. The requester invalidates locally, sends the SGI only to CPUs in the context active mask, and waits for a protected acknowledgement mask to become empty. The SGI handler performs TLBI and acknowledgement without invoking the scheduler. The four-core regression emits `[stress] mm-shootdown-ack PASS`, followed by `[stress] ALL PASS`, and QEMU exits with status 0.
+
 ### Scheduler, IPC, mutex, and MM lifetime hardening
 
 - Scheduler wait/wake now uses `sched_park_task()` and `sched_unpark_task()` with a pending-wake token, preventing wake-before-park notifications from being lost.
@@ -53,6 +57,7 @@ The opt-in SMP regression build now aggregates all six deterministic checks unde
 - A task running on another CPU is killed by setting `kill_pending` and sending an IPI. Its owning CPU transitions it to DEAD in `schedule()` before reaping can occur.
 - Nanosleep and task-state updates are serialized by scheduler APIs under `sched_lock`.
 - Mutex pool operations pin slots with `active_ops`; destroy rejects active, locked, owned, or queued mutexes. Reaping detaches dead tasks from mutex wait queues and transfers ownership when necessary.
+- IPC và mutex hiện dùng chung intrusive FIFO `struct wait_queue`; queue mutation được bảo vệ bởi subsystem lock, còn scheduler park/unpark luôn diễn ra sau khi nhả lock.
 - `mm_context` now has owner references, a `dying` state, an active CPU mask, and deferred release after the last CPU switches its TTBR0 away from the context.
 - A fresh 4-CPU QEMU run completed the pthread synchronization workload with `Complex Test Finished.`, all four user tasks exited with code 0, and no fatal marker was found.
 
@@ -60,9 +65,9 @@ The opt-in SMP regression build now aggregates all six deterministic checks unde
 - **Lock Contention**: The global `sched_lock` might become a bottleneck with more cores.
 - **Load Balancing**: Currently uses a simple round-robin where any core can pick any task. A more advanced scheduler with per-cpu runqueues could be implemented.
 - **Kernel Preemption**: The kernel itself is not yet fully preemptible.
-- **Synchronous remote stop**: remote kill is safe against premature reaping, but the API does not wait for an explicit stop acknowledgement before returning.
+- **Remote stop API**: `sched_kill_task_sync()` now waits until the target is no longer running on its owning CPU or has already been reaped. The asynchronous `sched_kill_task()` remains available when acknowledgement is unnecessary.
 - **Targeted MM shootdown**: MM lifetime is protected, but context switch still uses broad TLB invalidation and there is no synchronous targeted detach API.
-- **Handle generations**: IPC waiter safety relies on detach-before-slot-reuse, and mutex IDs do not yet include a generation counter for stale-handle detection.
+- **Intrusive waiter lifetime**: IPC và mutex dùng `task->wait_next`, nên một task chỉ được nằm trong một subsystem wait queue tại một thời điểm và vẫn phải detach trước khi task slot được tái sử dụng.
 - **Clone semantics**: `CLONE_VM` without `CLONE_THREAD` is not implemented with Linux-like shared-address-space semantics. Unsupported flag combinations should be rejected explicitly until implemented.
 - **Boot handshake**: Secondary cores are brought up sequentially through one shared `secondary_ready` flag. Use per-CPU acquire/release flags before parallel bring-up or CPU hotplug is introduced.
 

@@ -7,6 +7,7 @@
 - Đã hoàn thành: round-robin preemptive scheduling qua timer IRQ, context switch lưu full GPR/SIMD, reap dead task, idle task.
 - SMP Support: Hỗ trợ đa nhân (4 cores), mỗi core có idle task riêng, đồng bộ qua `sched_lock`. Hỗ trợ IPI để kích hoạt lập lịch lại khi có task được wake up.
 - Mutex Support: Đã implement `struct mutex` với hàng đợi chờ (wait queue) tích hợp scheduler. Task sẽ bị block khi không lấy được khóa và được wake up khi khóa giải phóng.
+- Wait queue abstraction: IPC và mutex dùng chung intrusive FIFO `struct wait_queue` dựa trên `task->wait_next`; subsystem lock bảo vệ queue mutation, còn scheduler park/unpark chỉ chạy sau khi lock đã được nhả.
 - pthread/SMP stability: idle task pinned theo CPU, scheduler chỉ reap DEAD task khi `current_cpu == TASK_NO_CPU`, và idle loops đã bật lại `wfe` sau khi fix IPI/timer lost wakeup.
 - Đã verify: demo task-a, task-b cycling, user-a, user-b chạy/exit sạch, idle giữ boot stack. Mutex đã được verify qua 2 kernel tasks chạy trên các CPU khác nhau. `test_pthread.elf` pass repeated 4-core QEMU stress runs.
 
@@ -22,9 +23,10 @@
 - Idle task cho CPU n có id = n, không alloc stack riêng.
 - User task đang chạy có `current_cpu=<cpu>`; khi switch ra khỏi user task thì scheduler đặt `current_cpu=TASK_NO_CPU`. Dead task chỉ được reap ở đầu `schedule()` khi đã rời CPU để không free kernel stack đang active.
 - IPC và mutex dùng handshake `sched_park_task()`/`sched_unpark_task()` với một-bit wake token. Subsystem luôn nhả lock riêng trước khi gọi scheduler, nên wake xảy ra trước park cũng không bị mất.
+- Một task chỉ được nằm trong một intrusive subsystem wait queue tại một thời điểm. Reaper phải gọi detach của từng subsystem trước khi clear hoặc tái sử dụng task slot.
 - Mọi chuyển đổi task state, `sleep_ticks`, `kill_pending`, `wake_pending` và exit status đều được serialize dưới `sched_lock`.
 - Reaper chỉ detach task khỏi run queue và chuyển sang `TASK_STATE_REAPING` khi giữ `sched_lock`; cleanup IPC, mutex, process, MM và stack diễn ra sau khi nhả khóa.
-- Remote kill đối với task đang RUNNING chỉ đặt `kill_pending` và gửi IPI. CPU đang sở hữu task tự chuyển nó sang DEAD trong `schedule()` trước khi task được reap.
+- Remote kill đối với task đang RUNNING chỉ đặt `kill_pending` và gửi IPI. CPU đang sở hữu task tự chuyển nó sang DEAD trong `schedule()` trước khi task được reap. `sched_kill_task_sync()` đợi đến khi task không còn chạy trên CPU đích hoặc đã được reap.
 - `sched_new_task_kickoff()` chỉ nhả `sched_lock`; không bật IRQ sớm trước khi `fork_child_exit` restore exception frame và `eret`.
 
 ## Giao thức SMP hiện tại
@@ -39,7 +41,7 @@
 
 - `sched_dump_tasks()` vẫn là debug best-effort vì đọc task/process fields không khóa xuyên suốt snapshot.
 - `sched_lock` toàn cục có thể trở thành bottleneck khi tăng số CPU; chưa có per-CPU run queue hay load balancing có affinity.
-- Remote kill đã ngăn reaping khi task còn chạy trên CPU khác, nhưng chưa cung cấp API synchronous kill có acknowledgement cho caller.
+- `sched_kill_task()` vẫn là API bất đồng bộ cho caller không cần chờ. Shell `unload` dùng `sched_kill_task_sync()` để chỉ báo thành công sau khi task đã thực sự dừng.
 
 ## Lệnh verify nhanh
 - make clean all RUN_OS_DEMOS=1
@@ -47,6 +49,7 @@
 - SMP regression wake-before-park:
 	`make clean all SMP_REGRESSION_TESTS=1 RUN_OS_DEMOS=0`
 - Marker thành công: `[stress] wake-before-park PASS`, `[stress] remote-kill PASS`, `[stress] mutex-owner-detach PASS`, `[stress] mutex-waiter-detach PASS` và `[stress] mutex-concurrent-destroy PASS`.
+- Sau migration wait queue, clean build và QEMU 4 CPU đã xác minh toàn bộ suite, gồm mutex destroy race, stale handle, MM shootdown/deferred release và kết thúc bằng `[stress] ALL PASS` với status 0.
 
 ## Pitfall/Debug note
 - Khi task không quay lại đúng PC, kiểm tra save/restore ELR/SPSR.
@@ -65,7 +68,11 @@
 - [x] Tổng hợp sáu regression bằng pass mask có khóa, in `[stress] ALL PASS` và tắt QEMU xác định qua PSCI `SYSTEM_OFF`.
 - [x] Thêm stress test 512 vòng lock/trylock/unlock cạnh tranh với destroy; xác minh destroy luôn bị từ chối khi mutex đang được giữ và thành công sau khi mọi operation kết thúc.
 - [x] Thêm stale mutex handle regression; xác minh generation cũ không thể thao tác trên slot đã được cấp lại.
-- Cân nhắc synchronous remote-stop acknowledgement nếu API kill cần bảo đảm task đã dừng trước khi trả về.
+- [x] Thêm synchronous MM shootdown regression qua SGI 1; xác minh remote TLBI acknowledgement hoàn tất mà không làm detach context đang active.
+- [x] Thêm wait queue abstraction FIFO chung và chuyển IPC/mutex sang sử dụng abstraction này.
+- [x] Xác minh migration wait queue bằng toàn bộ SMP regression suite trên QEMU 4 CPU.
+- [x] Thêm synchronous remote-stop acknowledgement qua `sched_kill_task_sync()` và regression `[stress] remote-stop-ack PASS`.
+- [x] Thêm regression init/orphan lifecycle, semaphore và condition variable; suite QEMU 4 CPU kết thúc với `[stress] init-reap PASS`, `[stress] semaphore PASS`, `[stress] condvar PASS` và `[stress] ALL PASS`.
 - Sau đó mới thêm priority, deadline, per-CPU run queue và load balancing.
 
 ---

@@ -8,7 +8,7 @@
 
 ## Trạng thái hiện tại
 - **Đã hoàn thành**:
-    - Kernel mutex với hàng đợi chờ (wait-queue) dựa trên `task->wait_next`.
+    - Kernel mutex dùng `struct wait_queue` FIFO chung, triển khai intrusive qua `task->wait_next`.
     - Hỗ trợ SMP-safe thông qua spinlock nội bộ và IRQ disabling.
     - **Mutex Pool**: Quản lý tập trung 64 mutex bằng ID, cho phép các process chia sẻ cùng một tài nguyên khóa.
     - **Syscall interface**: 
@@ -24,6 +24,8 @@
 ## File chính
 - [src/include/kernel/mutex.h](src/include/kernel/mutex.h): Định nghĩa `struct mutex`.
 - [src/kernel/mutex.c](src/kernel/mutex.c): Thực thi logic lock/unlock, pool management.
+- [src/include/kernel/wait_queue.h](src/include/kernel/wait_queue.h): API hàng đợi chờ FIFO dùng chung.
+- [src/kernel/wait_queue.c](src/kernel/wait_queue.c): Enqueue, dequeue, contains và detach waiter.
 - [src/kernel/syscall.c](src/kernel/syscall.c): Dispatcher cho các syscall synchronization.
 - [user/include/pthread.h](user/include/pthread.h): Cung cấp API POSIX-like cho EL0.
 
@@ -35,6 +37,7 @@
 - Wake xảy ra trước park được giữ lại bằng `wake_pending`, do đó ownership handoff không làm mất wakeup.
 - `mutex_detach_task()` xóa task chết khỏi wait queue; nếu task là owner, ownership được chuyển cho waiter kế tiếp hoặc mutex được mở khóa.
 - Mỗi thao tác trên mutex pool phải pin slot bằng `active_ops`. Slot có `destroying` không nhận operation mới và chỉ được tái sử dụng khi unlocked, không owner, không waiter và không operation đang hoạt động.
+- Wait queue không có lock nội bộ; mọi thao tác trên `mutex->waiters` phải diễn ra khi giữ `mutex->lock`, còn park/unpark chỉ được gọi sau khi nhả lock.
 
 ## SMP hardening đã hoàn thành
 
@@ -49,6 +52,7 @@
 - Trước khi cho owner unlock, regression gọi `mutex_pool_free()` đồng thời và xác minh destroy bị từ chối khi mutex còn locked/có owner. Marker: `[stress] mutex-concurrent-destroy PASS`.
 - Regression nhiều vòng tái sử dụng hai task hiện có để chạy 512 vòng lock, concurrent destroy rejection, unlock và trylock/unlock. Sau khi worker kết thúc, pool slot phải destroy thành công. Marker: `[stress] mutex-destroy-race PASS`.
 - Mutex pool handle giờ mã hóa cả slot index và generation. Khi một slot được free rồi cấp lại, handle cũ bị từ chối bởi lock, trylock, unlock và free, trong khi handle generation mới vẫn hoạt động bình thường. Marker: `[stress] mutex-stale-handle PASS`.
+- Mutex và IPC đã được chuyển sang wait queue abstraction chung. Clean build và toàn bộ SMP regression trên QEMU 4 CPU vẫn kết thúc với `[stress] ALL PASS` và status 0.
 
 ## Lệnh verify nhanh
 - Build và chạy QEMU:
@@ -67,7 +71,7 @@
 - [x] Xác minh destroy bị từ chối khi mutex còn locked/có owner.
 - [x] Thêm stress test 512 vòng cho destroy cạnh tranh với lock/trylock/unlock.
 - [x] Thêm generation-tagged handle và regression ngăn stale handle truy cập mutex mới tái sử dụng cùng pool slot.
-- [ ] Cân nhắc generation counter cho mutex ID để phát hiện stale handle sau khi slot được tái sử dụng.
-- [ ] Hỗ trợ **Condition Variables** (`pthread_cond_t`) để hoàn thiện bộ công cụ POSIX sync.
+- [x] Thêm generation counter cho mutex handle để phát hiện stale handle sau khi slot được tái sử dụng.
+- [x] Hỗ trợ semaphore và **Condition Variables** (`pthread_cond_t`), gồm syscall, user API, generation-tagged handles và regression runtime. Markers: `[stress] semaphore PASS`, `[stress] condvar PASS`.
 - [ ] Cải thiện bộ cấp phát Mutex Pool (dynamic allocation thay vì static array nếu có nhu cầu).
 - [ ] Hỗ trợ Priority Inheritance nếu hệ thống gặp vấn đề Priority Inversion nghiêm trọng.
