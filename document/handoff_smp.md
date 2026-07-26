@@ -44,6 +44,8 @@ The following SMP fixes are available on branch `fix/mmu-page-allocator-smp`:
 
 The combined changes passed a clean build and a 4-core QEMU pthread run. CPUs 1-3 came online, kernel initialization completed, all pthread tasks exited with code 0, and the test printed `Complex Test Finished.`. No panic, abort, invalid free, double free, allocator corruption, or deadlock marker appeared in that validation run.
 
+The opt-in SMP regression build now aggregates all six deterministic checks under a spinlock-protected pass mask. After every check succeeds it prints `[stress] ALL PASS` and calls PSCI `SYSTEM_OFF`, allowing QEMU to terminate normally with status 0 instead of depending on an external timeout.
+
 ### Scheduler, IPC, mutex, and MM lifetime hardening
 
 - Scheduler wait/wake now uses `sched_park_task()` and `sched_unpark_task()` with a pending-wake token, preventing wake-before-park notifications from being lost.

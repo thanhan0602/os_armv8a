@@ -3,7 +3,41 @@
 #include <kernel/mutex.h>
 #include <kernel/sched.h>
 #include <kernel/smp_regression.h>
+#include <kernel/spinlock.h>
 #include <arch/arm/cpu.h>
+#include <arch/arm/psci.h>
+
+#define SMP_PASS_WAKE_BEFORE_PARK       (1U << 0)
+#define SMP_PASS_REMOTE_KILL            (1U << 1)
+#define SMP_PASS_MUTEX_OWNER_DETACH     (1U << 2)
+#define SMP_PASS_MUTEX_WAITER_DETACH    (1U << 3)
+#define SMP_PASS_MUTEX_DESTROY_REJECT   (1U << 4)
+#define SMP_PASS_MM_DEFERRED_RELEASE    (1U << 5)
+#define SMP_PASS_ALL                    ((1U << 6) - 1U)
+
+static volatile unsigned int smp_regression_pass_mask;
+static struct spinlock smp_regression_pass_lock = SPINLOCK_INITIALIZER;
+
+static void smp_regression_mark_pass(unsigned int bit)
+{
+    unsigned long flags;
+
+    flags = spin_lock_irqsave(&smp_regression_pass_lock);
+    smp_regression_pass_mask |= bit;
+    spin_unlock_irqrestore(&smp_regression_pass_lock, flags);
+    __asm__ volatile("sev" ::: "memory");
+}
+
+static unsigned int smp_regression_passes(void)
+{
+    unsigned long flags;
+    unsigned int mask;
+
+    flags = spin_lock_irqsave(&smp_regression_pass_lock);
+    mask = smp_regression_pass_mask;
+    spin_unlock_irqrestore(&smp_regression_pass_lock, flags);
+    return mask;
+}
 
 static volatile struct task *wake_before_park_waiter;
 static volatile unsigned int wake_before_park_done;
@@ -99,6 +133,14 @@ static void mm_lifetime_run_controller(void)
     for (attempts = 0UL; attempts < 100000UL; attempts++) {
         if (mmu_context_test_release_count() == baseline + 1UL) {
             KER_INFO("[stress] mm-deferred-release PASS");
+            smp_regression_mark_pass(SMP_PASS_MM_DEFERRED_RELEASE);
+
+            while (smp_regression_passes() != SMP_PASS_ALL) {
+                schedule();
+            }
+
+            KER_INFO("[stress] ALL PASS");
+            psci_system_off();
             return;
         }
         schedule();
@@ -126,6 +168,7 @@ static void wake_before_park_consumer(void)
 
     if (sched_park_task(current) == 0) {
         KER_INFO("[stress] wake-before-park PASS");
+        smp_regression_mark_pass(SMP_PASS_WAKE_BEFORE_PARK);
     } else {
         KER_INFO("[stress] wake-before-park FAIL: pending wake was lost");
         schedule();
@@ -217,6 +260,7 @@ static void remote_kill_controller(void)
         if (!sched_task_snapshot(target_id, &state, &target_cpu,
                                  &kill_pending)) {
             KER_INFO("[stress] remote-kill PASS");
+            smp_regression_mark_pass(SMP_PASS_REMOTE_KILL);
             mm_lifetime_run_controller();
             task_exit();
         }
@@ -310,6 +354,7 @@ static void mutex_detach_controller(void)
     for (attempts = 0UL; attempts < 100000UL; attempts++) {
         if (mutex_pool_free(mutex_detach_id)) {
             KER_INFO("[stress] mutex-owner-detach PASS");
+            smp_regression_mark_pass(SMP_PASS_MUTEX_OWNER_DETACH);
             task_exit();
         }
         schedule();
@@ -400,6 +445,7 @@ static void mutex_waiter_kill_controller(void)
         task_exit();
     }
     KER_INFO("[stress] mutex-concurrent-destroy PASS");
+    smp_regression_mark_pass(SMP_PASS_MUTEX_DESTROY_REJECT);
 
     waiter_kill_release_owner = 1U;
     __asm__ volatile("dmb ish; sev" ::: "memory");
@@ -414,6 +460,7 @@ static void mutex_waiter_kill_controller(void)
     if (waiter_kill_owner_done != 0U &&
         mutex_pool_free(mutex_waiter_kill_id)) {
         KER_INFO("[stress] mutex-waiter-detach PASS");
+        smp_regression_mark_pass(SMP_PASS_MUTEX_WAITER_DETACH);
     } else {
         KER_INFO("[stress] mutex-waiter-detach FAIL: slot stayed busy");
     }
@@ -422,6 +469,7 @@ static void mutex_waiter_kill_controller(void)
 
 void smp_regression_start(void)
 {
+    smp_regression_pass_mask = 0U;
     wake_before_park_waiter = (struct task *)0;
     wake_before_park_done = 0U;
     remote_kill_target_id = 0UL;
