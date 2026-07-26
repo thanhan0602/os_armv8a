@@ -15,6 +15,7 @@
 #include <kernel/sched.h>
 #include <kernel/shell.h>
 #include <kernel/spinlock.h>
+#include <kernel/smp_regression.h>
 #include <kernel/timer.h>
 #include <kernel/vm.h>
 #include <kernel/mutex.h>
@@ -240,6 +241,9 @@ void kernel_main(void)
 
 #ifdef CONFIG_KERNEL_VIRTUAL
     kernel_start_user_services();
+#endif
+#ifdef CONFIG_SMP_REGRESSION_TESTS
+    smp_regression_start();
 #endif
     KER_INFO("kernel init complete");
     driver_system_dump();

@@ -44,6 +44,9 @@
 ## Lệnh verify nhanh
 - make clean all RUN_OS_DEMOS=1
 - Mutex test: xem `src/kernel/mutex_test.c` (được verify trên QEMU thành công).
+- SMP regression wake-before-park:
+	`make clean all SMP_REGRESSION_TESTS=1 RUN_OS_DEMOS=0`
+- Marker thành công: `[stress] wake-before-park PASS`.
 
 ## Pitfall/Debug note
 - Khi task không quay lại đúng PC, kiểm tra save/restore ELR/SPSR.
@@ -52,7 +55,8 @@
 - Với GICv2 SGI, `IAR` chứa source CPU ở bits [12:10]. Chỉ dùng `iar & 0x3ff` để dispatch intid, nhưng phải ghi full `iar` vào EOIR; nếu không timer IRQ có thể bị chặn sau IPI.
 
 ## Next steps
-- Thêm stress test riêng cho kill/reap, wake-before-park và waiter detach.
+- [x] Thêm regression test xác định cho wake-before-park.
+- [ ] Thêm stress test riêng cho remote kill/reap và waiter detach.
 - Cân nhắc synchronous remote-stop acknowledgement nếu API kill cần bảo đảm task đã dừng trước khi trả về.
 - Sau đó mới thêm priority, deadline, per-CPU run queue và load balancing.
 
