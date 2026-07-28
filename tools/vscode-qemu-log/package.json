@@ -36,7 +36,7 @@
       "properties": {
         "qemuLog.qemuBinary": {
           "type": "string",
-          "default": "/home/a/qemu/build/qemu-system-aarch64",
+          "default": "qemu-system-aarch64",
           "description": "Absolute path to QEMU binary"
         },
         "qemuLog.kernelImage": {
@@ -77,7 +77,7 @@
         },
         "qemuInspector.qemuBinary": {
           "type": "string",
-          "default": "/home/a/qemu/build/qemu-system-aarch64",
+          "default": "qemu-system-aarch64",
           "description": "Absolute path to QEMU binary used by the page inspector"
         },
         "qemuInspector.kernelImage": {

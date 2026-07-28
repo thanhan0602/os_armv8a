@@ -108,7 +108,7 @@ class QemuInspectorPanel {
         }
 
         const config = this.getConfig();
-        const qemuBinary = config.get("qemuBinary", "/home/a/qemu/build/qemu-system-aarch64");
+        const qemuBinary = config.get("qemuBinary", "qemu-system-aarch64");
         const kernelImage = this.resolveVars(config.get("kernelImage", "${workspaceFolder}/build/kernel8.img"));
         const monitorHost = config.get("monitorHost", "127.0.0.1");
         const monitorPort = config.get("monitorPort", 4444);

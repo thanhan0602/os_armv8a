@@ -490,7 +490,7 @@ Tac dung:
 ### 4. Chay QEMU voi MMU va exception trace
 
 ```text
-/home/a/qemu/build/qemu-system-aarch64 \
+qemu-system-aarch64 \
    -machine virt,gic-version=2 \
    -cpu max \
    -nographic \

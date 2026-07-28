@@ -141,5 +141,5 @@ make clean
 
 ## Ghi chú
 
-- Makefile hiện mặc định dùng `QEMU_BIN=/home/a/qemu/build/qemu-system-aarch64` nếu không override.
+- Makefile hiện mặc định dùng `QEMU_BIN=qemu-system-aarch64` nếu không override.
 - Thư mục `build/` là output build và không nên commit.

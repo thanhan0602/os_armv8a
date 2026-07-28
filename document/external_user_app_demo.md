@@ -23,7 +23,7 @@ Khởi động QEMU bằng script mặc định:
 
 ```bash
 cd /home/a/Learn/os_armv8a
-QEMU_BIN=/home/a/qemu/build/qemu-system-aarch64 bash scripts/run_qemu.sh
+QEMU_BIN=qemu-system-aarch64 bash scripts/run_qemu.sh
 ```
 
 Ở shell `os>` của kernel, nhập:

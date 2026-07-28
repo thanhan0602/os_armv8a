@@ -92,7 +92,7 @@ class QemuLogPanel {
     _startQemu() {
         const cfg = vscode.workspace.getConfiguration("qemuLog");
 
-        const bin    = cfg.get("qemuBinary", "/home/a/qemu/build/qemu-system-aarch64");
+        const bin    = cfg.get("qemuBinary", "qemu-system-aarch64");
         const kernel = this._resolveVars(
             cfg.get("kernelImage", "${workspaceFolder}/build/kernel8.img"),
         );
