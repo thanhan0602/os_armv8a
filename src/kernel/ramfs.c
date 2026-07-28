@@ -3,7 +3,7 @@
 #include <kernel/log.h>
 #include <kernel/vm.h>
 
-#define RAMFS_FILES_MAX  16UL
+#define RAMFS_FILES_MAX  32UL
 #define RAMFS_PATH_MAX   64UL
 
 struct ramfs_node {
