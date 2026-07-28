@@ -38,11 +38,12 @@ struct task_context {
 #define TASK_STATE_REAPING  5UL
 
 #define TASK_NO_CPU         0xffffffffU
+#define SCHED_MAX_CPUS      4U
 
 #define TASK_GUARD_PAGES    1UL
 #define TASK_STACK_PAGES    4UL
 #define TASK_TOTAL_PAGES    (TASK_GUARD_PAGES + TASK_STACK_PAGES)
-#define MAX_TASKS           16UL
+#define MAX_TASKS           32UL
 #define MAX_FILES_PER_TASK  16UL
 
 struct task {
@@ -55,12 +56,16 @@ struct task {
     unsigned int kill_pending;
     unsigned int wake_pending;
     unsigned int current_cpu;
+    unsigned int rq_cpu;
+    unsigned int on_rq;
+    unsigned int preempt_count;
     const char *name;
     struct mm_context *mm;
     struct process *process;
     unsigned long parent_id;
     int exit_status;
     struct task *next;
+    struct task *rq_next;
     struct task *wait_next;
     struct file *files[MAX_FILES_PER_TASK];
 };
@@ -68,7 +73,6 @@ struct task {
 void sched_init(void);
 struct task *task_create(task_fn_t entry, const char *name);
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 /*
  * Create a task that enters EL0 on first run.
  * process  : process descriptor owning the mm_context and user VA layout.
@@ -76,9 +80,14 @@ struct task *task_create(task_fn_t entry, const char *name);
  */
 struct task *task_create_user(struct process *process,
                                const char *name);
-#endif
 
 void schedule(void);
+void sched_request_reschedule(unsigned int cpu_id);
+void sched_preempt_disable(void);
+void sched_preempt_enable(void);
+int sched_preemptible(void);
+void sched_irq_enter(void);
+void sched_irq_exit(void);
 void sched_tick(void);
 void sched_new_task_kickoff(void);
 void task_exit(void);
@@ -94,6 +103,9 @@ int sched_register_init_task(struct task *task);
 int sched_adopt_task(struct task *task);
 #ifdef CONFIG_SMP_REGRESSION_TESTS
 int sched_test_set_parent(struct task *task, unsigned long parent_id);
+int sched_test_cpu_snapshot(unsigned int cpu_id,
+                            unsigned int *nr_running,
+                            unsigned long *switches);
 #endif
 void sched_dump_tasks(void);
 int sched_kill_task(unsigned long task_id);
@@ -106,9 +118,7 @@ int sched_task_snapshot(unsigned long task_id,
 extern void switch_context(struct task_context *old_ctx,
                            struct task_context *new_ctx);
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 extern void el0_entry_trampoline(void);
 extern void fork_child_exit(void);
-#endif
 
 #endif

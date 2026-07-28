@@ -393,12 +393,12 @@ static void shell_cmd_unload(unsigned int argc, char *argv[])
         return;
     }
 
-    if (!sched_kill_task(task_id)) {
+    if (!sched_kill_task_sync(task_id)) {
         KER_LOGF("[shell] unload failed: %lu\n", task_id);
         return;
     }
 
-    KER_LOGF("[shell] task %lu marked dead\n", task_id);
+    KER_LOGF("[shell] task %lu stopped\n", task_id);
 }
 
 static void shell_cmd_receive(unsigned int argc, char *argv[])

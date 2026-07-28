@@ -47,8 +47,10 @@ int timer_handle_irq(unsigned int intid)
 
     if (arch_get_cpu_id() == 0) {
         timer_ticks++;
-        sched_tick();
     }
+
+    /* Every CPU needs a local scheduler tick for per-CPU preemption. */
+    sched_tick();
 
     timer_program_next_tick();
 

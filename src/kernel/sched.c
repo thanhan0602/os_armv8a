@@ -19,10 +19,188 @@ extern void task_entry_trampoline(void);
 struct task tasks[MAX_TASKS];
 static unsigned long next_task_id;
 static struct spinlock sched_lock = SPINLOCK_INITIALIZER;
-static unsigned long switch_count;
+static unsigned long switch_count[SCHED_MAX_CPUS];
 static unsigned long init_task_id;
+static unsigned int task_slot_exhaustion_reported;
+static unsigned int next_enqueue_cpu;
+
+struct sched_run_queue {
+    struct task *head;
+    struct task *tail;
+    unsigned int nr_running;
+    unsigned int need_resched;
+    unsigned int irq_depth;
+};
+
+static struct sched_run_queue run_queues[SCHED_MAX_CPUS];
 
 #define SCHED_NO_PARENT (~0UL)
+
+static void sched_rq_init(struct sched_run_queue *rq)
+{
+    rq->head = (struct task *)0;
+    rq->tail = (struct task *)0;
+    rq->nr_running = 0U;
+    rq->need_resched = 0U;
+    rq->irq_depth = 0U;
+}
+
+static void sched_rq_enqueue_locked(struct task *task, unsigned int cpu)
+{
+    struct sched_run_queue *rq;
+
+    if (task == (struct task *)0 || task->id < SCHED_MAX_CPUS ||
+        task->on_rq != 0U || cpu >= SCHED_MAX_CPUS) {
+        return;
+    }
+
+    rq = &run_queues[cpu];
+    task->rq_cpu = cpu;
+    task->rq_next = (struct task *)0;
+    task->on_rq = 1U;
+    if (rq->tail == (struct task *)0) {
+        rq->head = task;
+        rq->tail = task;
+    } else {
+        rq->tail->rq_next = task;
+        rq->tail = task;
+    }
+    rq->nr_running++;
+}
+
+static struct task *sched_rq_dequeue_locked(unsigned int cpu)
+{
+    struct sched_run_queue *rq = &run_queues[cpu];
+    struct task *task = rq->head;
+
+    if (task == (struct task *)0) {
+        return (struct task *)0;
+    }
+
+    rq->head = task->rq_next;
+    if (rq->head == (struct task *)0) {
+        rq->tail = (struct task *)0;
+    }
+    task->rq_next = (struct task *)0;
+    task->on_rq = 0U;
+    if (rq->nr_running > 0U) {
+        rq->nr_running--;
+    }
+    return task;
+}
+
+static int sched_rq_remove_locked(struct task *task)
+{
+    struct sched_run_queue *rq;
+    struct task *previous = (struct task *)0;
+    struct task *current;
+
+    if (task == (struct task *)0 || task->on_rq == 0U ||
+        task->rq_cpu >= SCHED_MAX_CPUS) {
+        return 0;
+    }
+
+    rq = &run_queues[task->rq_cpu];
+    current = rq->head;
+    while (current != (struct task *)0) {
+        if (current == task) {
+            if (previous == (struct task *)0) {
+                rq->head = current->rq_next;
+            } else {
+                previous->rq_next = current->rq_next;
+            }
+            if (rq->tail == current) {
+                rq->tail = previous;
+            }
+            current->rq_next = (struct task *)0;
+            current->on_rq = 0U;
+            if (rq->nr_running > 0U) {
+                rq->nr_running--;
+            }
+            return 1;
+        }
+        previous = current;
+        current = current->rq_next;
+    }
+
+    task->on_rq = 0U;
+    task->rq_next = (struct task *)0;
+    return 0;
+}
+
+static unsigned int sched_least_loaded_cpu_locked(void)
+{
+    unsigned int best = next_enqueue_cpu;
+    unsigned int best_load = run_queues[best].nr_running;
+
+    /*
+     * Start each search at a rotating CPU. A queue length alone does not
+     * include the task currently running on that CPU, so several rapid task
+     * creations can otherwise all choose CPU 0 after it dequeues each task.
+     * Rotating equal-load choices preserves least-loaded placement while
+     * distributing bursts across all CPUs.
+     */
+    for (unsigned int offset = 1U; offset < SCHED_MAX_CPUS; offset++) {
+        unsigned int cpu = (next_enqueue_cpu + offset) % SCHED_MAX_CPUS;
+        unsigned int load = run_queues[cpu].nr_running;
+
+        if (load < best_load) {
+            best = cpu;
+            best_load = load;
+        }
+    }
+
+    next_enqueue_cpu = (best + 1U) % SCHED_MAX_CPUS;
+    return best;
+}
+
+static struct task *sched_pick_next_locked(unsigned int cpu)
+{
+    struct task *task;
+    unsigned int busiest = cpu;
+
+    /* Prefer work already assigned to this CPU. Discard stale queue entries. */
+    do {
+        task = sched_rq_dequeue_locked(cpu);
+    } while (task != (struct task *)0 && task->state != TASK_STATE_READY);
+
+    if (task != (struct task *)0) {
+        return task;
+    }
+
+    /* Idle CPUs steal one runnable task from the busiest remote queue. */
+    for (unsigned int other = 0U; other < SCHED_MAX_CPUS; other++) {
+        if (run_queues[other].nr_running > run_queues[busiest].nr_running) {
+            busiest = other;
+        }
+    }
+
+    if (busiest == cpu || run_queues[busiest].nr_running == 0U) {
+        return (struct task *)0;
+    }
+
+    do {
+        task = sched_rq_dequeue_locked(busiest);
+    } while (task != (struct task *)0 && task->state != TASK_STATE_READY);
+
+    if (task != (struct task *)0) {
+        task->rq_cpu = cpu;
+    }
+    return task;
+}
+
+static void sched_make_ready_locked(struct task *task)
+{
+    unsigned int cpu;
+
+    if (task == (struct task *)0 || task->id < SCHED_MAX_CPUS) {
+        return;
+    }
+    task->state = TASK_STATE_READY;
+    cpu = sched_least_loaded_cpu_locked();
+    sched_rq_enqueue_locked(task, cpu);
+    run_queues[cpu].need_resched = 1U;
+}
 
 static const char *sched_state_name(unsigned long state)
 {
@@ -74,8 +252,14 @@ void sched_init(void)
     struct task *idle;
 
     next_task_id = 0;
-    switch_count = 0;
     init_task_id = SCHED_NO_PARENT;
+    task_slot_exhaustion_reported = 0U;
+    next_enqueue_cpu = 0U;
+
+    for (unsigned int cpu = 0U; cpu < SCHED_MAX_CPUS; cpu++) {
+        sched_rq_init(&run_queues[cpu]);
+        switch_count[cpu] = 0UL;
+    }
     
     /* Zero out all tasks */
     for (unsigned long i = 0; i < MAX_TASKS; i++) {
@@ -90,6 +274,9 @@ void sched_init(void)
         idle->id = next_task_id++;
         idle->state = TASK_STATE_RUNNING;
         idle->current_cpu = i;
+        idle->rq_cpu = i;
+        idle->on_rq = 0U;
+        idle->preempt_count = 0U;
         idle->stack_base = (void *)0;
         idle->stack_size = 0;
         
@@ -116,15 +303,21 @@ struct task *task_create(task_fn_t entry, const char *name)
     void *stack_pa;
     unsigned char *stack_va;
     unsigned long sp;
+    unsigned int target_cpu;
+    unsigned int current_cpu;
 
     unsigned long flags = spin_lock_irqsave(&sched_lock);
 
     t = sched_allocate_task_slot();
     if (t == (struct task *)0) {
         spin_unlock_irqrestore(&sched_lock, flags);
-        KER_INFO("task_create: max tasks reached");
+        if (task_slot_exhaustion_reported == 0U) {
+            task_slot_exhaustion_reported = 1U;
+            KER_INFO("task_create: max tasks reached (suppressing repeats)");
+        }
         return (struct task *)0;
     }
+    task_slot_exhaustion_reported = 0U;
 
     /*
      * Allocate guard page + usable stack contiguously.
@@ -144,11 +337,21 @@ struct task *task_create(task_fn_t entry, const char *name)
 
     t->id = next_task_id;
     t->current_cpu = TASK_NO_CPU;
+    t->rq_cpu = TASK_NO_CPU;
+    t->on_rq = 0U;
+    t->preempt_count = 0U;
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
     t->mm = (struct mm_context *)0;
     t->process = (struct process *)0;
+    /*
+     * Kernel tasks are parentless unless a caller explicitly assigns a
+     * parent. Leaving this field zero accidentally makes idle0 their parent,
+     * so exited stress tasks remain uncollectable ZOMBIEs and eventually
+     * exhaust MAX_TASKS.
+     */
+    t->parent_id = SCHED_NO_PARENT;
 
     /* Initial callee-saved context: x19=entry, x30=trampoline, SP=top */
     t->context.x19 = (unsigned long)entry;
@@ -170,15 +373,27 @@ struct task *task_create(task_fn_t entry, const char *name)
     t->next = curr->next;
     curr->next = t;
 
-    t->state = TASK_STATE_READY;
+    sched_make_ready_locked(t);
+    target_cpu = t->rq_cpu;
     next_task_id++;
 
     spin_unlock_irqrestore(&sched_lock, flags);
 
+    /*
+     * A newly queued task may have been assigned to a remote CPU that is
+     * sleeping in WFE. The full regression suite generated enough unrelated
+     * interrupts to hide this omission, while the focused scheduler test
+     * exposed it. Kick the selected CPU after dropping sched_lock so it can
+     * immediately observe its non-empty local run queue.
+     */
+    current_cpu = arch_get_cpu_id();
+    if (target_cpu < SCHED_MAX_CPUS && target_cpu != current_cpu) {
+        gicv2_send_ipi(1U << target_cpu, 0U);
+    }
+
     return t;
 }
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 struct task *task_create_user(struct process *process,
                                const char *name)
 {
@@ -214,11 +429,16 @@ struct task *task_create_user(struct process *process,
 
     t->id = next_task_id;
     t->current_cpu = TASK_NO_CPU;
+    t->rq_cpu = TASK_NO_CPU;
+    t->on_rq = 0U;
+    t->preempt_count = 0U;
     t->stack_base = stack_va;
     t->stack_size = TASK_TOTAL_PAGES * PAGE_SIZE;
     t->name = name;
     t->mm = process->mm;
     t->process = process;
+    /* Boot services and cloned tasks assign their parent explicitly. */
+    t->parent_id = SCHED_NO_PARENT;
 
     for (int i = 0; i < MAX_FILES_PER_TASK; i++) {
         t->files[i] = (struct file *)0;
@@ -252,7 +472,6 @@ struct task *task_create_user(struct process *process,
 
     return t;
 }
-#endif /* CONFIG_KERNEL_VIRTUAL */
 
 /*
  * Reclaim resources from dead tasks.  Called at the start of schedule()
@@ -266,9 +485,7 @@ static void sched_reap_dead(void)
         struct task *prev;
         struct task *t;
         void *stack_base;
-#ifdef CONFIG_KERNEL_VIRTUAL
         struct process *process;
-#endif
         unsigned long flags = spin_lock_irqsave(&sched_lock);
 
         /*
@@ -282,6 +499,13 @@ static void sched_reap_dead(void)
         while (t != &tasks[0]) {
             if (t->state == TASK_STATE_DEAD &&
                 t->current_cpu == TASK_NO_CPU) {
+                /*
+                 * A task can become DEAD while it is still queued, for
+                 * example when a blocked or READY task is killed remotely.
+                 * Remove it before clearing and reusing the task slot so no
+                 * per-CPU run queue retains a stale pointer to the victim.
+                 */
+                (void)sched_rq_remove_locked(t);
                 prev->next = t->next;
                 t->state = TASK_STATE_REAPING;
                 victim = t;
@@ -298,11 +522,9 @@ static void sched_reap_dead(void)
 
         stack_base = victim->stack_base;
         victim->stack_base = (void *)0;
-#ifdef CONFIG_KERNEL_VIRTUAL
         process = victim->process;
         victim->process = (struct process *)0;
         victim->mm = (struct mm_context *)0;
-#endif
         spin_unlock_irqrestore(&sched_lock, flags);
 
         ipc_detach_task(victim);
@@ -315,11 +537,9 @@ static void sched_reap_dead(void)
                                  TASK_TOTAL_PAGES);
         }
 
-#ifdef CONFIG_KERNEL_VIRTUAL
         if (process != (struct process *)0) {
             process_destroy(process);
         }
-#endif
 
         flags = spin_lock_irqsave(&sched_lock);
         sched_clear_task(victim);
@@ -332,33 +552,108 @@ void sched_new_task_kickoff(void)
     spin_unlock(&sched_lock);
 }
 
+void sched_request_reschedule(unsigned int cpu_id)
+{
+    unsigned long flags;
+
+    if (cpu_id >= SCHED_MAX_CPUS) {
+        return;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    run_queues[cpu_id].need_resched = 1U;
+    spin_unlock_irqrestore(&sched_lock, flags);
+}
+
+void sched_preempt_disable(void)
+{
+    struct task *task = sched_current();
+
+    if (task != (struct task *)0) {
+        task->preempt_count++;
+    }
+}
+
+void sched_preempt_enable(void)
+{
+    struct task *task = sched_current();
+
+    if (task != (struct task *)0 && task->preempt_count != 0U) {
+        task->preempt_count--;
+    }
+}
+
+int sched_preemptible(void)
+{
+    struct task *task = sched_current();
+    unsigned int cpu = arch_get_cpu_id();
+
+    return task != (struct task *)0 && task->preempt_count == 0U &&
+           cpu < SCHED_MAX_CPUS && run_queues[cpu].irq_depth == 0U;
+}
+
+void sched_irq_enter(void)
+{
+    unsigned int cpu = arch_get_cpu_id();
+
+    if (cpu < SCHED_MAX_CPUS) {
+        run_queues[cpu].irq_depth++;
+    }
+}
+
+void sched_irq_exit(void)
+{
+    struct task *task = sched_current();
+    unsigned int cpu = arch_get_cpu_id();
+    unsigned int depth;
+
+    if (cpu >= SCHED_MAX_CPUS) {
+        return;
+    }
+
+    if (run_queues[cpu].irq_depth == 0U) {
+        return;
+    }
+    run_queues[cpu].irq_depth--;
+    depth = run_queues[cpu].irq_depth;
+    if (depth == 0U && run_queues[cpu].need_resched != 0U &&
+        task != (struct task *)0 && task->preempt_count == 0U) {
+        schedule();
+    }
+}
+
 void sched_tick(void)
 {
     unsigned long flags = spin_lock_irqsave(&sched_lock);
-    int woken = 0;
+    unsigned int target_mask = 0U;
+    unsigned int current_cpu = arch_get_cpu_id();
 
-    for (unsigned long i = 0; i < MAX_TASKS; i++) {
-        struct task *t = &tasks[i];
-        if (t->name && t->state == TASK_STATE_BLOCKED && t->sleep_ticks > 0) {
-            t->sleep_ticks--;
-            if (t->sleep_ticks == 0) {
-                t->state = TASK_STATE_READY;
-                woken = 1;
+    /* CPU 0 owns the global sleep clock so ticks are not decremented once
+     * per core. Every CPU still marks its own run queue for preemption. */
+    if (current_cpu == 0U) {
+        for (unsigned long i = 0; i < MAX_TASKS; i++) {
+            struct task *t = &tasks[i];
+            if (t->name && t->state == TASK_STATE_BLOCKED &&
+                t->sleep_ticks > 0) {
+                t->sleep_ticks--;
+                if (t->sleep_ticks == 0) {
+                    sched_make_ready_locked(t);
+                    if (t->rq_cpu < SCHED_MAX_CPUS &&
+                        t->rq_cpu != current_cpu) {
+                        target_mask |= 1U << t->rq_cpu;
+                    }
+                }
             }
         }
     }
 
+    if (current_cpu < SCHED_MAX_CPUS) {
+        run_queues[current_cpu].need_resched = 1U;
+    }
+
     spin_unlock_irqrestore(&sched_lock, flags);
 
-    if (woken) {
-        /* Send IPI to other cores to inform them a new task is READY */
-        unsigned int current_cpu = arch_get_cpu_id();
-        unsigned int target_mask = 0;
-        for (unsigned int i = 0; i < 4; i++) {
-            if (i != current_cpu) {
-                target_mask |= (1 << (unsigned char)i);
-            }
-        }
+    if (target_mask != 0U) {
         gicv2_send_ipi(target_mask, 0);
     }
 }
@@ -374,6 +669,11 @@ void schedule(void)
 
     unsigned long flags = spin_lock_irqsave(&sched_lock);
 
+    if (cpu_id >= SCHED_MAX_CPUS) {
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return;
+    }
+
     prev = arch_get_current_task();
 
     /*
@@ -385,53 +685,30 @@ void schedule(void)
         prev->kill_pending = 0U;
         prev->state = TASK_STATE_DEAD;
     }
-    next = prev->next;
 
-    /* Round-robin: find next ready task */
-    while (next != prev) {
-        if (next->state == TASK_STATE_READY) {
-            /* 
-             * Task 0-3 are idle tasks for CPU 0-3.
-             * Only allow a CPU to pick its own idle task.
-             */
-            if (next->id < 4) {
-                if (next->id == cpu_id) {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        next = next->next;
-    }
+    run_queues[cpu_id].need_resched = 0U;
 
-    /* 
-     * If we didn't search and find a DIFFERENT ready task:
-     * Check if the current task can keep running or if we must switch to idle.
-     */
-    if (next == prev) {
-        /* If current is READY/RUNNING and is not a pinned idle task of another CPU, just keep it. */
-        if (prev->state == TASK_STATE_RUNNING || prev->state == TASK_STATE_READY) {
-            if (prev->id >= 4 || prev->id == cpu_id) {
-                spin_unlock_irqrestore(&sched_lock, flags);
-                return;
-            }
+    /* A runnable outgoing task returns to its local queue for round-robin. */
+    if (prev->id >= SCHED_MAX_CPUS) {
+        if (prev->state == TASK_STATE_RUNNING) {
+            prev->state = TASK_STATE_READY;
+            sched_rq_enqueue_locked(prev, cpu_id);
         }
-        
-        /* Current task blocked or belongs to another CPU. Switch to our idle task. */
-        next = &tasks[cpu_id];
-        if (next == prev) {
-            spin_unlock_irqrestore(&sched_lock, flags);
-            return;
-        }
-    }
-
-    if (prev->state == TASK_STATE_RUNNING) {
-        prev->state = TASK_STATE_READY;
-    }
-    if (prev->id >= 4UL) {
         prev->current_cpu = TASK_NO_CPU;
     }
+
+    next = sched_pick_next_locked(cpu_id);
+    if (next == (struct task *)0) {
+        next = &tasks[cpu_id];
+    }
+
+    if (next == prev) {
+        prev->state = TASK_STATE_RUNNING;
+        prev->current_cpu = cpu_id;
+        spin_unlock_irqrestore(&sched_lock, flags);
+        return;
+    }
+
     next->state = TASK_STATE_RUNNING;
     next->current_cpu = cpu_id;
     
@@ -440,11 +717,9 @@ void schedule(void)
     */
 
     arch_set_current_task(next);
-    switch_count++;
+    switch_count[cpu_id]++;
 
-#ifdef CONFIG_KERNEL_VIRTUAL
     mmu_context_switch(next->mm);
-#endif
 
     /* 
      * IMPORTANT: We hold the spinlock across switch_context!
@@ -492,7 +767,7 @@ void task_exit(void)
 
     /* Wake up parent if it's waiting */
     if (parent != (struct task *)0 && parent->state == TASK_STATE_BLOCKED) {
-            parent->state = TASK_STATE_READY;
+            sched_make_ready_locked(parent);
             
             /* Send IPI to other cores */
             unsigned int current_cpu = arch_get_cpu_id();
@@ -565,6 +840,27 @@ int sched_test_set_parent(struct task *task, unsigned long parent_id)
     spin_unlock_irqrestore(&sched_lock, flags);
     return 1;
 }
+
+int sched_test_cpu_snapshot(unsigned int cpu_id,
+                            unsigned int *nr_running,
+                            unsigned long *switches)
+{
+    unsigned long flags;
+
+    if (cpu_id >= SCHED_MAX_CPUS) {
+        return 0;
+    }
+
+    flags = spin_lock_irqsave(&sched_lock);
+    if (nr_running != (unsigned int *)0) {
+        *nr_running = run_queues[cpu_id].nr_running;
+    }
+    if (switches != (unsigned long *)0) {
+        *switches = switch_count[cpu_id];
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return 1;
+}
 #endif
 
 struct task *sched_current(void)
@@ -584,6 +880,7 @@ void sched_block_task(struct task *task)
         task->state != TASK_STATE_ZOMBIE &&
         task->state != TASK_STATE_REAPING &&
         task->kill_pending == 0U) {
+        (void)sched_rq_remove_locked(task);
         task->state = TASK_STATE_BLOCKED;
     }
     spin_unlock_irqrestore(&sched_lock, flags);
@@ -599,7 +896,7 @@ void sched_wake_task(struct task *task)
 
     unsigned long flags = spin_lock_irqsave(&sched_lock);
     if (task->state == TASK_STATE_BLOCKED && task->kill_pending == 0U) {
-        task->state = TASK_STATE_READY;
+        sched_make_ready_locked(task);
         woken = 1;
     }
     spin_unlock_irqrestore(&sched_lock, flags);
@@ -662,7 +959,7 @@ void sched_unpark_task(struct task *task)
 
     flags = spin_lock_irqsave(&sched_lock);
     if (task->state == TASK_STATE_BLOCKED && task->kill_pending == 0U) {
-        task->state = TASK_STATE_READY;
+        sched_make_ready_locked(task);
         woken = 1;
     } else if (task->state != TASK_STATE_DEAD &&
                task->state != TASK_STATE_ZOMBIE &&
@@ -703,7 +1000,12 @@ int sched_sleep_current(unsigned long ticks)
     }
 
     task->sleep_ticks = ticks;
-    task->state = (ticks == 0UL) ? TASK_STATE_READY : TASK_STATE_BLOCKED;
+    if (ticks == 0UL) {
+        sched_make_ready_locked(task);
+    } else {
+        (void)sched_rq_remove_locked(task);
+        task->state = TASK_STATE_BLOCKED;
+    }
     spin_unlock_irqrestore(&sched_lock, flags);
     return 1;
 }
@@ -779,11 +1081,9 @@ void sched_dump_tasks(void)
                  task->current_cpu,
                  task->name,
                  task->process != (struct process *)0 ? "user" : "kernel");
-#ifdef CONFIG_KERNEL_VIRTUAL
         if (task->process != (struct process *)0) {
             KER_LOGF(" brk=%lx", task->process->brk);
         }
-#endif
         log_write("\n");
     }
 }

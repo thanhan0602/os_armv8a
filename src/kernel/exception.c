@@ -253,13 +253,20 @@ void exception_handle_irq(unsigned long vector_id,
 {
     unsigned int iar;
     unsigned int intid;
-    int reschedule = 1;
 
     (void)esr_el1;
     (void)elr_el1;
     (void)spsr_el1;
     (void)far_el1;
     (void)context;
+
+    /*
+     * Track nested interrupt context per CPU. Rescheduling is deferred until
+     * the outermost IRQ has been acknowledged and all device handlers have
+     * released their locks, so kernel preemption never switches tasks from
+     * inside a nested or partially handled interrupt.
+     */
+    sched_irq_enter();
 
     /*
      * The Interrupt Acknowledge Register returns the full IAR value: the
@@ -274,6 +281,7 @@ void exception_handle_irq(unsigned long vector_id,
     iar = gicv2_acknowledge_irq();
     intid = iar & 0x3FFU;
     if (intid >= 1020U) {
+        sched_irq_exit();
         return;
     }
 
@@ -283,22 +291,13 @@ void exception_handle_irq(unsigned long vector_id,
     } else if (intid == 1U) {
         /* IPI 1: synchronous MM ASID shootdown request. */
         mmu_handle_shootdown_ipi();
-        /*
-         * A shootdown acknowledgement must not implicitly switch the target
-         * CPU away from its current address space. The requester only needs
-         * confirmation that this CPU completed the requested TLBI.
-         */
-        reschedule = 0;
     } else if (!timer_handle_irq(intid)) {
         KER_LOGF("[irq] unexpected vector=%s\n", exception_vector_name(vector_id));
         KER_LOGF("[irq] unexpected intid=%u\n", intid);
     }
 
     gicv2_end_of_interrupt(iar);
-
-    if (reschedule) {
-        schedule();
-    }
+    sched_irq_exit();
 }
 
 void exception_trigger_test(void)

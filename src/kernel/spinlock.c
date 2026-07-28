@@ -1,4 +1,5 @@
 #include <kernel/spinlock.h>
+#include <kernel/sched.h>
 #include <arch/arm/cpu.h>
 
 static int spin_try_lock(struct spinlock *lock)
@@ -69,6 +70,7 @@ void spin_unlock(struct spinlock *lock)
 unsigned long spin_lock_irqsave(struct spinlock *lock)
 {
     unsigned long flags = arch_local_irq_save();
+    sched_preempt_disable();
     spin_lock(lock);
     return flags;
 }
@@ -76,5 +78,6 @@ unsigned long spin_lock_irqsave(struct spinlock *lock)
 void spin_unlock_irqrestore(struct spinlock *lock, unsigned long flags)
 {
     spin_unlock(lock);
+    sched_preempt_enable();
     arch_local_irq_restore(flags);
 }

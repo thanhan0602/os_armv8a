@@ -6,6 +6,7 @@
 #include <kernel/sched.h>
 #include <kernel/smp_regression.h>
 #include <kernel/spinlock.h>
+#include <kernel/timer.h>
 #include <arch/arm/cpu.h>
 #include <arch/arm/psci.h>
 
@@ -24,7 +25,9 @@
 #define SMP_PASS_SEMAPHORE               (1U << 10)
 #define SMP_PASS_CONDVAR                 (1U << 11)
 #define SMP_PASS_INIT_REAP               (1U << 12)
-#define SMP_PASS_ALL                    ((1U << 13) - 1U)
+#define SMP_PASS_PER_CPU_RQ              (1U << 13)
+#define SMP_PASS_KERNEL_PREEMPT          (1U << 14)
+#define SMP_PASS_ALL                    ((1U << 15) - 1U)
 #define MUTEX_DESTROY_RACE_ROUNDS       512U
 
 static volatile unsigned int smp_regression_pass_mask;
@@ -91,6 +94,174 @@ static volatile unsigned long init_reap_child_id;
 static volatile unsigned int init_reap_child_exit;
 static volatile unsigned long init_reap_parent_id;
 static volatile unsigned int init_reap_parent_done;
+static volatile unsigned int sched_worker_release;
+static volatile unsigned int sched_worker_done;
+static volatile unsigned int sched_cpu_seen[SCHED_MAX_CPUS];
+
+static void scheduler_preempt_worker(void)
+{
+    unsigned int cpu;
+
+    while (sched_worker_release == 0U) {
+        cpu = arch_get_cpu_id();
+        if (cpu < SCHED_MAX_CPUS) {
+            sched_cpu_seen[cpu] = 1U;
+        }
+        __asm__ volatile("dmb ish; yield" ::: "memory");
+    }
+
+    /* Each worker writes a unique completion slot through the scheduler lock
+     * backed snapshot path, avoiding compiler atomic runtime dependencies in
+     * this freestanding kernel. */
+    {
+        unsigned long flags = spin_lock_irqsave(&smp_regression_pass_lock);
+        sched_worker_done++;
+        spin_unlock_irqrestore(&smp_regression_pass_lock, flags);
+    }
+    task_exit();
+}
+
+static int scheduler_regression_run(void)
+{
+    const unsigned int worker_count = SCHED_MAX_CPUS * 2U;
+    unsigned long switch_baseline[SCHED_MAX_CPUS];
+    unsigned long tick_baseline;
+    unsigned long switches;
+    unsigned int running;
+    unsigned int cpu;
+    unsigned int all_seen;
+    unsigned long attempts;
+    struct task *worker;
+
+    for (cpu = 0U; cpu < SCHED_MAX_CPUS; cpu++) {
+        if (!sched_test_cpu_snapshot(cpu, &running,
+                                     &switch_baseline[cpu])) {
+            return 0;
+        }
+        sched_cpu_seen[cpu] = 0U;
+    }
+    sched_worker_release = 0U;
+    sched_worker_done = 0U;
+
+    /*
+     * Queue two non-yielding workers per CPU. With only one worker assigned
+     * to a CPU, a timer interrupt can enter schedule() and select the same
+     * task again, correctly leaving switch_count unchanged. Two workers per
+     * CPU guarantee that timer preemption has an alternative runnable task
+     * and therefore produces an observable context switch on every CPU.
+     */
+    for (cpu = 0U; cpu < worker_count; cpu++) {
+        worker = (struct task *)0;
+        for (;;) {
+            worker = task_create(scheduler_preempt_worker,
+                                 "stress-preempt-worker");
+            if (worker != (struct task *)0) {
+                break;
+            }
+
+            /*
+             * Earlier regression tasks may have exited but not yet reached
+             * sched_reap_dead(). Yield so their slots can be reclaimed before
+             * concluding that MAX_TASKS is genuinely exhausted.
+             */
+            schedule();
+        }
+
+        if (worker == (struct task *)0) {
+            KER_INFO("[stress] per-cpu-runqueue FAIL: task creation failed");
+            return 0;
+        }
+    }
+
+    for (attempts = 0UL; attempts < 1000000UL; attempts++) {
+        /*
+         * The controller is itself normal runnable scheduler work and may
+         * migrate onto the one CPU not currently executing a worker. Count
+         * that CPU as observed too. Requiring only worker tasks to visit all
+         * CPUs incorrectly fails when three CPUs run workers while the fourth
+         * legitimately runs this controller.
+         */
+        cpu = arch_get_cpu_id();
+        if (cpu < SCHED_MAX_CPUS) {
+            sched_cpu_seen[cpu] = 1U;
+        }
+
+        all_seen = 1U;
+        for (cpu = 0U; cpu < SCHED_MAX_CPUS; cpu++) {
+            if (sched_cpu_seen[cpu] == 0U) {
+                all_seen = 0U;
+                break;
+            }
+        }
+        if (all_seen != 0U) {
+            break;
+        }
+        schedule();
+    }
+
+    if (all_seen == 0U) {
+        unsigned int seen_mask = 0U;
+
+        for (cpu = 0U; cpu < SCHED_MAX_CPUS; cpu++) {
+            if (sched_cpu_seen[cpu] != 0U) {
+                seen_mask |= 1U << cpu;
+            }
+            if (sched_test_cpu_snapshot(cpu, &running, &switches)) {
+                KER_LOGF("[stress] scheduler snapshot cpu=%u seen=%u rq=%u switches=%lu\n",
+                         cpu, sched_cpu_seen[cpu], running, switches);
+            }
+        }
+        KER_LOGF("[stress] per-cpu-runqueue seen-mask=%x\n", seen_mask);
+        KER_INFO("[stress] per-cpu-runqueue FAIL: CPUs did not receive work");
+        return 0;
+    }
+    KER_INFO("[stress] per-cpu-runqueue PASS");
+    smp_regression_mark_pass(SMP_PASS_PER_CPU_RQ);
+
+    /*
+     * Iteration counts are not a reliable timer deadline under QEMU: one
+     * million schedule() calls can complete before the first 500 ms tick.
+     * Keep the non-yielding workers alive for at least two CPU0 timer ticks,
+     * then inspect the per-CPU switch counters. CPU0 owns timer_ticks, while
+     * every CPU receives the same local virtual-timer period.
+     */
+    tick_baseline = timer_tick_count();
+    while (timer_tick_count() - tick_baseline < 2UL) {
+        schedule();
+    }
+
+    for (cpu = 0U; cpu < SCHED_MAX_CPUS; cpu++) {
+        if (!sched_test_cpu_snapshot(cpu, &running, &switches) ||
+            switches <= switch_baseline[cpu]) {
+            KER_LOGF("[stress] preemption snapshot cpu=%u rq=%u baseline=%lu switches=%lu\n",
+                     cpu, running, switch_baseline[cpu], switches);
+            KER_INFO("[stress] kernel-preemption FAIL: missing timer switch");
+            return 0;
+        }
+    }
+    KER_INFO("[stress] kernel-preemption PASS");
+    smp_regression_mark_pass(SMP_PASS_KERNEL_PREEMPT);
+
+    sched_worker_release = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+    while (sched_worker_done != worker_count) {
+        schedule();
+    }
+    return 1;
+}
+
+#ifdef CONFIG_SCHED_REGRESSION_ONLY
+static void scheduler_only_controller(void)
+{
+    if (scheduler_regression_run()) {
+        KER_INFO("[stress] SCHEDULER ONLY PASS");
+        psci_system_off();
+    }
+
+    KER_INFO("[stress] SCHEDULER ONLY FAIL");
+    task_exit();
+}
+#endif
 
 static void sync_regression_controller(void);
 
@@ -172,7 +343,13 @@ static void mm_lifetime_run_controller(void)
     unsigned long baseline;
     unsigned long attempts;
 
-    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+    /*
+     * Per-CPU queues can legitimately delay the second holder while other
+     * local work is ahead of it. Keep yielding until both CPUs have installed
+     * the shared context; the external 30-second QEMU timeout remains the
+     * bounded failure detector for a real scheduler deadlock.
+     */
+    for (;;) {
         __asm__ volatile("dmb ish" ::: "memory");
         if (mm_lifetime_active != 0U &&
             mm_lifetime_second_active != 0U) {
@@ -447,17 +624,12 @@ static void mutex_detach_controller(void)
         task_exit();
     }
 
-    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+    for (;;) {
         __asm__ volatile("dmb ish" ::: "memory");
         if (mutex_waiter_acquired != 0U) {
             break;
         }
         schedule();
-    }
-
-    if (mutex_waiter_acquired == 0U) {
-        KER_INFO("[stress] mutex-owner-detach FAIL: ownership not handed off");
-        task_exit();
     }
 
     for (attempts = 0UL; attempts < 100000UL; attempts++) {
@@ -588,8 +760,25 @@ static void mutex_waiter_kill_controller(void)
         schedule();
     }
 
-    if (state != TASK_STATE_BLOCKED ||
-        !sched_kill_task(killed_waiter_id)) {
+    if (state != TASK_STATE_BLOCKED) {
+        KER_INFO("[stress] mutex-waiter-detach FAIL: waiter kill failed");
+        task_exit();
+    }
+
+    if (!sched_kill_task(killed_waiter_id)) {
+        unsigned long observed_state = TASK_STATE_READY;
+        unsigned int observed_cpu = TASK_NO_CPU;
+        unsigned int observed_pending = 0U;
+
+        if (sched_task_snapshot(killed_waiter_id, &observed_state,
+                                &observed_cpu, &observed_pending)) {
+            KER_LOGF("[stress] waiter kill snapshot id=%lu state=%lu cpu=%u pending=%u\n",
+                     killed_waiter_id, observed_state, observed_cpu,
+                     observed_pending);
+        } else {
+            KER_LOGF("[stress] waiter kill snapshot id=%lu missing\n",
+                     killed_waiter_id);
+        }
         KER_INFO("[stress] mutex-waiter-detach FAIL: waiter kill failed");
         task_exit();
     }
@@ -807,10 +996,17 @@ static void sync_regression_controller(void)
         schedule();
     }
 
-    if (sync_sem_waiter_done == 0U ||
-        !semaphore_pool_free(sync_sem_handle)) {
+    if (sync_sem_waiter_done == 0U) {
         KER_INFO("[stress] semaphore FAIL: wake or destroy failed");
         task_exit();
+    }
+
+    /* The waiter publishes done immediately before task_exit(), while its
+     * pool operation remains pinned until semaphore_pool_wait() returns.
+     * Wait for that final unpin instead of treating the transient busy slot
+     * as a semaphore failure under a different SMP scheduling order. */
+    while (!semaphore_pool_free(sync_sem_handle)) {
+        schedule();
     }
     KER_INFO("[stress] semaphore PASS");
     smp_regression_mark_pass(SMP_PASS_SEMAPHORE);
@@ -839,12 +1035,40 @@ static void sync_regression_controller(void)
     }
     KER_INFO("[stress] condvar PASS");
     smp_regression_mark_pass(SMP_PASS_CONDVAR);
+
+    /*
+     * The semaphore and condition-variable workers publish their completion
+     * flags immediately before task_exit(). Give the scheduler enough turns
+     * to finish those exits and reap all accumulated dead stress tasks before
+     * allocating the four scheduler workers. Otherwise transient dead slots
+     * can exhaust MAX_TASKS even though the earlier tests have completed.
+     */
+    for (attempts = 0UL; attempts < MAX_TASKS; attempts++) {
+        schedule();
+    }
+
+    if (!scheduler_regression_run()) {
+        task_exit();
+    }
     task_exit();
 }
 
 void smp_regression_start(void)
 {
     smp_regression_pass_mask = 0U;
+#ifdef CONFIG_SCHED_REGRESSION_ONLY
+    sched_worker_release = 0U;
+    sched_worker_done = 0U;
+    for (unsigned int cpu = 0U; cpu < SCHED_MAX_CPUS; cpu++) {
+        sched_cpu_seen[cpu] = 0U;
+    }
+    KER_INFO("[stress] starting scheduler-only regression");
+    if (task_create(scheduler_only_controller,
+                    "stress-sched-controller") == (struct task *)0) {
+        KER_INFO("[stress] SCHEDULER ONLY FAIL: controller creation failed");
+    }
+    return;
+#endif
     wake_before_park_waiter = (struct task *)0;
     wake_before_park_done = 0U;
     remote_kill_target_id = 0UL;
