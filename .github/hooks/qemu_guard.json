@@ -1,0 +1,9 @@
+{
+    "name": "qemu-timeout-guard",
+    "description": "Prevents sync QEMU runs by warning or modifying terminal calls.",
+    "events": ["PreToolUse"],
+    "tool": "run_in_terminal",
+    "condition": "command.contains('run_qemu.sh') && mode == 'sync'",
+    "action": "warn",
+    "message": "WARNING: You are trying to run QEMU in 'sync' mode. This might cause a hang if the OS doesn't exit. Please use 'async' mode with a timeout."
+}
