@@ -14,12 +14,10 @@ unsigned long *mmu_l1_table;
 unsigned long *mmu_l2_ram_table;
 unsigned long mmu_fine_map_chunks_used;
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 /* TTBR1 page-table root pointers for the kernel virtual address space. */
 unsigned long *l0_table_ttbr1;
 unsigned long *l1_table_ttbr1;
 unsigned long *l2_ram_table_ttbr1;
-#endif
 
 extern char __text_start[];
 extern char __text_end[];
@@ -35,14 +33,12 @@ extern char __stack_guard[];
 extern char __stack_guard_end[];
 extern char __kernel_end[];
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 unsigned long *alloc_named_table_page(const char *name)
 {
     unsigned long *table = (unsigned long *)page_alloc();
     if (table) mmu_debug_record_table_page((unsigned long)table, name);
     return table;
 }
-#endif
 
 static void mmu_log_segment(const char *name, void *start, void *end)
 {
@@ -227,9 +223,7 @@ int mmu_build_identity_map(void)
     return build_generic_boot_map(&mmu_l0_table, &mmu_l1_table, &mmu_l2_ram_table, "id");
 }
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 int build_kernel_map(void)
 {
     return build_generic_boot_map(&l0_table_ttbr1, &l1_table_ttbr1, &l2_ram_table_ttbr1, "t1-");
 }
-#endif

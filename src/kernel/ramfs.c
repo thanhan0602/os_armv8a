@@ -3,8 +3,6 @@
 #include <kernel/log.h>
 #include <kernel/vm.h>
 
-#ifdef CONFIG_KERNEL_VIRTUAL
-
 #define RAMFS_FILES_MAX  16UL
 #define RAMFS_PATH_MAX   64UL
 
@@ -218,9 +216,3 @@ void *ramfs_get_data_ptr(struct file *file)
     struct ramfs_node *node = (struct ramfs_node *)file->vn->data;
     return (void *)node->data;
 }
-
-#else
-void ramfs_init(void) {}
-int ramfs_register_file(const char *path, unsigned char *data, unsigned long size) { (void)path; (void)data; (void)size; return 0; }
-int ramfs_unregister_file(const char *path) { (void)path; return 0; }
-#endif

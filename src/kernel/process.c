@@ -13,7 +13,6 @@ extern void fork_child_exit(void);
 extern int mmu_copy_to_user(const struct mm_context *mm, unsigned long dst_va, const void *src, unsigned long len);
 extern int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsigned long esr_el1);
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 #define ELF_MAGIC 0x464c457fUL
 #define ELF_CLASS_64 2U
 #define ELF_DATA_LE 1U
@@ -1033,26 +1032,7 @@ unsigned long process_fork(struct exception_context *ctx)
 {
     return process_clone(0, 0, 0, ctx);
 }
-#else
-struct process *process_create_from_image(char *code_start, char *code_end)
-{
-    (void)code_start;
-    (void)code_end;
-    return (struct process *)0;
-}
 
-void process_destroy(struct process *process)
-{
-    (void)process;
-}
-
-unsigned long process_brk(struct process *process, unsigned long new_break)
-{
-    (void)process;
-    (void)new_break;
-    return 0UL;
-}
-#endif
 unsigned long process_execve(const char *filename_va, char *const argv_va[], char *const envp_va[], struct exception_context *ctx)
 {
     struct task *task = arch_get_current_task();

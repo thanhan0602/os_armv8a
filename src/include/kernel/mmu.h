@@ -50,10 +50,8 @@ int mmu_handle_process_page_fault(struct process *p, unsigned long far_el1, unsi
 #define MMU_MAIR_DEVICE_nGnRnE 0x00UL
 #define MMU_MAIR_NORMAL_WBWA   0xffUL
 #define MMU_TCR_IPS_48BIT      (5UL << 32)
-#ifdef CONFIG_KERNEL_VIRTUAL
 #define MMU_T1SZ               (MMU_T0SZ << 16)
 #define MMU_TG1_4K             (2UL << 30)
-#endif
 
 #define SCTLR_EL1_RES1         ((1UL << 29) | (1UL << 28) | (1UL << 23) | (1UL << 22) | (1UL << 20) | (1UL << 11))
 #define SCTLR_EL1_M            (1UL << 0)
@@ -81,18 +79,15 @@ extern unsigned long *mmu_l1_table;
 extern unsigned long *mmu_l2_ram_table;
 extern unsigned long mmu_fine_map_chunks_used;
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 extern unsigned long *l0_table_ttbr1;
 extern unsigned long *l1_table_ttbr1;
 extern unsigned long *l2_ram_table_ttbr1;
 int build_kernel_map(void);
-#endif
 
 unsigned long mmu_kernel_page_attrs_pa(unsigned long pa);
 int mmu_build_identity_map(void);
 unsigned long *alloc_named_table_page(const char *name);
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 /*
  * Replace the boot-time TTBR0 identity map with an owned empty lower-half
  * root after the kernel has switched to TTBR1. The old TTBR0 table pages are
@@ -164,7 +159,8 @@ int mmu_context_test_snapshot(struct mm_context *mm,
                               unsigned int *dying,
                               unsigned int *active_cpu_mask);
 unsigned long mmu_context_test_release_count(void);
-#endif
+#endif /* CONFIG_SMP_REGRESSION_TESTS */
+
 /*
  * Register a physical page with the mm_context so it is freed when the
  * context is destroyed.  Call this for user content pages (code, stack)
@@ -221,7 +217,6 @@ int mmu_unmap_user_range(struct mm_context *mm, unsigned long va, unsigned long 
  * Returns 1 if the fault was handled (mapping successful), 0 otherwise.
  */
 int mmu_handle_page_fault(unsigned long far_el1, unsigned long esr_el1);
-#endif
 
 /* Number of physical pages currently consumed by translation tables. */
 unsigned long mmu_table_pages_used(void);

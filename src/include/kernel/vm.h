@@ -22,15 +22,11 @@
  *   - PA 0x09000000 (PL011 UART)          maps to VA 0xFFFF000009000000
  *   - PA 0x08000000 (GICv2 GICD)          maps to VA 0xFFFF000008000000
  */
-#ifdef CONFIG_KERNEL_VIRTUAL
 #define KERNEL_VA_OFFSET  0xFFFF000000000000UL
 #define USER_CODE_BASE    0x00001000UL
 #define USER_HEAP_BASE    0x10000000UL
 #define USER_HEAP_LIMIT   0x70000000UL
 #define USER_STACK_TOP    0x80000000UL
-#else
-#define KERNEL_VA_OFFSET  0UL
-#endif
 
 /*
  * Convert a physical address (or a pointer derived from one) to the

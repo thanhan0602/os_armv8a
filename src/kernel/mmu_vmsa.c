@@ -10,8 +10,6 @@
 #include <arch/arm/sysregs.h>
 #include <drivers/interrupt/gicv2.h>
 
-#ifdef CONFIG_KERNEL_VIRTUAL
-
 /* Root pointer for the empty TTBR0 root during kernel tasks. */
 unsigned long *ttbr0_runtime_empty_root;
 
@@ -1391,5 +1389,3 @@ int mmu_unmap_user_range(struct mm_context *mm, unsigned long va, unsigned long 
     spin_unlock_irqrestore(&mm->lock, irq_flags);
     return 1;
 }
-
-#endif /* CONFIG_KERNEL_VIRTUAL */

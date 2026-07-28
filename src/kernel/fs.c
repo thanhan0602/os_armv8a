@@ -115,7 +115,6 @@ void fs_close(struct file *file)
     file->vn = (struct vnode *)0;
 }
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 int fs_register_file(const char *path, unsigned char *data, unsigned long size)
 {
     return ramfs_register_file(path, data, size);
@@ -132,8 +131,3 @@ void fs_init(void)
     ramfs_init();
     vfs_mount("/", "ramfs", (void *)0);
 }
-#else
-int fs_register_file(const char *path, unsigned char *data, unsigned long size) { return 0; }
-int fs_unregister_file(const char *path) { return 0; }
-void fs_init(void) {}
-#endif

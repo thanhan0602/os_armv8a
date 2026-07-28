@@ -29,7 +29,6 @@ volatile int secondary_ready = 0;
 
 extern char __text_start[];
 
-#ifdef CONFIG_KERNEL_VIRTUAL
 struct boot_service {
     const char *path;
     const char *name;
@@ -114,7 +113,6 @@ static void kernel_start_user_services(void)
         }
     }
 }
-#endif
 
 /*
  * Boot order matters here:
@@ -262,14 +260,12 @@ void kernel_main(void)
      */
     exception_init();
 
-#ifdef CONFIG_KERNEL_VIRTUAL
     /* 
      * Now that we are safely running in the high virtual address space (TTBR1),
      * we can remove the identity map (TTBR0 bridge) used during boot.
      * This prepares TTBR0 for use by user processes.
      */
     mmu_install_empty_ttbr0_root();
-#endif
 
     kernel_heap_init();
     fs_init();
@@ -278,7 +274,7 @@ void kernel_main(void)
     /* Enable interrupts on CPU 0 */
     arch_local_irq_enable();
 
-#if defined(CONFIG_KERNEL_VIRTUAL) && defined(CONFIG_RUN_OS_DEMOS)
+#ifdef CONFIG_RUN_OS_DEMOS
     kernel_start_user_services();
 #endif
 #ifdef CONFIG_SMP_REGRESSION_TESTS

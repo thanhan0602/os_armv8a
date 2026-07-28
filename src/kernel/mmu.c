@@ -38,23 +38,17 @@ void mmu_setup_core(void)
           (0UL << 14) |
           (0UL << 22) |  /* A1 = 0: ASID comes from TTBR0_EL1 */
           /* (1UL << 36) |  AS = 1: 16-bit ASID */
-#ifdef CONFIG_KERNEL_VIRTUAL
           MMU_T1SZ |
           (1UL << 24) |
           (1UL << 26) |
           (3UL << 28) |
           MMU_TG1_4K |
-#else
-          (1UL << 23) |  /* EPD1 = 1: disable TTBR1 translations */
-#endif
           MMU_TCR_IPS_48BIT;
 
     mmu_set_mair(mair);
     mmu_set_tcr(tcr);
     mmu_set_ttbr0((unsigned long)mmu_l0_table);
-#ifdef CONFIG_KERNEL_VIRTUAL
     mmu_set_ttbr1((unsigned long)l0_table_ttbr1);
-#endif
     mmu_invalidate_tlb_all();
 
     unsigned long sctlr = SCTLR_EL1_RES1 | SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_I;
@@ -78,11 +72,9 @@ void mmu_init(void)
         return;
     }
 
-#ifdef CONFIG_KERNEL_VIRTUAL
     if (!build_kernel_map()) {
         return;
     }
-#endif
 
     kernel_debug_log_mmu_boot_targets();
 

@@ -79,7 +79,6 @@ secondary_entry:
     mov x0, x9
     bl kernel_main_early
 
-#ifdef CONFIG_KERNEL_VIRTUAL
     /*
      * kernel_main_early has returned.  The MMU is now on with:
      *   TTBR0_EL1 -> identity map  (VA == PA)
@@ -97,9 +96,6 @@ secondary_entry:
 
     ldr x0, =kernel_main
     br  x0
-#else
-    bl kernel_main
-#endif
 
 4:
     wfe
