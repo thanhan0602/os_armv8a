@@ -16,6 +16,11 @@ Giữ một IPC slice nhỏ nhưng thực dụng cho runtime hiện tại:
   - `IPC_MESSAGE_MAX=64`
   - `ipc_send()` copy message vào kernel mailbox
   - `ipc_receive()` return ngay nếu có message, hoặc block task hiện tại nếu mailbox rỗng
+  - receiver dùng `struct wait_queue` FIFO chung thay cho một raw `struct task *`, cho phép nhiều task chờ trên cùng channel
+- `src/kernel/wait_queue.c` + `src/include/kernel/wait_queue.h`
+  - cung cấp intrusive FIFO queue qua `task->wait_next`
+  - hỗ trợ init, enqueue, dequeue, contains và remove
+  - không tự khóa; caller phải giữ subsystem lock khi thao tác queue
 - `src/kernel/sched.c` + `src/include/kernel/sched.h`
   - thêm `TASK_STATE_BLOCKED`
   - IPC blocking path dùng `sched_park_task()` và `sched_unpark_task()` với wake token để tránh lost wakeup
@@ -63,24 +68,22 @@ Fix hiện tại nằm ở:
 
 ## SMP locking và lifetime
 
-- Receiver được publish vào `waiting_receiver` dưới `channel->lock`, sau đó channel lock được nhả trước khi gọi `sched_park_task()`.
-- Sender lấy waiter khỏi channel dưới `channel->lock`, nhả khóa, rồi mới gọi `sched_unpark_task()`.
+- Receiver được enqueue vào `channel->receivers` dưới `channel->lock`, sau đó channel lock được nhả trước khi gọi `sched_park_task()`.
+- Sender dequeue đúng một waiter theo FIFO dưới `channel->lock`, nhả khóa, rồi mới gọi `sched_unpark_task()`.
 - Nếu sender wake trước khi receiver kịp park, scheduler lưu `wake_pending`; lần park kế tiếp tiêu thụ token thay vì chuyển task sang BLOCKED.
 - Reaper nhả `sched_lock` trước khi gọi `ipc_detach_task()`, vì vậy không còn cạnh khóa ngược `sched_lock -> channel->lock`.
 - Task slot chỉ được clear và tái sử dụng sau khi IPC và mutex detach hoàn tất.
 
 ## Limitations hiện tại
 
-- chỉ có một blocked receiver cho mỗi channel
 - mailbox chỉ chứa được một message tại một thời điểm
 - `send` hiện fail nếu mailbox đang đầy, không block
 - chưa có channel create/destroy động
-- chưa có close semantics, broadcast, multi-waiter queue, stream/pipe semantics, hoặc request/reply routing
-- Channel vẫn chỉ lưu một raw `struct task *` và chỉ hỗ trợ một receiver chờ. An toàn hiện tại phụ thuộc vào invariant reaper luôn detach trước khi clear task slot.
+- chưa có close semantics, broadcast, stream/pipe semantics, hoặc request/reply routing
+- Wait queue vẫn intrusive qua `task->wait_next`, nên một task chỉ có thể nằm trong một subsystem wait queue tại một thời điểm. Reaper vẫn phải detach trước khi clear và tái sử dụng task slot.
 
 ## Hướng đi hợp lý tiếp theo
 
-1. Thay `waiting_receiver` đơn bằng wait queue nhiều waiter có lifecycle rõ ràng.
-2. Thêm stress test cho wake-before-park, kill waiter và detach/reuse task slot.
-3. Quyết định primitive kế tiếp: pipe/stream hay lifecycle/wait events cho process manager.
-4. Nếu đi tiếp tới process manager, cân nhắc thêm `waitpid`-style event IPC thay vì mở rộng shell polling.
+1. Thêm regression riêng cho nhiều IPC receiver, FIFO wake và kill waiter giữa queue.
+2. Quyết định primitive kế tiếp: semaphore/condition variable hay pipe/stream.
+3. Nếu đi tiếp tới process manager, cân nhắc thêm `waitpid`-style event IPC thay vì mở rộng shell polling.

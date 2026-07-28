@@ -16,12 +16,11 @@ Hệ thống hiện tại sử dụng:
   - `L0 -> L1 -> L2 -> L3` cho vùng kernel image (với granularity `4 KiB`).
   - `L2` block mappings (`2 MiB`) cho phần RAM còn lại để giảm overhead bảng trang.
 
-Hệ thống hỗ trợ hai build variant thông qua flag `CONFIG_KERNEL_VIRTUAL`:
+Kernel chỉ hỗ trợ một kiến trúc high-VA:
 
-- **`KERNEL_VIRTUAL=1` (Mặc định)**:
-  - Boot: Dùng `TTBR0_EL1` identity map và `TTBR1_EL1` kernel VA map ($0xFFFF...$).
-  - Runtime: Sau khi nhảy sang Kernel VA, `TTBR0` được thay bằng một empty root cho kernel tasks hoặc page table của process hiện tại cho user tasks.
-- **`KERNEL_VIRTUAL=0`**: Chỉ dùng `TTBR0_EL1` identity map, `TTBR1` bị tắt. Kernel chạy tại PA.
+- Boot dùng `TTBR0_EL1` identity map và `TTBR1_EL1` kernel VA map (`0xFFFF...`).
+- Sau khi nhảy sang kernel VA, `TTBR0_EL1` được thay bằng empty root cho kernel task hoặc page table của process hiện tại cho user task.
+- Chế độ kernel chạy identity-only tại PA không còn được hỗ trợ.
 
 ## Kiến trúc bảng trang 4 Tầng
 

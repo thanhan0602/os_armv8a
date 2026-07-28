@@ -39,9 +39,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
   - Inc 8: Hardening pass cho process runtime — user code page được map RO + EL0 execute nhưng `PXN` tại EL1; `sys_write` trả partial byte count nếu fault sau khi đã emit một phần buffer; ASID hiện được recycle an toàn khi `mm_context_destroy()` thay vì tăng đơn điệu suốt lifetime kernel.
 - Kernel virtual layout hoàn thành: TTBR1 active, trampoline works, PA→VA migration done.
 - Scheduler hoạt động: round-robin preemptive scheduling qua timer IRQ.
-- Hỗ trợ hai build variant qua `CONFIG_KERNEL_VIRTUAL`:
-  - `make` hoặc `make KERNEL_VIRTUAL=1`: kernel chạy tại high VA qua TTBR1 (mặc định)
-  - `make KERNEL_VIRTUAL=0`: kernel chạy tại PA qua identity map (TTBR0 only, EPD1=1)
+- Kernel chỉ chạy tại high VA qua `TTBR1_EL1`; identity map `TTBR0_EL1` chỉ dùng trong giai đoạn boot.
 - Build hiện tại thành công qua `make`.
 - Runtime hiện tại boot ổn định trên QEMU cho cả hai variant.
 - Mặc định build hiện tắt `DEBUG_PRE_MMU`, `DEBUG_MMU_BOOT`, và `DEBUG_POST_MMU` (`0/0/0`), nên boot thành công chỉ còn log `[info] kernel init complete`; có thể override lại qua `make DEBUG_PRE_MMU=1 DEBUG_MMU_BOOT=1 DEBUG_POST_MMU=1` khi cần soi boot path.
@@ -55,12 +53,11 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - Physical page allocator hoạt động.
 - Kernel heap page-backed hiện hỗ trợ allocation nhỏ và allocation lớn hơn một page thông qua contiguous physical spans.
 - Shared debug target framework hiện cũng bao phủ heap arena inspection qua `heap-arenas` và `heap-large-arenas`; heap self-test đã đi qua cùng framework này.
-- MMU đã bật ổn định: boot path dùng TTBR0 identity + TTBR1 kernel VA khi virtual, hoặc chỉ TTBR0 khi identity.
-- Khi `CONFIG_KERNEL_VIRTUAL=1`, sau trampoline kernel hiện giữ TTBR1 cho kernel runtime và thay TTBR0 identity root bằng một empty lower-half root được kernel sở hữu; TTBR0 walks vẫn bật nhưng low VA kernel aliases giờ fault như mong đợi.
+- MMU đã bật ổn định: boot path dùng TTBR0 identity cùng TTBR1 kernel VA.
+- Sau trampoline kernel giữ TTBR1 cho runtime và thay TTBR0 identity root bằng một empty lower-half root được kernel sở hữu; low VA kernel aliases fault như mong đợi.
 - Đây là increment Stage 10 đầu tiên: runtime đã cắt phụ thuộc vào boot identity map và giữ sẵn lower-half root để đi tiếp tới address spaces riêng.
 - Cache `SCTLR_EL1.M/C/I` đã được bật và verify.
-- Boot flow khi `CONFIG_KERNEL_VIRTUAL=1`: `_start` (PA) → `kernel_main_early` (PA) → trampoline → `kernel_main` (VA qua TTBR1).
-- Boot flow khi `KERNEL_VIRTUAL=0`: `_start` (PA) → `kernel_main_early` (PA) → `kernel_main` (PA qua TTBR0).
+- Boot flow: `_start` (PA) → `kernel_main_early` (PA) → trampoline → `kernel_main` (VA qua TTBR1).
 - Runtime verify mới nhất với `RUN_OS_DEMOS=1`: `user-a` và `user-b` in hello bằng syscall numbers kiểu Linux; `user-a` grow heap bằng `brk`, in `[user] brk ok`, rồi fault `0xDEAD0000`; `user-b` fault khi ghi vào code page `0x10000`. Cả hai đều bị kill và reap sạch.
 - **Stage 11 (IPC And Synchronization)** — increments 1–2 đã chạy được trên QEMU:
   - increment 1: thêm `spinlock` IRQ-safe (`spin_lock_irqsave` / `spin_unlock_irqrestore`) và `wfe`/`sev` wait hints trong `src/kernel/spinlock.c`; logger hiện là consumer đầu tiên nên output kernel đã được serialize qua cùng primitive này
@@ -138,16 +135,10 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - `48-bit VA`
 - `4 KiB` granule
 - `4-level translation` rooted at `L0`
-- Hai build variant:
-  - `CONFIG_KERNEL_VIRTUAL=1` (mặc định):
-    - `TTBR0_EL1`: identity map (VA == PA) — dùng cho boot path
-    - `TTBR1_EL1`: kernel VA map (VA == PA + `0xFFFF000000000000`) — active sau trampoline
-    - sau khi nhảy sang high VA, runtime cài `TTBR0_EL1` sang một empty lower-half root riêng và giải phóng boot TTBR0 identity tables
-    - `mmu table pages=6` ở runtime sau handoff (1 empty TTBR0 root + 5 TTBR1 pages)
-  - `KERNEL_VIRTUAL=0`:
-    - `TTBR0_EL1`: identity map (VA == PA) — active suốt runtime
-    - `TTBR1_EL1`: tắt bằng `EPD1=1`
-    - `mmu table pages=5`
+- Một kiến trúc high-VA duy nhất:
+  - `TTBR0_EL1`: identity map trong boot, sau đó empty lower-half root hoặc page table của user process.
+  - `TTBR1_EL1`: kernel VA map (VA == PA + `0xFFFF000000000000`) active sau trampoline.
+  - `mmu table pages=6` ở runtime sau handoff (1 empty TTBR0 root + 5 TTBR1 pages).
 - Hybrid mapping (cùng cấu trúc cho cả hai bộ bảng trang):
   - `L0 -> L1 -> L2 -> L3` cho tối thiểu `2` chunk đầu, mỗi chunk `2 MiB`
   - tổng vùng fine-grained hiện tại là ít nhất `4 MiB`
@@ -318,16 +309,10 @@ Nếu log heap cần đọc nhanh, nên nhìn theo thứ tự:
 
 ## Lệnh thường dùng
 
-Build (virtual, mặc định):
+Build:
 
 ```text
 make
-```
-
-Build (identity only):
-
-```text
-make KERNEL_VIRTUAL=0
 ```
 
 Run:
@@ -345,19 +330,18 @@ bash scripts/run_qemu_debug.sh
 ## Việc đáng cân nhắc tiếp theo
 
 1. **Hoàn thành**: PA→VA migration — tất cả module đã được chuyển.
-2. **Hoàn thành**: Dual build variant (`CONFIG_KERNEL_VIRTUAL=1` / `0`).
+2. **Hoàn thành**: high-VA kernel qua TTBR1; chế độ identity-only đã được loại bỏ.
 3. Dùng empty TTBR0 runtime root hiện có làm base cho lower-half mappings riêng theo process/user.
 4. Thêm guard pages cho stack hoặc các vùng nhạy cảm.
 5. Tiếp tục các increment Stage 10 tiếp theo cho address spaces riêng.
 
 ## Ghi chú quyết định kiến trúc
 
-- TTBR1 kernel VA map đã active (khi `CONFIG_KERNEL_VIRTUAL=1`). TTBR0 identity map chỉ giữ cho boot path; runtime đổi sang empty lower-half root riêng.
-- Khi `KERNEL_VIRTUAL=0`, TTBR1 bị tắt bằng EPD1=1, kernel chạy hoàn toàn trên identity map.
+- TTBR1 kernel VA map luôn active ở runtime. TTBR0 identity map chỉ giữ cho boot path; runtime đổi sang empty lower-half root riêng.
 - VMA vẫn là PA trong linker.ld để tránh pointer-in-data bug (xem mục bài học kỹ thuật).
 - Trampoline dùng `adrp+add+offset` thay vì `ldr =symbol` vì VMA=PA khiến literal pool chứa PA, cần cộng offset runtime.
-- `kernel_main` giờ gồm hai phần: `kernel_main_early` (PA) và `kernel_main` (VA hoặc PA tùy variant).
-- `KERNEL_VA_OFFSET` được define là `0xFFFF000000000000` khi virtual, `0` khi identity — `pa_to_va()` trở thành no-op trong identity mode.
+- `kernel_main` gồm hai phần: `kernel_main_early` chạy tại PA và `kernel_main` chạy tại high VA.
+- `KERNEL_VA_OFFSET` cố định là `0xFFFF000000000000`.
 
 ## Mục tiêu khi mở lại phiên sau
 

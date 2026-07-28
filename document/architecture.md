@@ -74,26 +74,17 @@ Tất cả địa chỉ MMIO được map trong bảng trang với thuộc tính
 
 ---
 
-## 3. Build variants
+## 3. Cấu hình địa chỉ kernel
 
-Kernel hỗ trợ hai cấu hình build thông qua biến `KERNEL_VIRTUAL`:
-
-| Flag | Lệnh build | Chế độ chạy | TTBR1 |
-|---|---|---|---|
-| `KERNEL_VIRTUAL=1` | `make` hoặc `make KERNEL_VIRTUAL=1` | High VA `0xFFFF...` qua TTBR1 | bật |
-| `KERNEL_VIRTUAL=0` | `make KERNEL_VIRTUAL=0` | PA qua identity map | tắt (`EPD1=1`) |
-
-Cả hai variant đã được xác minh runtime: timer tick, exception handling, heap, scheduler đều hoạt động.
+Kernel chỉ hỗ trợ một chế độ chạy: high VA `0xFFFF...` qua `TTBR1_EL1`.
+Identity map `TTBR0_EL1` chỉ tồn tại trong giai đoạn boot và được thay bằng
+empty lower-half root sau khi kernel chuyển sang high VA.
 
 Macro chuyển đổi địa chỉ:
 
 ```c
 // src/include/kernel/vm.h
-#if CONFIG_KERNEL_VIRTUAL
 #define KERNEL_VA_OFFSET  0xFFFF000000000000UL
-#else
-#define KERNEL_VA_OFFSET  0UL
-#endif
 
 #define pa_to_va(pa)  ((void *)((uintptr_t)(pa) + KERNEL_VA_OFFSET))
 #define va_to_pa(va)  ((uintptr_t)(va) - KERNEL_VA_OFFSET)
@@ -103,7 +94,7 @@ Macro chuyển đổi địa chỉ:
 
 ## 4. Luồng boot
 
-### KERNEL_VIRTUAL=1 (mặc định)
+### Luồng high-VA duy nhất
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -144,16 +135,6 @@ Macro chuyển đổi địa chỉ:
 │         └─ enable IRQ, enter schedule()                     │
 └─────────────────────────────────────────────────────────────┘
 ```
-
-### KERNEL_VIRTUAL=0
-
-```
-_start (PA) → kernel_main_early (PA)
-  → mmu_init (TTBR0 only, EPD1=1) → MMU ON
-  → kernel_main (PA, qua TTBR0) → ...
-```
-
-Không có trampoline. Kernel ở lại PA suốt runtime.
 
 ---
 
@@ -227,7 +208,7 @@ Phần RAM còn lại:
   → ít overhead bảng trang hơn
 ```
 
-### Cấu trúc bảng trang (KERNEL_VIRTUAL=1)
+### Cấu trúc bảng trang
 
 ```
 TTBR0_EL1 (boot: identity map PA=VA, runtime: empty lower-half root)
@@ -248,8 +229,6 @@ TTBR1_EL1 (kernel VA map, prefix t1-)
 ```
 
 Sau trampoline: TTBR0 identity root bị thay bằng empty owned root; 5 boot TTBR0 pages được freed. Runtime giữ 6 pages bảng trang (1 empty TTBR0 root + 5 TTBR1 pages).
-
-Với `KERNEL_VIRTUAL=0`: 5 pages bảng trang, không có TTBR1.
 
 ### Permission model
 
@@ -288,14 +267,13 @@ Kernel hiện sử dụng cơ chế quản lý bộ nhớ dựa trên vùng (Reg
 0x0000FFFFFFFFFFFF ┐
                    │
 0x0000000040080000 │  (Boot: identity map PA=VA)
-                   │  (Runtime KERNEL_VIRTUAL=1: FAULT — lower half empty)
-                   │  (Runtime KERNEL_VIRTUAL=0: identity map còn active)
+                   │  (Runtime: FAULT — lower half empty)
 0x0000000040000000 │
                    │
 0x0000000000000000 ┘  ← Lower half (TTBR0)
 ```
 
-Sau trampoline trong build `KERNEL_VIRTUAL=1`:
+Sau trampoline:
 - Low alias `0x40080000` → fault (TTBR0 root rỗng)
 - High alias `0xFFFF000040080000` → translates qua TTBR1
 

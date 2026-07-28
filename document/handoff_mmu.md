@@ -11,6 +11,8 @@
 - Đã hoàn thành (MM lifetime): `mm_context` có owner refcount, trạng thái `dying`, active CPU mask và lifecycle lock. Context chỉ được giải phóng sau khi owner cuối cùng biến mất và không còn CPU nào cài nó trong TTBR0.
 - Đã verify (MM deferred release): regression xác định trên QEMU 4 core giữ context active trên một CPU, drop owner cuối từ task điều khiển, xác nhận context chuyển sang `dying` nhưng chưa release, rồi xác nhận release đúng một lần sau khi CPU giữ context chuyển TTBR0 về empty root.
 - Đã verify (multi-CPU detach): cùng một `mm_context` được cài đồng thời trên hai CPU; sau khi owner cuối biến mất, detach CPU đầu tiên không được release context, và CPU cuối cùng detach mới thực hiện release đúng một lần. Marker: `[stress] mm-multi-cpu-detach PASS`.
+- Đã hoàn thành synchronous cross-CPU ASID shootdown: requester chụp `active_cpu_mask`, tự invalidate ASID cục bộ, gửi SGI 1 đến các CPU remote và chỉ return sau khi toàn bộ target xóa bit acknowledgement. Handler SGI không gọi scheduler nên không làm thay đổi context đang active ngoài ý muốn.
+- Đã verify shootdown acknowledgement trên QEMU 4 core với cùng `mm_context` active trên hai CPU. Sau shootdown, cả hai active bits vẫn còn và mọi target đã hoàn tất TLBI trước khi requester tiếp tục. Marker: `[stress] mm-shootdown-ack PASS`.
 - Đã verify: test_cow.elf (CoW success), fork/wait4 logic, lazy page fault handler, execve memory cleanup.
 - Đã verify thêm trên QEMU 4 core: CPU 1-3 online, kernel init hoàn tất, pthread workload in ra `Complex Test Finished.`, không có fatal MMU/allocator marker trong log kiểm thử.
 
@@ -37,7 +39,7 @@
 
 ## Known issues / future SMP work
 
-- Lifetime cơ bản đã an toàn với refcount, `dying` và active CPU mask, nhưng chưa có synchronous cross-CPU detach/shootdown API cho caller cần chờ mọi CPU xác nhận ngay lập tức.
+- Lifetime cơ bản đã an toàn với refcount, `dying`, active CPU mask và synchronous ASID shootdown acknowledgement. API hiện serialize một shootdown tại một thời điểm; chưa có per-request queue hoặc batching cho nhiều shootdown đồng thời.
 - `mmu_context_switch()` vẫn thực hiện global TLB invalidation sau khi ghi TTBR0. Cách này an toàn nhưng làm mất phần lớn lợi ích ASID và tạo broadcast cost trên mỗi context switch.
 - Chưa có ASID generation rollover. Nếu có hơn 255 address space sống đồng thời, cấp ASID sẽ thất bại.
 - `CLONE_VM` không kèm `CLONE_THREAD` chưa có semantics chia sẻ MM đúng nghĩa. Nên từ chối tổ hợp chưa hỗ trợ cho đến khi MM lifetime độc lập được hoàn thiện.
@@ -55,7 +57,7 @@
 - Khi free page, chỉ lưu PA, không lưu VA.
 
 ## Next steps
-- Thêm stress lặp và synchronous cross-CPU shootdown/acknowledgement cho trường hợp nhiều CPU đồng thời active cùng một context.
+- Thêm stress lặp, timeout/failure diagnostics và per-request shootdown queue hoặc generation để hỗ trợ nhiều requester đồng thời.
 - Bỏ global TLB flush khỏi context-switch fast path và thêm ASID generation rollover sau khi có targeted shootdown đầy đủ.
 - Thêm object cache (slab/slub).
 - Hỗ trợ Shared Memory (SYS_SHM).

@@ -601,7 +601,7 @@ async def get_gdb() -> GdbRspClient:
     return _gdb
 
 
-# ── struct task layout (CONFIG_KERNEL_VIRTUAL, 64-bit host, VMA=LMA=PA) ─────
+# ── struct task layout (high-VA kernel, 64-bit host, VMA=LMA=PA) ────────────
 _TASK_CONTEXT_SIZE  = 13 * 8   # x19..x30 + sp
 _TASK_ID_OFF        = _TASK_CONTEXT_SIZE        # 104
 _TASK_STATE_OFF     = _TASK_CONTEXT_SIZE + 8    # 112

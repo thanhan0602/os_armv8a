@@ -132,14 +132,14 @@ Current behavior:
 - MMU boot-time debug targets now flow through the same framework as page-allocator debug targets, so software walk and hardware probe logs can be correlated from one target system
 
 Kernel virtual layout (completed):
-- Added `vm.h` with `KERNEL_VA_OFFSET`, `pa_to_va()` and `va_to_pa()` macros. Offset is `0xFFFF000000000000` when `CONFIG_KERNEL_VIRTUAL=1`, `0` when identity-only.
+- Added `vm.h` with the fixed high-VA `KERNEL_VA_OFFSET` (`0xFFFF000000000000`), `pa_to_va()`, and `va_to_pa()` macros.
 - Linker script exports `__kernel_va_offset` symbol and defines `KERNEL_LMA_BASE`, `KERNEL_VA_OFFSET`, `KERNEL_VMA_BASE`
-- `mmu_init()` now builds a second set of page tables for `TTBR1_EL1` (kernel VA) alongside a boot-time `TTBR0_EL1` identity map (when `CONFIG_KERNEL_VIRTUAL=1`)
-- `TCR_EL1` enables both TTBR0 and TTBR1 walks when virtual, or sets `EPD1=1` to disable TTBR1 when identity-only
-- `start.S` calls `kernel_main_early()` at PA (pre-MMU through post-MMU-enable), then uses a trampoline (`adrp+add+KERNEL_VA_OFFSET`) to jump to `kernel_main()` at the kernel VA (when virtual), or calls `kernel_main()` directly (when identity)
+- `mmu_init()` builds the `TTBR1_EL1` kernel VA map alongside the boot-time `TTBR0_EL1` identity map.
+- `TCR_EL1` enables both TTBR0 and TTBR1 walks.
+- `start.S` calls `kernel_main_early()` at PA, then uses a trampoline (`adrp+add+KERNEL_VA_OFFSET`) to jump to `kernel_main()` at the kernel VA.
 - PA→VA migration complete: page_alloc, heap, mmu walks, MMIO drivers all use conditional PA/VA conversion via `mmu_is_enabled()`
 - After trampoline in the virtual build, runtime installs an owned empty lower-half root into `TTBR0_EL1` and frees the old boot identity tables, so `TTBR1_EL1` remains the only kernel execution map
-- Runtime verified: both `KERNEL_VIRTUAL=1` (high VA, 6 table pages at runtime, heap at `0xFFFF...`) and `KERNEL_VIRTUAL=0` (PA, 5 table pages, heap at `0x4...`) boot clean with timer ticks and zero mismatches
+- Runtime verified in the high-VA configuration with 6 table pages at runtime and heap addresses in the `0xFFFF...` range.
 - Runtime proof for the virtual build now shows the low kernel alias faults while the `TTBR1` high alias still translates
 
 Bug encountered during this work:
@@ -191,7 +191,7 @@ Current behavior:
 - Scheduler cycles idle → task-b → task-a → idle every 500ms timer tick
 - Context switches logged for the first 8 switches
 - Dead tasks are unlinked from the ready list and their guard+stack pages are freed
-- Both `KERNEL_VIRTUAL=1` and `KERNEL_VIRTUAL=0` variants verified at runtime
+- High-VA runtime verified with scheduler and timer preemption.
 
 ### Stage 9: EL0 And Syscalls
 
@@ -241,7 +241,7 @@ Implemented (second increment — EL0 fault handling):
 - User task demo updated to trigger a deliberate store to `0xDEAD0000` after its normal work, validating the full fault → kill → reap path
 
 Current behavior:
-- In `KERNEL_VIRTUAL=1`, the low kernel alias faults at runtime while the high `TTBR1` alias still translates
+- The low kernel alias faults at runtime while the high `TTBR1` alias still translates.
 - User task runs at EL0, does 3 `sys_write` + `sys_yield` iterations, then accesses unmapped VA
 - Fault handler logs `[fault] EL0 data abort: FAR=0xdead0000 ELR=... ESR=... FSC=5` (translation fault level 1)
 - User task is killed and reaped; idle/task-a/task-b continue scheduling normally
