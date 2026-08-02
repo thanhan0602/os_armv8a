@@ -69,7 +69,7 @@ Goals:
 - Generate periodic timer interrupts
 
 Implemented:
-- GICv2 bring-up for QEMU `virt`
+- GICv3 bring-up for QEMU `virt`, including Distributor initialization, per-CPU Redistributor wake/configuration, and the EL1 ICC system-register interface
 - IRQ-aware exception vector flow with `eret` return path
 - Periodic generic timer interrupts using the EL1 virtual timer registers
 - Timer tick logging from the IRQ handler
@@ -358,6 +358,10 @@ Implemented (fifth increment — ASID support):
 7. Stage 16 synchronous MM shootdown: ✅ Reserved SGI 1 for cross-CPU ASID invalidation, added protected acknowledgement tracking, prevented the shootdown IRQ from scheduling, and validated the two-CPU active-context path with `[stress] mm-shootdown-ack PASS`. The complete four-core suite reaches `[stress] ALL PASS` and exits QEMU with status 0.
 8. Extend shootdown support with timeout diagnostics, concurrent-request generations or queues, and targeted VA-range invalidation.
 9. Stage 16 lifecycle and synchronization coverage: ✅ Added deterministic init/orphan reaping, semaphore wakeup, and condition-variable wait/signal regressions. The complete four-core suite emits all three PASS markers and exits QEMU with status 0 after `[stress] ALL PASS`.
+10. Stage 16 deterministic regression profiles: ✅ Added `SMP_REGRESSION_SUITE=full|scheduler|mutex|lifecycle|mm`, suite-specific expected masks and completion markers, and isolated four-core profiles for scheduler, mutex, lifecycle, and MM validation.
+11. Stage 16 staged full regression: ✅ Changed the full profile from concurrent cross-suite startup to lifecycle → mutex → scheduler → MM orchestration. Stage transitions wait for complete pass masks and reap prior workers before creating the next group. A clean four-core QEMU build passed five consecutive full runs with `[stress] ALL PASS`, status 0, and no fatal marker on 2026-08-01.
+12. Add a separate long-duration mixed-workload SMP soak profile so deterministic staged regressions remain reproducible while broad contention testing is still available.
+13. GICv3 migration: ✅ Replaced kernel interrupt-controller call sites with a neutral `gic_*` API, added GICv3 Distributor/Redistributor and ICC system-register support, moved QEMU launchers to `virt,gic-version=3`, and verified the complete four-core staged regression through `[stress] ALL PASS` with status 0 on 2026-08-02.
 4. Stage 16 increment 3: Kernel Preemption. Currently, the kernel only reschedules on explicit yield or return from interrupt. Full kernel preemption would allow higher priority tasks to interrupt lower priority kernel work.
 5. Stage 11 increment 3: add a real wait-queue abstraction or multi-waiter channel queue so IPC is no longer limited to one blocked receiver per channel.
 6. Stage 12 increment 3: add a real init-style launch path so the kernel boots one named program from the filesystem instead of hardcoding demo pairs in `main.c`.
@@ -438,8 +442,8 @@ Implemented:
 - **PSCI Booting:** CPU 0 wakes secondary cores (1, 2, 3) using `psci_cpu_on` via `hvc`.
 - **Per-CPU Isolation:** Each core has its own 16KB stack in the kernel VA space and uses `tpidr_el1` to point to its current `struct task`.
 - **SMP-Safe Scheduler:** Refactored `sched.c` to use a global `sched_lock`. Idle tasks are created for each core (slots 0-3). `schedule()` holds the lock across `switch_context`, which is then released by the incoming task.
-- **GICv2 Secondary Initialization:** Added `gicv2_init_secondary` to enable the CPU interface and timers for each core.
-- **Inter-Processor Interrupts (IPI):** Implemented `gicv2_send_ipi` using GICv2 SGIs. `sched_wake_task` sends an IPI to all other cores to trigger a reschedule, ensuring low latency for task wakeup.
+- **GICv3 Secondary Initialization:** Each CPU wakes and configures its Redistributor, assigns SGIs/PPIs to non-secure Group 1, enables the ICC system-register interface, and enables its local timer PPI.
+- **Inter-Processor Interrupts (IPI):** `gic_send_ipi` writes `ICC_SGI1R_EL1`; SGI 0 requests rescheduling and SGI 1 performs synchronous MM shootdown acknowledgement.
 - **Concurrency Safety:** Added spinlocks to `page_alloc.c` and `heap.c` to prevent race conditions during memory allocation from multiple cores.
 
 Current behavior:
@@ -489,7 +493,7 @@ Implemented:
 - **Syscall Interface:** Added `SYS_MUTEX_LOCK` (500), `SYS_MUTEX_UNLOCK` (501), mutex trylock/init/destroy support, and standard `SYS_CLONE` (224) in [src/include/kernel/syscall.h](src/include/kernel/syscall.h).
 - **User-space API:** Created [user/include/pthread.h](user/include/pthread.h) providing `pthread_create`, `pthread_join`, `pthread_yield`, and pthread mutex operations.
 - **TLS and clone ABI:** `CLONE_VM | CLONE_THREAD | CLONE_SETTLS` shares the process address space and installs per-thread `TPIDR_EL0`; `switch_context` saves/restores the thread pointer.
-- **SMP Safety:** Mutex internals are protected by spinlocks with IRQ disabling, scheduler wakeups send reschedule IPIs, and GICv2 SGI handling now masks IAR[9:0] for dispatch while writing the full IAR to EOIR.
+- **SMP Safety:** Mutex internals are protected by spinlocks with IRQ disabling, scheduler wakeups send GICv3 reschedule SGIs, and IRQ acknowledgement/deactivation uses `ICC_IAR1_EL1`/`ICC_EOIR1_EL1`.
 - **Runtime verification:** `test_pthread.elf` completed cleanly on 4-core QEMU in repeated stress runs with idle `wfe` re-enabled.
 
 ### Stage 20: Swap to Disk & Advanced VFS (Next Steps)

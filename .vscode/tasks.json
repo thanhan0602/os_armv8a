@@ -87,7 +87,7 @@
             "isBackground": true,
             "command": "${env:QEMU_BIN}/qemu-system-aarch64",
             "args": [
-                "-machine", "virt,gic-version=2",
+                "-machine", "virt,gic-version=3",
                 "-cpu", "max",
                 "-display", "none",
                 "-serial", "file:/tmp/qemu-serial.log",

@@ -50,6 +50,7 @@ DEBUG_POST_MMU ?= 0
 RUN_OS_DEMOS ?= 1
 SMP_REGRESSION_TESTS ?= 0
 SCHED_REGRESSION_ONLY ?= 0
+SMP_REGRESSION_SUITE ?= full
 
 CFLAGS += -DKERNEL_DEBUG_ENABLE_PRE_MMU=$(DEBUG_PRE_MMU)
 CFLAGS += -DKERNEL_DEBUG_ENABLE_MMU_BOOT=$(DEBUG_MMU_BOOT)
@@ -70,7 +71,30 @@ CFLAGS += -DCONFIG_SCHED_REGRESSION_ONLY=1
 ASFLAGS += -DCONFIG_SCHED_REGRESSION_ONLY=1
 endif
 
+ifeq ($(SMP_REGRESSION_SUITE),scheduler)
+CFLAGS += -DCONFIG_SMP_REGRESSION_SUITE_SCHEDULER=1
+ASFLAGS += -DCONFIG_SMP_REGRESSION_SUITE_SCHEDULER=1
+else ifeq ($(SMP_REGRESSION_SUITE),mutex)
+CFLAGS += -DCONFIG_SMP_REGRESSION_SUITE_MUTEX=1
+ASFLAGS += -DCONFIG_SMP_REGRESSION_SUITE_MUTEX=1
+else ifeq ($(SMP_REGRESSION_SUITE),lifecycle)
+CFLAGS += -DCONFIG_SMP_REGRESSION_SUITE_LIFECYCLE=1
+ASFLAGS += -DCONFIG_SMP_REGRESSION_SUITE_LIFECYCLE=1
+else ifeq ($(SMP_REGRESSION_SUITE),mm)
+CFLAGS += -DCONFIG_SMP_REGRESSION_SUITE_MM=1
+ASFLAGS += -DCONFIG_SMP_REGRESSION_SUITE_MM=1
+else ifneq ($(SMP_REGRESSION_SUITE),full)
+$(error Unsupported SMP_REGRESSION_SUITE='$(SMP_REGRESSION_SUITE)'; use full, scheduler, mutex, lifecycle, or mm)
+endif
+
 C_SOURCES := $(shell find $(SRC_DIR) -type f -name '*.c')
+
+# MMU walking, probing, descriptor decoding, and boot-target diagnostics are
+# optional. Production table allocation and TTBR0 teardown live separately in
+# mmu_table.c and therefore remain linked regardless of these debug switches.
+ifeq ($(DEBUG_PRE_MMU)$(DEBUG_MMU_BOOT)$(DEBUG_POST_MMU),000)
+C_SOURCES := $(filter-out $(SRC_DIR)/kernel/mmu_debug.c,$(C_SOURCES))
+endif
 S_SOURCES := $(shell find $(SRC_DIR) -type f -name '*.S')
 
 C_OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%_c.o,$(C_SOURCES))

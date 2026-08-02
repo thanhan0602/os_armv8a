@@ -4,6 +4,7 @@
 #include <kernel/log.h>
 #include <kernel/mmu.h>
 #include <kernel/mmu_debug.h>
+#include <kernel/mmu_table.h>
 #include <kernel/page_alloc.h>
 #include <kernel/vm.h>
 
@@ -141,10 +142,10 @@ static void kernel_debug_log_targets(unsigned long phase, unsigned long page_a, 
             KER_LOGF(" count=%lu\n", kernel_debug_targets[index].page_count);
             page_allocator_log_managed_head(kernel_debug_targets[index].page_count);
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MMU_TABLES) {
-            KER_LOGF(" count=%lu\n", mmu_debug_table_page_count());
-            for (table_index = 0UL; table_index < mmu_debug_table_page_count(); table_index++) {
-                KER_LOGF("[info] debug target=%s count=1\n", mmu_debug_table_page_name(table_index));
-                page_allocator_log_page_state(mmu_debug_table_page_address(table_index));
+            KER_LOGF(" count=%lu\n", mmu_table_page_count());
+            for (table_index = 0UL; table_index < mmu_table_page_count(); table_index++) {
+                KER_LOGF("[info] debug target=%s count=1\n", mmu_table_page_name(table_index));
+                page_allocator_log_page_state(mmu_table_page_address(table_index));
             }
         } else if (kernel_debug_targets[index].kind == KERNEL_DEBUG_TARGET_MMU_WALK) {
             KER_LOGF(" count=1\n");

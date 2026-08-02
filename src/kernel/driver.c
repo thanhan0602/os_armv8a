@@ -1,6 +1,6 @@
 #include <kernel/driver.h>
 
-#include <drivers/interrupt/gicv2.h>
+#include <drivers/interrupt/gic.h>
 #include <drivers/uart/pl011.h>
 #include <kernel/log.h>
 #include <kernel/timer.h>
@@ -32,7 +32,7 @@ void driver_system_init(void)
     }
 
     if (!gic_ready) {
-        gicv2_init();
+        gic_init();
         gic_ready = 1;
     }
 
@@ -44,7 +44,7 @@ void driver_system_init(void)
 
 void driver_secondary_init(void)
 {
-    gicv2_init_secondary();
+    gic_init_secondary();
     timer_init();
 }
 

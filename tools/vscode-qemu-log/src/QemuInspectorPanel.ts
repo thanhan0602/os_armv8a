@@ -119,7 +119,7 @@ export class QemuInspectorPanel {
         const monitorHost = config.get<string>('monitorHost', '127.0.0.1');
         const monitorPort = config.get<number>('monitorPort', 4444);
         const qemuArgs = config.get<string[]>('qemuArgs', [
-            '-machine', 'virt,gic-version=2',
+            '-machine', 'virt,gic-version=3',
             '-cpu', 'max',
             '-nographic',
             '-serial', 'stdio',

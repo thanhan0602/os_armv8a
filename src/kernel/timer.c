@@ -3,7 +3,7 @@
 #include <arch/arm/virt.h>
 #include <arch/arm/cpu.h>
 #include <arch/arm/sysregs.h>
-#include <drivers/interrupt/gicv2.h>
+#include <drivers/interrupt/gic.h>
 #include <kernel/log.h>
 #include <kernel/sched.h>
 
@@ -27,7 +27,7 @@ static void timer_program_next_tick(void)
 
 void timer_init(void)
 {
-    gicv2_enable_irq(TIMER_PPI);
+    gic_enable_irq(TIMER_PPI);
 
     timer_frequency = arch_timer_get_cntfrq();
     timer_interval = timer_frequency / 2UL;

@@ -12,7 +12,7 @@ if [[ ! -x "$QEMU_BIN" ]]; then
 fi
 
 exec "$QEMU_BIN" \
-  -machine virt,gic-version=2 \
+  -machine virt,gic-version=3 \
   -cpu max \
   -smp 4 \
   -nographic \

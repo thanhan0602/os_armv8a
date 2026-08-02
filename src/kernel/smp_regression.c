@@ -54,6 +54,49 @@ static unsigned int smp_regression_passes(void)
     return mask;
 }
 
+static unsigned int smp_regression_expected_mask(void)
+{
+#if defined(CONFIG_SMP_REGRESSION_SUITE_SCHEDULER) || \
+    defined(CONFIG_SCHED_REGRESSION_ONLY)
+    return SMP_PASS_PER_CPU_RQ | SMP_PASS_KERNEL_PREEMPT;
+#elif defined(CONFIG_SMP_REGRESSION_SUITE_MUTEX)
+    return SMP_PASS_MUTEX_OWNER_DETACH |
+           SMP_PASS_MUTEX_WAITER_DETACH |
+           SMP_PASS_MUTEX_DESTROY_REJECT |
+           SMP_PASS_MUTEX_DESTROY_RACE |
+           SMP_PASS_MUTEX_STALE_HANDLE;
+#elif defined(CONFIG_SMP_REGRESSION_SUITE_LIFECYCLE)
+    return SMP_PASS_WAKE_BEFORE_PARK |
+           SMP_PASS_REMOTE_KILL |
+           SMP_PASS_SEMAPHORE |
+           SMP_PASS_CONDVAR |
+           SMP_PASS_INIT_REAP;
+#elif defined(CONFIG_SMP_REGRESSION_SUITE_MM)
+    return SMP_PASS_MM_DEFERRED_RELEASE |
+           SMP_PASS_MM_MULTI_CPU_DETACH |
+           SMP_PASS_MM_SHOOTDOWN_ACK;
+#else
+    return SMP_PASS_ALL;
+#endif
+}
+
+static int smp_regression_complete(void)
+{
+    unsigned int expected = smp_regression_expected_mask();
+
+    return (smp_regression_passes() & expected) == expected;
+}
+
+static void smp_regression_finish_if_complete(const char *suite_name)
+{
+    if (!smp_regression_complete()) {
+        return;
+    }
+
+    KER_LOGF("[stress] %s PASS\n", suite_name);
+    psci_system_off();
+}
+
 static volatile struct task *wake_before_park_waiter;
 static volatile unsigned int wake_before_park_done;
 static volatile unsigned long remote_kill_target_id;
@@ -250,20 +293,62 @@ static int scheduler_regression_run(void)
     return 1;
 }
 
-#ifdef CONFIG_SCHED_REGRESSION_ONLY
+#if defined(CONFIG_SCHED_REGRESSION_ONLY) || \
+    defined(CONFIG_SMP_REGRESSION_SUITE_SCHEDULER)
 static void scheduler_only_controller(void)
 {
     if (scheduler_regression_run()) {
+#if defined(CONFIG_SMP_REGRESSION_SUITE_SCHEDULER) && \
+    !defined(CONFIG_SCHED_REGRESSION_ONLY)
+        smp_regression_finish_if_complete("SCHEDULER SUITE");
+#else
         KER_INFO("[stress] SCHEDULER ONLY PASS");
         psci_system_off();
+#endif
     }
 
+#if defined(CONFIG_SMP_REGRESSION_SUITE_SCHEDULER) && \
+    !defined(CONFIG_SCHED_REGRESSION_ONLY)
+    KER_INFO("[stress] SCHEDULER SUITE FAIL");
+#else
     KER_INFO("[stress] SCHEDULER ONLY FAIL");
+#endif
     task_exit();
 }
 #endif
 
 static void sync_regression_controller(void);
+static void mm_lifetime_run_controller(void);
+static void mutex_detach_owner(void);
+static void mutex_detach_waiter(void);
+static void mutex_detach_controller(void);
+static void mutex_waiter_kill_owner(void);
+static void mutex_waiter_kill_target(void);
+static void mutex_waiter_kill_controller(void);
+
+static int start_mutex_regression_stage(void)
+{
+    mutex_detach_id = mutex_pool_alloc();
+    mutex_waiter_kill_id = mutex_pool_alloc();
+
+    if (mutex_detach_id < 0 || mutex_waiter_kill_id < 0 ||
+        task_create(mutex_detach_owner, "stress-mutex-owner") ==
+            (struct task *)0 ||
+        task_create(mutex_detach_waiter, "stress-mutex-waiter") ==
+            (struct task *)0 ||
+        task_create(mutex_detach_controller, "stress-mutex-controller") ==
+            (struct task *)0 ||
+        task_create(mutex_waiter_kill_owner, "stress-waiter-owner") ==
+            (struct task *)0 ||
+        task_create(mutex_waiter_kill_target, "stress-killed-waiter") ==
+            (struct task *)0 ||
+        task_create(mutex_waiter_kill_controller,
+                    "stress-waiter-controller") == (struct task *)0) {
+        return 0;
+    }
+
+    return 1;
+}
 
 static void init_reap_child(void)
 {
@@ -331,6 +416,43 @@ static void mm_lifetime_holder(void)
     mm_lifetime_first_detached = 1U;
     __asm__ volatile("dmb ish; sev" ::: "memory");
     arch_local_irq_restore(irq_flags);
+    task_exit();
+}
+
+static void mm_lifetime_second_holder(void)
+{
+    struct mm_context *mm;
+    unsigned long irq_flags;
+
+    while (mm_lifetime_active == 0U) {
+        __asm__ volatile("dmb ish" ::: "memory");
+        schedule();
+    }
+
+    mm = (struct mm_context *)mm_lifetime_context;
+    if (mm == (struct mm_context *)0) {
+        KER_INFO("[stress] mm-multi-cpu-detach FAIL: missing shared context");
+        task_exit();
+    }
+
+    irq_flags = arch_local_irq_save();
+    mmu_context_switch(mm);
+    mm_lifetime_second_active = 1U;
+    __asm__ volatile("dmb ish; sev" ::: "memory");
+
+    while (mm_lifetime_second_detach == 0U) {
+        mmu_handle_shootdown_ipi();
+        __asm__ volatile("dmb ish; yield" ::: "memory");
+    }
+
+    mmu_context_switch((struct mm_context *)0);
+    arch_local_irq_restore(irq_flags);
+    task_exit();
+}
+
+static void mm_suite_controller(void)
+{
+    mm_lifetime_run_controller();
     task_exit();
 }
 
@@ -419,12 +541,16 @@ static void mm_lifetime_run_controller(void)
             KER_INFO("[stress] mm-multi-cpu-detach PASS");
             smp_regression_mark_pass(SMP_PASS_MM_MULTI_CPU_DETACH);
 
-            while (smp_regression_passes() != SMP_PASS_ALL) {
+            while (!smp_regression_complete()) {
                 schedule();
             }
 
+#if defined(CONFIG_SMP_REGRESSION_SUITE_MM)
+            smp_regression_finish_if_complete("MM SUITE");
+#else
             KER_INFO("[stress] ALL PASS");
             psci_system_off();
+#endif
             return;
         }
         schedule();
@@ -553,7 +679,10 @@ static void remote_kill_controller(void)
     KER_INFO("[stress] remote-stop-ack PASS");
     KER_INFO("[stress] remote-kill PASS");
     smp_regression_mark_pass(SMP_PASS_REMOTE_KILL);
-    mm_lifetime_run_controller();
+    while ((smp_regression_passes() & SMP_PASS_WAKE_BEFORE_PARK) == 0U) {
+        schedule();
+    }
+    sync_regression_controller();
     task_exit();
 }
 
@@ -636,6 +765,9 @@ static void mutex_detach_controller(void)
         if (mutex_pool_free(mutex_detach_id)) {
             KER_INFO("[stress] mutex-owner-detach PASS");
             smp_regression_mark_pass(SMP_PASS_MUTEX_OWNER_DETACH);
+#if defined(CONFIG_SMP_REGRESSION_SUITE_MUTEX)
+            smp_regression_finish_if_complete("MUTEX SUITE");
+#endif
             task_exit();
         }
         schedule();
@@ -648,8 +780,6 @@ static void mutex_detach_controller(void)
 static void mutex_waiter_kill_owner(void)
 {
     unsigned int round;
-    unsigned long irq_flags;
-    struct mm_context *mm;
 
     if (!mutex_pool_lock(mutex_waiter_kill_id)) {
         KER_INFO("[stress] mutex-waiter-detach FAIL: owner lock failed");
@@ -701,29 +831,6 @@ static void mutex_waiter_kill_owner(void)
     mutex_destroy_race_finished = 1U;
     __asm__ volatile("dmb ish; sev" ::: "memory");
 
-    while (mm_lifetime_active == 0U) {
-        __asm__ volatile("dmb ish" ::: "memory");
-        schedule();
-    }
-
-    mm = (struct mm_context *)mm_lifetime_context;
-    if (mm == (struct mm_context *)0) {
-        KER_INFO("[stress] mm-multi-cpu-detach FAIL: missing shared context");
-        task_exit();
-    }
-
-    irq_flags = arch_local_irq_save();
-    mmu_context_switch(mm);
-    mm_lifetime_second_active = 1U;
-    __asm__ volatile("dmb ish; sev" ::: "memory");
-    while (mm_lifetime_second_detach == 0U) {
-        /* See mm_lifetime_holder(): service pending shootdowns while the
-         * deterministic observation window keeps timer IRQs masked. */
-        mmu_handle_shootdown_ipi();
-        __asm__ volatile("dmb ish; yield" ::: "memory");
-    }
-    mmu_context_switch((struct mm_context *)0);
-    arch_local_irq_restore(irq_flags);
     task_exit();
 }
 
@@ -880,7 +987,40 @@ static void mutex_waiter_kill_controller(void)
 
         KER_INFO("[stress] mutex-stale-handle PASS");
         smp_regression_mark_pass(SMP_PASS_MUTEX_STALE_HANDLE);
-        sync_regression_controller();
+#if defined(CONFIG_SMP_REGRESSION_SUITE_MUTEX)
+        smp_regression_finish_if_complete("MUTEX SUITE");
+#else
+        while ((smp_regression_passes() &
+                (SMP_PASS_MUTEX_OWNER_DETACH |
+                 SMP_PASS_MUTEX_WAITER_DETACH |
+                 SMP_PASS_MUTEX_DESTROY_REJECT |
+                 SMP_PASS_MUTEX_DESTROY_RACE |
+                 SMP_PASS_MUTEX_STALE_HANDLE)) !=
+               (SMP_PASS_MUTEX_OWNER_DETACH |
+                SMP_PASS_MUTEX_WAITER_DETACH |
+                SMP_PASS_MUTEX_DESTROY_REJECT |
+                SMP_PASS_MUTEX_DESTROY_RACE |
+                SMP_PASS_MUTEX_STALE_HANDLE)) {
+            schedule();
+        }
+
+        for (unsigned long attempts = 0UL; attempts < MAX_TASKS; attempts++) {
+            schedule();
+        }
+
+        if (!scheduler_regression_run()) {
+            task_exit();
+        }
+
+        if (task_create(mm_lifetime_holder, "stress-mm-holder-a") ==
+                (struct task *)0 ||
+            task_create(mm_lifetime_second_holder, "stress-mm-holder-b") ==
+                (struct task *)0 ||
+            task_create(mm_suite_controller, "stress-mm-controller") ==
+                (struct task *)0) {
+            KER_INFO("[stress] MM stage FAIL: task creation failed");
+        }
+#endif
     } else {
         KER_INFO("[stress] mutex-destroy-race FAIL: race invariant violated");
     }
@@ -970,16 +1110,13 @@ static void sync_regression_controller(void)
     smp_regression_mark_pass(SMP_PASS_INIT_REAP);
 
     if (task_create(sync_semaphore_waiter, "stress-sem-waiter") ==
-            (struct task *)0 ||
-        task_create(sync_condvar_waiter, "stress-cond-waiter") ==
             (struct task *)0) {
-        KER_INFO("[stress] sync primitives FAIL: task creation failed");
+        KER_INFO("[stress] semaphore FAIL: task creation failed");
         task_exit();
     }
 
     for (attempts = 0UL; attempts < 100000UL; attempts++) {
-        if (sync_sem_waiter_started != 0U &&
-            sync_cond_waiter_started != 0U) {
+        if (sync_sem_waiter_started != 0U) {
             break;
         }
         schedule();
@@ -1011,6 +1148,28 @@ static void sync_regression_controller(void)
     KER_INFO("[stress] semaphore PASS");
     smp_regression_mark_pass(SMP_PASS_SEMAPHORE);
 
+    /* Run the condition-variable stage only after the semaphore waiter has
+     * completed and released its task/pool operation pins. Keeping these two
+     * lifecycle tests sequential avoids unrelated runnable work obscuring
+     * which primitive failed and makes the isolated suite deterministic. */
+    if (task_create(sync_condvar_waiter, "stress-cond-waiter") ==
+            (struct task *)0) {
+        KER_INFO("[stress] condvar FAIL: task creation failed");
+        task_exit();
+    }
+
+    for (attempts = 0UL; attempts < 100000UL; attempts++) {
+        if (sync_cond_waiter_started != 0U) {
+            break;
+        }
+        schedule();
+    }
+
+    if (sync_cond_waiter_started == 0U) {
+        KER_INFO("[stress] condvar FAIL: waiter did not start");
+        task_exit();
+    }
+
     if (!mutex_pool_lock(sync_cond_mutex_handle)) {
         KER_INFO("[stress] condvar FAIL: controller lock rejected");
         task_exit();
@@ -1036,19 +1195,17 @@ static void sync_regression_controller(void)
     KER_INFO("[stress] condvar PASS");
     smp_regression_mark_pass(SMP_PASS_CONDVAR);
 
-    /*
-     * The semaphore and condition-variable workers publish their completion
-     * flags immediately before task_exit(). Give the scheduler enough turns
-     * to finish those exits and reap all accumulated dead stress tasks before
-     * allocating the four scheduler workers. Otherwise transient dead slots
-     * can exhaust MAX_TASKS even though the earlier tests have completed.
-     */
+#if defined(CONFIG_SMP_REGRESSION_SUITE_LIFECYCLE)
+    smp_regression_finish_if_complete("LIFECYCLE SUITE");
+    task_exit();
+#endif
+
     for (attempts = 0UL; attempts < MAX_TASKS; attempts++) {
         schedule();
     }
 
-    if (!scheduler_regression_run()) {
-        task_exit();
+    if (!start_mutex_regression_stage()) {
+        KER_INFO("[stress] mutex stage FAIL: setup failed");
     }
     task_exit();
 }
@@ -1056,7 +1213,8 @@ static void sync_regression_controller(void)
 void smp_regression_start(void)
 {
     smp_regression_pass_mask = 0U;
-#ifdef CONFIG_SCHED_REGRESSION_ONLY
+#if defined(CONFIG_SCHED_REGRESSION_ONLY) || \
+    defined(CONFIG_SMP_REGRESSION_SUITE_SCHEDULER)
     sched_worker_release = 0U;
     sched_worker_done = 0U;
     for (unsigned int cpu = 0U; cpu < SCHED_MAX_CPUS; cpu++) {
@@ -1109,6 +1267,48 @@ void smp_regression_start(void)
     init_reap_child_exit = 0U;
     init_reap_parent_id = 0UL;
     init_reap_parent_done = 0U;
+
+#if defined(CONFIG_SMP_REGRESSION_SUITE_MUTEX)
+    KER_INFO("[stress] starting mutex regression suite");
+    if (!start_mutex_regression_stage()) {
+        KER_INFO("[stress] MUTEX SUITE FAIL: setup failed");
+    }
+    return;
+#endif
+
+#if defined(CONFIG_SMP_REGRESSION_SUITE_LIFECYCLE)
+    KER_INFO("[stress] starting lifecycle regression suite");
+    sync_sem_handle = semaphore_pool_alloc(0UL);
+    sync_cond_handle = condvar_pool_alloc();
+    sync_cond_mutex_handle = mutex_pool_alloc();
+    if (sync_sem_handle < 0 || sync_cond_handle < 0 ||
+        sync_cond_mutex_handle < 0 ||
+        task_create(wake_before_park_consumer, "stress-waiter") ==
+            (struct task *)0 ||
+        task_create(wake_before_park_producer, "stress-waker") ==
+            (struct task *)0 ||
+        task_create(remote_kill_target, "stress-kill-target") ==
+            (struct task *)0 ||
+        task_create(remote_kill_controller, "stress-kill-controller") ==
+            (struct task *)0) {
+        KER_INFO("[stress] LIFECYCLE SUITE FAIL: setup failed");
+    }
+    return;
+#endif
+
+#if defined(CONFIG_SMP_REGRESSION_SUITE_MM)
+    KER_INFO("[stress] starting MM regression suite");
+    if (task_create(mm_lifetime_holder, "stress-mm-holder-a") ==
+            (struct task *)0 ||
+        task_create(mm_lifetime_second_holder, "stress-mm-holder-b") ==
+            (struct task *)0 ||
+        task_create(mm_suite_controller, "stress-mm-controller") ==
+            (struct task *)0) {
+        KER_INFO("[stress] MM SUITE FAIL: setup failed");
+    }
+    return;
+#endif
+
     KER_INFO("[stress] starting SMP regression suite");
 
     if (sync_sem_handle < 0 || sync_cond_handle < 0 ||
@@ -1130,37 +1330,6 @@ void smp_regression_start(void)
         KER_INFO("[stress] remote-kill FAIL: task creation failed");
     }
 
-    if (mutex_detach_id < 0) {
-        KER_INFO("[stress] mutex-owner-detach FAIL: pool allocation failed");
-    } else if (task_create(mutex_detach_owner, "stress-mutex-owner") ==
-                   (struct task *)0 ||
-               task_create(mutex_detach_waiter, "stress-mutex-waiter") ==
-                   (struct task *)0 ||
-               task_create(mutex_detach_controller,
-                           "stress-mutex-controller") == (struct task *)0) {
-        KER_INFO("[stress] mutex-owner-detach FAIL: task creation failed");
-    }
-
-    if (mutex_waiter_kill_id < 0) {
-        KER_INFO("[stress] mutex-waiter-detach FAIL: pool allocation failed");
-    } else if (task_create(mutex_waiter_kill_owner,
-                           "stress-waiter-owner") == (struct task *)0 ||
-               task_create(mutex_waiter_kill_target,
-                           "stress-killed-waiter") == (struct task *)0 ||
-               task_create(mutex_waiter_kill_controller,
-                           "stress-waiter-controller") == (struct task *)0) {
-        KER_INFO("[stress] mutex-waiter-detach FAIL: task creation failed");
-    }
-
-    /*
-     * Reuse the remote-kill controller for the MM assertions. The regression
-     * build already has a shell plus ten stress tasks, so creating a separate
-     * MM controller would exceed MAX_TASKS before any test task is reaped.
-     */
-    if (task_create(mm_lifetime_holder, "stress-mm-holder") ==
-            (struct task *)0) {
-        KER_INFO("[stress] mm-deferred-release FAIL: task creation failed");
-    }
 }
 
 #else

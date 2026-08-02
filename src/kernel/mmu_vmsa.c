@@ -1,5 +1,5 @@
 #include <kernel/mmu.h>
-#include <kernel/mmu_debug.h>
+#include <kernel/mmu_table.h>
 #include <kernel/page_alloc.h>
 #include <kernel/process.h>
 #include <kernel/sched.h>
@@ -8,7 +8,7 @@
 #include <kernel/vm.h>
 #include <arch/arm/virt.h>
 #include <arch/arm/sysregs.h>
-#include <drivers/interrupt/gicv2.h>
+#include <drivers/interrupt/gic.h>
 
 /* Root pointer for the empty TTBR0 root during kernel tasks. */
 unsigned long *ttbr0_runtime_empty_root;
@@ -22,7 +22,8 @@ void mmu_install_empty_ttbr0_root(void)
         return;
     }
 
-    if (ttbr0_runtime_empty_root != (unsigned long *)0 && mmu_debug_ttbr0_root() == ttbr0_runtime_empty_root) {
+    if (ttbr0_runtime_empty_root != (unsigned long *)0 &&
+        mmu_l0_table == ttbr0_runtime_empty_root) {
         return;
     }
 
@@ -41,18 +42,12 @@ void mmu_install_empty_ttbr0_root(void)
 
     ttbr0_runtime_empty_root = new_root;
     
-    /* We need a way to update the global mmu_l0_table in mmu.c if it's external,
-     * or at least inform the debug system. 
-     * For now, mmu_debug_ttbr0_root() returns mmu_l0_table.
-     */
-    extern unsigned long *mmu_l0_table;
-    extern unsigned long *mmu_l1_table;
-    extern unsigned long *mmu_l2_ram_table;
+    /* Publish the runtime empty root as the active kernel TTBR0 tree. */
     mmu_l0_table = new_root;
     mmu_l1_table = (unsigned long *)0;
     mmu_l2_ram_table = (unsigned long *)0;
 
-    mmu_debug_compact_for_ttbr0_install((unsigned long)new_root);
+    mmu_table_release_boot_ttbr0((unsigned long)new_root);
 }
 
 /*
@@ -94,7 +89,7 @@ static void *mmu_alloc_sub_table_locked(struct mm_context *mm, const char *name)
     unsigned long *tbl = (unsigned long *)pa_to_va(va_to_pa(new_page));
     for (int i = 0; i < 512; i++) tbl[i] = 0UL;
 
-    if (name) mmu_debug_record_table_page((unsigned long)va_to_pa(new_page), name);
+    if (name) mmu_table_record_page((unsigned long)va_to_pa(new_page), name);
     return new_page;
 }
 
@@ -562,7 +557,7 @@ int mmu_context_shootdown(struct mm_context *mm)
     /* The requester completes its own invalidation directly. */
     mmu_tlbi_asid(mm->asid);
     if (target_mask != 0U) {
-        gicv2_send_ipi(target_mask, MMU_SHOOTDOWN_SGI);
+        gic_send_ipi(target_mask, MMU_SHOOTDOWN_SGI);
     }
 
     do {

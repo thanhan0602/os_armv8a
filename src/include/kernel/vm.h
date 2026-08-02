@@ -20,7 +20,8 @@
  * KERNEL_VA_OFFSET is chosen so that:
  *   - PA 0x40080000 (kernel load address) maps to VA 0xFFFF000040080000
  *   - PA 0x09000000 (PL011 UART)          maps to VA 0xFFFF000009000000
- *   - PA 0x08000000 (GICv2 GICD)          maps to VA 0xFFFF000008000000
+ *   - PA 0x08000000 (GICv3 Distributor)   maps to VA 0xFFFF000008000000
+ *   - PA 0x080A0000 (GICv3 Redistributor) maps to VA 0xFFFF0000080A0000
  */
 #define KERNEL_VA_OFFSET  0xFFFF000000000000UL
 #define USER_CODE_BASE    0x00001000UL

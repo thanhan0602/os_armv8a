@@ -218,7 +218,4 @@ int mmu_unmap_user_range(struct mm_context *mm, unsigned long va, unsigned long 
  */
 int mmu_handle_page_fault(unsigned long far_el1, unsigned long esr_el1);
 
-/* Number of physical pages currently consumed by translation tables. */
-unsigned long mmu_table_pages_used(void);
-
 #endif

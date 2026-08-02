@@ -1,6 +1,6 @@
 #include <kernel/exception.h>
 
-#include <drivers/interrupt/gicv2.h>
+#include <drivers/interrupt/gic.h>
 #include <arch/arm/cpu.h>
 #include <arch/arm/sysregs.h>
 #include <kernel/log.h>
@@ -278,7 +278,7 @@ void exception_handle_irq(unsigned long vector_id,
      * The End-Of-Interrupt write must use the full IAR value so the SGI is
      * correctly deactivated for the right source CPU.
      */
-    iar = gicv2_acknowledge_irq();
+    iar = gic_acknowledge_irq();
     intid = iar & 0x3FFU;
     if (intid >= 1020U) {
         sched_irq_exit();
@@ -296,7 +296,7 @@ void exception_handle_irq(unsigned long vector_id,
         KER_LOGF("[irq] unexpected intid=%u\n", intid);
     }
 
-    gicv2_end_of_interrupt(iar);
+    gic_end_of_interrupt(iar);
     sched_irq_exit();
 }
 

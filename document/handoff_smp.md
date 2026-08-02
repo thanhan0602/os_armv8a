@@ -48,7 +48,22 @@ The opt-in SMP regression build now aggregates all six deterministic checks unde
 
 The suite now also covers init-style orphan reparenting and collection, semaphore blocking/wakeup, and condition-variable wait/signal with mutex reacquisition. The corresponding markers are `[stress] init-reap PASS`, `[stress] semaphore PASS`, and `[stress] condvar PASS`.
 
-MM invalidation now reserves GICv2 SGI 1 for synchronous cross-CPU ASID shootdown. The requester invalidates locally, sends the SGI only to CPUs in the context active mask, and waits for a protected acknowledgement mask to become empty. The SGI handler performs TLBI and acknowledgement without invoking the scheduler. The four-core regression emits `[stress] mm-shootdown-ack PASS`, followed by `[stress] ALL PASS`, and QEMU exits with status 0.
+MM invalidation reserves GICv3 SGI 1 for synchronous cross-CPU ASID shootdown. The requester invalidates locally, sends the SGI through `ICC_SGI1R_EL1` only to CPUs in the context active mask, and waits for a protected acknowledgement mask to become empty. The SGI handler performs TLBI and acknowledgement without invoking the scheduler. The four-core regression emits `[stress] mm-shootdown-ack PASS`, followed by `[stress] ALL PASS`, and QEMU exits with status 0.
+
+### Deterministic staged SMP regression
+
+The regression build supports focused profiles through `SMP_REGRESSION_SUITE=full|scheduler|mutex|lifecycle|mm`. Each focused profile computes its own expected pass mask, prints a suite-specific completion marker, and powers QEMU off through PSCI after completion.
+
+The `full` profile no longer starts independent lifecycle, mutex, scheduler, and MM tests concurrently. It now runs a deterministic pipeline:
+
+1. lifecycle: wake-before-park, remote kill acknowledgement, init-style orphan reaping, semaphore, and condition variable;
+2. mutex: owner detach, waiter detach, concurrent-destroy rejection, repeated destroy race, and stale generation-tagged handle rejection;
+3. scheduler: per-CPU run queue placement, work stealing, and kernel preemption;
+4. MM: synchronous shootdown acknowledgement, deferred release, and final multi-CPU detach.
+
+Each transition waits for the current stage's complete pass mask and gives the scheduler time to reap dead workers before allocating the next stage. The MM workers are dedicated tasks rather than reused mutex workers. This removes cross-suite task-slot pressure and timing contention while preserving concurrency inside each individual regression.
+
+GICv3 validation on 2026-08-02 used a clean `SMP_REGRESSION_TESTS=1 SMP_REGRESSION_SUITE=full RUN_OS_DEMOS=0` build and QEMU `virt,gic-version=3` with four CPUs. The run emitted every expected lifecycle, mutex, scheduler, and MM PASS marker, ended with `[stress] ALL PASS`, contained no stress failure, panic, unexpected interrupt, or parked-exception marker, and allowed QEMU to exit with status 0. The focused lifecycle profile also completed through semaphore and condition-variable coverage with status 0.
 
 ### Scheduler, IPC, mutex, and MM lifetime hardening
 
@@ -70,6 +85,7 @@ MM invalidation now reserves GICv2 SGI 1 for synchronous cross-CPU ASID shootdow
 - **Intrusive waiter lifetime**: IPC và mutex dùng `task->wait_next`, nên một task chỉ được nằm trong một subsystem wait queue tại một thời điểm và vẫn phải detach trước khi task slot được tái sử dụng.
 - **Clone semantics**: `CLONE_VM` without `CLONE_THREAD` is not implemented with Linux-like shared-address-space semantics. Unsupported flag combinations should be rejected explicitly until implemented.
 - **Boot handshake**: Secondary cores are brought up sequentially through one shared `secondary_ready` flag. Use per-CPU acquire/release flags before parallel bring-up or CPU hotplug is introduced.
+- **Regression coverage versus proof**: The staged full regression validates deterministic subsystem invariants and transitions, but intentionally avoids unrelated suites competing at the same time. Separate long-duration mixed-workload soak tests remain useful for discovering contention that deterministic regressions do not model.
 
 ## Supplementary Documentation
 - [SMP Postmortem](smp_postmortem.md): Detailed analysis of bugs and race conditions encountered during SMP integration (UART sync, VA/PA consistency).

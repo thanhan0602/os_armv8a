@@ -2,7 +2,7 @@
 #include <arch/arm/virt.h>
 #include <arch/arm/sysregs.h>
 #include <kernel/debug_targets.h>
-#include <kernel/mmu_debug.h>
+#include <kernel/mmu_table.h>
 #include <kernel/log.h>
 #include <kernel/page_alloc.h>
 #include <kernel/vm.h>
@@ -61,7 +61,7 @@ void mmu_init(void)
         return;
     }
 
-    mmu_debug_reset();
+    mmu_table_registry_reset();
 
     // mmu_log_kernel_layout();
 
@@ -95,9 +95,4 @@ void mmu_init_secondary(void)
 int mmu_is_enabled(void)
 {
     return mmu_enabled;
-}
-
-unsigned long *mmu_debug_ttbr0_root(void)
-{
-    return mmu_l0_table;
 }

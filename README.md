@@ -8,7 +8,7 @@ Kernel bare-metal ARMv8-A chạy trên QEMU `virt`, được phát triển theo 
 - UART PL011 hoạt động
 - Logging kernel hoạt động
 - Exception vectors đã được cài đặt
-- GICv2 và generic timer IRQ hoạt động
+- GICv3 và generic timer IRQ hoạt động
 - Physical page allocator hoạt động
 - Kernel heap page-backed hoạt động
 - MMU và cache đã được bật ổn định
@@ -111,7 +111,7 @@ make QEMU_BIN=/path/to/qemu-system-aarch64 run
 ```text
 src/
   arch/arm/         Boot code và exception vectors
-  drivers/          PL011 UART, GICv2
+  drivers/          PL011 UART, GICv3
   include/          Header files
   kernel/           Core kernel subsystems
   linker.ld         Linker script

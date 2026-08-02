@@ -22,8 +22,6 @@
 #define MMU_L2_BLOCK_ADDR_MASK  0x0000ffffffe00000UL
 #define MMU_L3_PAGE_ADDR_MASK   0x0000fffffffff000UL
 
-#define MMU_DEBUG_MAX_TABLE_PAGES 67UL
-#define MMU_DEBUG_MAX_TABLE_NAME_LEN 24UL
 #define MMU_DEBUG_VECTOR_PAGE  0x40080000UL
 #define MMU_DEBUG_SYNC_PAGE    0x40081000UL
 #define MMU_DEBUG_MMU_PAGE     0x40082000UL
@@ -33,6 +31,11 @@ struct mmu_debug_target {
     const char *name;
     unsigned long address;
 };
+
+unsigned long *mmu_debug_ttbr0_root(void)
+{
+    return mmu_l0_table;
+}
 
 static unsigned long l0_index_for(unsigned long address)
 {
@@ -173,107 +176,6 @@ void mmu_debug_print_desc_kind(const char *level_name, const char *kind)
     KER_LOGF("[info] %s type=%s\n", level_name, kind);
 }
 
-/* Table page inventory recorded while page tables are allocated. */
-unsigned long mmu_table_page_addresses[MMU_DEBUG_MAX_TABLE_PAGES];
-char mmu_table_page_names[MMU_DEBUG_MAX_TABLE_PAGES][MMU_DEBUG_MAX_TABLE_NAME_LEN];
-unsigned long mmu_table_page_count = 0UL;
-unsigned long table_pages_used = 0UL;
-
-static void mmu_debug_copy_name_internal(char *destination, const char *source)
-{
-    unsigned long index;
-
-    for (index = 0UL; index < (MMU_DEBUG_MAX_TABLE_NAME_LEN - 1UL) && source[index] != '\0'; index++) {
-        destination[index] = source[index];
-    }
-    destination[index] = '\0';
-}
-
-void mmu_debug_copy_name(char *destination, const char *source)
-{
-    mmu_debug_copy_name_internal(destination, source);
-}
-
-int mmu_debug_name_has_prefix(const char *name, const char *prefix)
-{
-    unsigned long index;
-
-    for (index = 0UL; prefix[index] != '\0'; index++) {
-        if (name[index] != prefix[index]) {
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-void mmu_debug_record_table_page(unsigned long address, const char *name)
-{
-    if (mmu_table_page_count >= MMU_DEBUG_MAX_TABLE_PAGES) {
-        return;
-    }
-
-    mmu_table_page_addresses[mmu_table_page_count] = address;
-    mmu_debug_copy_name_internal(mmu_table_page_names[mmu_table_page_count], name);
-    mmu_table_page_count++;
-    table_pages_used++;
-}
-
-void mmu_debug_set_chunk_name(char *destination, const char *prefix, unsigned long chunk_index)
-{
-    char digits[21];
-    unsigned long digit_count;
-    unsigned long value;
-    unsigned long index;
-    unsigned long output_index;
-
-    value = chunk_index;
-    digit_count = 0UL;
-    do {
-        digits[digit_count++] = (char)('0' + (value % 10UL));
-        value /= 10UL;
-    } while (value != 0UL && digit_count < sizeof(digits));
-
-    output_index = 0UL;
-    for (index = 0UL; prefix[index] != '\0' && output_index < (MMU_DEBUG_MAX_TABLE_NAME_LEN - 1UL); index++) {
-        destination[output_index++] = prefix[index];
-    }
-
-    while (digit_count > 0UL && output_index < (MMU_DEBUG_MAX_TABLE_NAME_LEN - 1UL)) {
-        destination[output_index++] = digits[--digit_count];
-    }
-
-    destination[output_index] = '\0';
-}
-
-unsigned long mmu_debug_table_page_count(void)
-{
-    return mmu_table_page_count;
-}
-
-unsigned long mmu_debug_table_page_address(unsigned long index)
-{
-    if (index >= mmu_table_page_count) {
-        return 0UL;
-    }
-
-    return mmu_table_page_addresses[index];
-}
-
-const char *mmu_debug_table_page_name(unsigned long index)
-{
-    if (index >= mmu_table_page_count) {
-        return "mmu-table-invalid";
-    }
-
-    return mmu_table_page_names[index];
-}
-
-unsigned long mmu_table_pages_used(void)
-{
-    return table_pages_used;
-}
-
 /* Boot targets */
 static const struct mmu_debug_target mmu_boot_debug_targets[] = {
     { "vector", MMU_DEBUG_VECTOR_PAGE },
@@ -305,38 +207,6 @@ unsigned long mmu_debug_boot_target_address(unsigned long index)
     }
 
     return mmu_boot_debug_targets[index].address;
-}
-
-/* Compact table pages and free non-ttbr1 pages when installing empty ttbr0 root */
-void mmu_debug_compact_for_ttbr0_install(unsigned long new_root)
-{
-    unsigned long read_index;
-    unsigned long write_index;
-
-    write_index = 0UL;
-    for (read_index = 0UL; read_index < mmu_table_page_count; read_index++) {
-        const char *name = mmu_table_page_names[read_index];
-        if (mmu_debug_name_has_prefix(name, "t1-")) {
-            if (write_index != read_index) {
-                mmu_table_page_addresses[write_index] = mmu_table_page_addresses[read_index];
-                mmu_debug_copy_name_internal(mmu_table_page_names[write_index], name);
-            }
-            write_index++;
-            continue;
-        }
-
-        page_free((void *)mmu_table_page_addresses[read_index]);
-        if (table_pages_used > 0) table_pages_used--;
-    }
-
-    mmu_table_page_count = write_index;
-    mmu_debug_record_table_page(new_root, "t0-empty-root");
-}
-
-void mmu_debug_reset(void)
-{
-    mmu_table_page_count = 0UL;
-    table_pages_used = 0UL;
 }
 
 static unsigned long *mmu_debug_desc_pa_to_table(unsigned long pa)
@@ -466,20 +336,4 @@ void mmu_debug_walk_address(unsigned long address)
     }
 
     mmu_debug_walk(address);
-}
-
-/* Allocate a page, record it with a generated chunk name, and return pointer. */
-unsigned long *mmu_debug_alloc_named_table_page_chunk(const char *prefix, unsigned long chunk_index)
-{
-    unsigned long *table = (unsigned long *)page_alloc();
-    if (table == (unsigned long *)0) {
-        return (unsigned long *)0;
-    }
-
-    if (mmu_table_page_count < MMU_DEBUG_MAX_TABLE_PAGES) {
-        mmu_debug_set_chunk_name(mmu_table_page_names[mmu_table_page_count], prefix, chunk_index);
-        mmu_debug_record_table_page((unsigned long)table, mmu_table_page_names[mmu_table_page_count]);
-    }
-
-    return table;
 }

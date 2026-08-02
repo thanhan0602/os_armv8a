@@ -1,5 +1,5 @@
 #include <kernel/mmu.h>
-#include <kernel/mmu_debug.h>
+#include <kernel/mmu_table.h>
 #include <kernel/page_alloc.h>
 #include <kernel/log.h>
 #include <kernel/vm.h>
@@ -35,9 +35,7 @@ extern char __kernel_end[];
 
 unsigned long *alloc_named_table_page(const char *name)
 {
-    unsigned long *table = (unsigned long *)page_alloc();
-    if (table) mmu_debug_record_table_page((unsigned long)table, name);
-    return table;
+    return mmu_table_alloc_named_page(name);
 }
 
 static void mmu_log_segment(const char *name, void *start, void *end)
@@ -190,7 +188,7 @@ static int build_generic_boot_map(unsigned long **l0, unsigned long **l1, unsign
         unsigned long *l3_table;
         unsigned long chunk_index = (chunk_base - QEMU_VIRT_RAM_BASE) / MMU_L2_BLOCK_SIZE;
         
-        l3_table = mmu_debug_alloc_named_table_page_chunk(prefix ? prefix : "l3", chunk_index);
+        l3_table = mmu_table_alloc_chunk_page(prefix ? prefix : "l3", chunk_index);
         if (!l3_table) return 0;
 
         (*l2)[L2_INDEX_FOR(chunk_base)] = ((unsigned long)l3_table) | MMU_DESC_TABLE;

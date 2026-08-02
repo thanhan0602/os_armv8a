@@ -49,7 +49,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - Driver system layer hiện gom UART, GIC, và timer qua `driver_system_init()`; `driver_system_dump()` báo trạng thái sau khi logger sẵn sàng.
 - Exception vectors hoạt động.
 - Sync fault path hiện dump đầy đủ `x0..x30`, `SP_EL1`, `FPCR`, và `FPSR`.
-- GICv2 và generic timer IRQ hoạt động.
+- GICv3 và generic timer IRQ hoạt động. CPU 0 khởi tạo Distributor, mỗi CPU đánh thức Redistributor riêng và dùng ICC system-register interface tại EL1.
 - Physical page allocator hoạt động.
 - Kernel heap page-backed hiện hỗ trợ allocation nhỏ và allocation lớn hơn một page thông qua contiguous physical spans.
 - Shared debug target framework hiện cũng bao phủ heap arena inspection qua `heap-arenas` và `heap-large-arenas`; heap self-test đã đi qua cùng framework này.
@@ -109,10 +109,17 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
 - **Stage 19 (pthread/clone SMP stability)** — hoàn thành và verify trên QEMU:
   - `SYS_CLONE` (224) hiện hỗ trợ `CLONE_VM`, `CLONE_THREAD`, và `CLONE_SETTLS`; user `pthread_create()` dùng trampoline assembly kiểu glibc để child bắt đầu trên stack riêng.
   - `TPIDR_EL0` được lưu/khôi phục trong `switch_context`, cho phép TLS/errno riêng từng thread.
-  - GICv2 SGI/IPI fix: IRQ handler mask `IAR[9:0]` để lấy intid nhưng ghi full IAR vào EOIR, tránh SGI từ CPU khác bị coi là spurious và chặn timer IRQ.
+  - GICv3 SGI/IPI: IRQ được acknowledge/deactivate qua `ICC_IAR1_EL1` và `ICC_EOIR1_EL1`; SGI 0 dành cho reschedule, SGI 1 dành cho synchronous MM shootdown.
   - `process_clone()` chỉ copy saved `exception_context` vào frame sạch trên child kernel stack, không copy toàn bộ live kernel stack của parent.
   - `sched_reap_dead()` chỉ free stack task DEAD khi task đã rời CPU (`TASK_NO_CPU`), tránh free stack đang còn chạy trong `task_exit()`/`schedule()`.
   - Runtime verify mới nhất: `test_pthread.elf` pass 20/20 lần trên QEMU 4-core với idle `wfe` bật lại, không fault/panic/hang.
+- **Stage 16 deterministic SMP regression orchestration** — hoàn thành và verify trên QEMU:
+  - build hỗ trợ `SMP_REGRESSION_SUITE=full|scheduler|mutex|lifecycle|mm`; mỗi focused suite có expected pass mask và marker hoàn tất riêng
+  - full suite hiện chạy tuần tự theo pipeline lifecycle → mutex → scheduler → MM thay vì tạo các nhóm worker độc lập cùng lúc
+  - lifecycle stage hoàn tất wake-before-park, remote kill/ack, init-reap, semaphore và condvar trước khi tạo mutex workers
+  - mutex stage hoàn tất owner/waiter detach, destroy reject/race và stale handle; sau đó scheduler regression mới chạy và tạo dedicated MM workers ở stage cuối
+  - giữa các stage có scheduler turns để worker cũ exit và được reap, tránh áp lực tạm thời lên `MAX_TASKS` và loại cross-suite timing contention
+  - clean build profile full với `RUN_OS_DEMOS=0` đã PASS trên QEMU `virt,gic-version=3`, 4 CPU; run kết thúc bằng `[stress] ALL PASS`, QEMU status 0, không có stress FAIL, panic hay `exception handler parked`
 - **Stage 14 (Lazy Loading & Copy-on-Write)** — hoàn thành và verify trên QEMU:
   - Chuyển đổi từ mô hình nạp code "eager" (copy toàn bộ vào RAM ngay khi nạp) sang "Lazy Loading" (Demand Paging).
   - Thêm `struct vm_region` để quản lý các vùng nhớ ảo (ELF segments, Stack, Heap).
@@ -147,7 +154,7 @@ Repo này là một kernel ARMv8-A bare-metal chạy trên QEMU `virt`, đang đ
   - `.text`: `RO + X`
   - `.rodata`: `RO + NX`
   - `.data/.bss/.boot_stack`: `RW + NX`
-- PA→VA migration hoàn tất: page_alloc, heap, mmu walks, MMIO drivers (pl011, gicv2) đều conditional convert qua `mmu_is_enabled()`
+- PA→VA migration hoàn tất: page_alloc, heap, mmu walks, MMIO drivers (PL011, GICv3 Distributor/Redistributor) đều conditional convert qua `mmu_is_enabled()`
 
 ## Các bài học kỹ thuật quan trọng
 

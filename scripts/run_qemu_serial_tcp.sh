@@ -21,7 +21,7 @@ if ss -tlnH "sport = :$SERIAL_PORT" 2>/dev/null | grep -q .; then
 fi
 
 exec "$QEMU_BIN" \
-  -machine virt,gic-version=2 \
+  -machine virt,gic-version=3 \
   -cpu max \
   -display none \
   -monitor none \

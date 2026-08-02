@@ -11,7 +11,7 @@
 #include <kernel/console.h>
 #include <kernel/condvar.h>
 #include <kernel/spinlock.h>
-#include <drivers/interrupt/gicv2.h>
+#include <drivers/interrupt/gic.h>
 #include <arch/arm/cpu.h>
 
 extern void task_entry_trampoline(void);
@@ -388,7 +388,7 @@ struct task *task_create(task_fn_t entry, const char *name)
      */
     current_cpu = arch_get_cpu_id();
     if (target_cpu < SCHED_MAX_CPUS && target_cpu != current_cpu) {
-        gicv2_send_ipi(1U << target_cpu, 0U);
+        gic_send_ipi(1U << target_cpu, 0U);
     }
 
     return t;
@@ -654,7 +654,7 @@ void sched_tick(void)
     spin_unlock_irqrestore(&sched_lock, flags);
 
     if (target_mask != 0U) {
-        gicv2_send_ipi(target_mask, 0);
+        gic_send_ipi(target_mask, 0);
     }
 }
 
@@ -777,7 +777,7 @@ void task_exit(void)
                     target_mask |= (1 << (unsigned char)j);
                 }
             }
-            gicv2_send_ipi(target_mask, 0);
+            gic_send_ipi(target_mask, 0);
     }
     
     spin_unlock_irqrestore(&sched_lock, flags);
@@ -913,7 +913,7 @@ void sched_wake_task(struct task *task)
             target_mask |= (1 << i);
         }
     }
-    gicv2_send_ipi(target_mask, 0);
+    gic_send_ipi(target_mask, 0);
 }
 
 /*
@@ -977,7 +977,7 @@ void sched_unpark_task(struct task *task)
                 target_mask |= (1U << i);
             }
         }
-        gicv2_send_ipi(target_mask, 0U);
+        gic_send_ipi(target_mask, 0U);
     }
 }
 
@@ -1126,7 +1126,7 @@ int sched_kill_task(unsigned long task_id)
     spin_unlock_irqrestore(&sched_lock, flags);
 
     if (killed && target_cpu != TASK_NO_CPU) {
-        gicv2_send_ipi(1U << target_cpu, 0U);
+        gic_send_ipi(1U << target_cpu, 0U);
     }
 
     return killed;

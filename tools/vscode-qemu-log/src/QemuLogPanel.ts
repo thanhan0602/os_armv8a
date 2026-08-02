@@ -124,7 +124,7 @@ export class QemuLogPanel {
             cfg.get<string>('kernelImage', '${workspaceFolder}/build/kernel8.img'),
         );
         const extraArgs = cfg.get<string[]>('qemuArgs', [
-            '-machine', 'virt,gic-version=2',
+            '-machine', 'virt,gic-version=3',
             '-cpu', 'max',
             '-nographic',
             '-serial', 'mon:stdio',

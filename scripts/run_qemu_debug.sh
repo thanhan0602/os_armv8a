@@ -36,7 +36,7 @@ for PORT in "$MONITOR_PORT" "$GDB_PORT"; do
 done
 
 exec "$QEMU_BIN" \
-  -machine virt,gic-version=2 \
+  -machine virt,gic-version=3 \
   -cpu max \
   -nographic \
   -serial mon:stdio \
